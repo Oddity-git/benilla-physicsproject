@@ -65,7 +65,11 @@ pub(super) struct Ragdoll {
     born: f32,
     /// When its bodies last all slept (or it fell): awake past [`MAX_SIM_SECS`] from here freezes.
     awake_since: f32,
-    /// Frozen bone locals once settled, by profile body; `None` while the bodies simulate.
+    /// Each root bone (a bone with no parent) and its pose relative to the hub's at death. A root
+    /// carries every bone outside the body tree (a quadruped's front half, a tail, a cloak), so it
+    /// rides the hub instead of holding the death animation where the unit stood.
+    anchors: Vec<(usize, Affine3A)>,
+    /// Every bone local once frozen; `None` while the bodies simulate.
     frozen: Option<Vec<Transform>>,
 }
 
@@ -241,6 +245,19 @@ fn start_ragdolls(
                 },
             ));
         }
+        let hub = profile.bodies[0].bone as usize;
+        let anchors = match rig.model.get(hub) {
+            Some(hub_model) => {
+                let hub_inv = hub_model.inverse();
+                rig.parents
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, &p)| p < 0 && i != hub)
+                    .filter_map(|(i, _)| rig.model.get(i).map(|m| (i, hub_inv * *m)))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         info!(
             "ragdoll: unit {unit} falls with {} bodies (scale {scale:.2})",
             spawned.len()
@@ -250,6 +267,7 @@ fn start_ragdolls(
             profile,
             born: time.elapsed_secs(),
             awake_since: time.elapsed_secs(),
+            anchors,
             frozen: None,
         });
     }
@@ -282,10 +300,8 @@ fn drive_bones_from_bodies(
     for (unit, rag, rig) in &mut rigs {
         let rig = rig.into_inner();
         if let Some(frozen) = &rag.frozen {
-            for (body, local) in rag.profile.bodies.iter().zip(frozen) {
-                if let Some(slot) = rig.locals.get_mut(body.bone as usize) {
-                    *slot = *local;
-                }
+            for (slot, local) in rig.locals.iter_mut().zip(frozen) {
+                *slot = *local;
             }
             rig.pose_dirty = true;
             continue;
@@ -293,21 +309,39 @@ fn drive_bones_from_bodies(
         let (Ok(frame), Some(ids)) = (frames.get(rig.joints_root), bodies.0.get(&unit)) else {
             continue;
         };
-        write_pose(rig, &rag.profile, frame, ids, &body_tfs);
+        write_pose(rig, rag, frame, ids, &body_tfs);
     }
 }
 
 /// The body-to-bone write for one rig; see [`drive_bones_from_bodies`].
 fn write_pose(
     rig: &mut RigPose,
-    profile: &Profile,
+    rag: &Ragdoll,
     frame: &GlobalTransform,
     ids: &[Entity],
     body_tfs: &Query<&Transform, With<RigidBody>>,
 ) {
+    let profile = &rag.profile;
     let world_inv = frame.affine().inverse();
     let (_, frame_rot, _) = frame.affine().to_scale_rotation_translation();
     let frame_rot_inv = frame_rot.inverse();
+    let body_model = |tf: &Transform| {
+        Affine3A::from_rotation_translation(
+            (frame_rot_inv * tf.rotation).normalize(),
+            world_inv.transform_point3(tf.translation),
+        )
+    };
+    // The roots follow the hub body, so the bones outside the body tree come along.
+    if let Some(hub) = ids.first().and_then(|id| body_tfs.get(*id).ok()) {
+        let hub = body_model(hub);
+        for &(i, rel) in &rag.anchors {
+            let (_, r, t) = (hub * rel).to_scale_rotation_translation();
+            if let Some(slot) = rig.locals.get_mut(i) {
+                slot.translation = t;
+                slot.rotation = r;
+            }
+        }
+    }
     let n = rig.locals.len().min(rig.parents.len());
     let mut model = vec![Affine3A::IDENTITY; n];
     let mut body_k = 0;
@@ -321,10 +355,7 @@ fn write_pose(
             let tf = ids.get(body_k).and_then(|id| body_tfs.get(*id).ok());
             body_k += 1;
             if let Some(tf) = tf {
-                let m = Affine3A::from_rotation_translation(
-                    (frame_rot_inv * tf.rotation).normalize(),
-                    world_inv.transform_point3(tf.translation),
-                );
+                let m = body_model(tf);
                 let local = parent.map_or(m, |p| p.inverse() * m);
                 let (_, r, t) = local.to_scale_rotation_translation();
                 rig.locals[i] = Transform::from_translation(t).with_rotation(r);
@@ -365,13 +396,7 @@ fn freeze_settled(
         if now - rag.awake_since < MAX_SIM_SECS {
             continue;
         }
-        let frozen = rag
-            .profile
-            .bodies
-            .iter()
-            .map(|b| rig.locals.get(b.bone as usize).copied().unwrap_or_default())
-            .collect();
-        rag.frozen = Some(frozen);
+        rag.frozen = Some(rig.locals.clone());
         let ids = bodies.0.remove(&unit).unwrap_or_default();
         despawn_bodies(&mut commands, &ids, &joints);
     }
