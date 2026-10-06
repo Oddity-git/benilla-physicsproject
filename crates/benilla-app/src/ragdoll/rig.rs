@@ -60,8 +60,10 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
             subtree[p] += subtree[i];
         }
     }
-    // Each bone's main child, the one its segment runs to: the child that best continues the bone
-    // (the elbow's hand, the pelvis's spine), else the largest subtree, else the farthest pivot.
+    // Each bone's main child, the one its segment runs to: a child with children of its own over a
+    // leaf (a leaf is a helper: an attachment point, a pad, an unused bone at the origin), then the
+    // child that best continues the bone (the elbow's hand, the pelvis's spine), then the largest
+    // subtree, then the farthest pivot.
     let incoming = |p: usize| {
         parent_of(p)
             .map(|g| pivots[p] - pivots[g])
@@ -73,7 +75,12 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
             (Some(a), Some(b)) => a.dot(b),
             _ => 0.0,
         };
-        (straight, subtree[c], (pivots[c] - pivots[p]).length())
+        (
+            subtree[c] > 1,
+            straight,
+            subtree[c],
+            (pivots[c] - pivots[p]).length(),
+        )
     };
     let mut main_child: Vec<Option<usize>> = vec![None; n];
     for i in 0..n {
@@ -84,9 +91,10 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
             None => true,
             Some(c) => {
                 let (a, b) = (score(p, i), score(p, c));
-                a.0.total_cmp(&b.0)
-                    .then(a.1.cmp(&b.1))
-                    .then(a.2.total_cmp(&b.2))
+                a.0.cmp(&b.0)
+                    .then(a.1.total_cmp(&b.1))
+                    .then(a.2.cmp(&b.2))
+                    .then(a.3.total_cmp(&b.3))
                     .is_gt()
             }
         };
@@ -198,6 +206,22 @@ mod tests {
         assert_eq!(p.bodies[idx(5)].parent, Some(idx(2)));
         // The spine's segment runs up the neck, not out to the shoulder.
         assert!(p.bodies[idx(2)].segment.x.abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_helper_leaf_does_not_steal_the_limb() {
+        // An upper arm whose helper leaf points straight on, while the elbow bends down.
+        let (mut binds, mut parents) = stick();
+        binds.push(Vec3::new(0.1, 0.0, 0.0)); // 12 shoulder pad, child of the upper arm
+        parents.push(5);
+        binds[6] = Vec3::new(0.1, -0.3, 0.0); // the elbow drops
+        let p = build_profile(&binds, &parents).unwrap();
+        let arm = p.bodies.iter().find(|b| b.bone == 5).unwrap();
+        assert!(
+            arm.segment.y < 0.0,
+            "the arm runs to the elbow: {:?}",
+            arm.segment
+        );
     }
 
     #[test]
