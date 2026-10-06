@@ -12,10 +12,11 @@ use benilla_protocol::EntityKind;
 use benilla_world::collision::{ragdoll_layers, RagdollIgnore};
 use benilla_world::rig_anim::RigPose;
 
+use super::blow::LastHit;
 use super::rig::{build_profile, Profile};
 use crate::creature_anim::AnimDriver;
 use crate::entities::mount::MountBody;
-use crate::net::{NetEntity, ObjectStore, SelfPlayer};
+use crate::net::{GuidIndex, NetEntity, ObjectStore};
 
 /// Joint limits about the bind pose: how far a limb may swing off its bind direction, and twist.
 const SWING_LIMIT: f32 = 55.0_f32.to_radians();
@@ -33,9 +34,15 @@ const HUB_MASS: f32 = 2.5;
 const MAX_SIM_SECS: f32 = 12.0;
 /// Most ragdolls keeping bodies (moving or asleep) at once; past it the oldest freezes.
 const MAX_LIVE: usize = 16;
-/// The push at death, away from where the unit faced (yd/s): full at the head, a quarter at the
-/// feet, so the body topples backwards instead of sliding; plus a little lift.
-const DEATH_PUSH: f32 = 3.0;
+/// The base push at death (yd/s), away from the killer, else from where the unit faced: full at
+/// the head, a quarter at the feet, so the body topples backwards instead of sliding; plus a little lift.
+const DEATH_PUSH: f32 = 2.5;
+/// Added to the push per whole health bar the killing blow took (yd/s): a blow for half the
+/// unit's health adds half of it. The push never exceeds [`MAX_PUSH`].
+const BLOW_PUSH: f32 = 14.0;
+const MAX_PUSH: f32 = 12.0;
+/// A hit older than this when the unit reads dead was not the killing blow (s).
+const BLOW_WINDOW: f32 = 2.0;
 const DEATH_LIFT: f32 = 0.5;
 
 pub(super) fn plugin(app: &mut App) {
@@ -184,16 +191,17 @@ fn start_ragdolls(
             &RigPose,
             &GlobalTransform,
             Option<&LastSpot>,
+            Option<&LastHit>,
         ),
         (
             With<SeenAlive>,
             With<AnimDriver>,
             Without<Ragdoll>,
-            Without<SelfPlayer>,
             Without<MountBody>,
         ),
     >,
     frames: Query<&GlobalTransform>,
+    index: Res<GuidIndex>,
     mut active: Query<(Entity, &mut Ragdoll)>,
     mut bodies: ResMut<RagdollBodies>,
 ) {
@@ -201,8 +209,11 @@ fn start_ragdolls(
         return;
     }
     let dt = time.delta_secs().max(1e-3);
-    for (unit, store, net, rig, unit_tf, spot) in &dying {
-        if net.kind != EntityKind::Unit || !store.0.unit_is_dead() {
+    for (unit, store, net, rig, unit_tf, spot, blow) in &dying {
+        // Creatures and players alike, our own character included; a ghost reads alive again and
+        // `cleanup` hands it back to its animation.
+        let living_kind = matches!(net.kind, EntityKind::Unit | EntityKind::Player);
+        if !living_kind || !store.0.unit_is_dead() {
             continue;
         }
         commands.entity(unit).remove::<SeenAlive>();
@@ -219,6 +230,22 @@ fn start_ragdolls(
         let facing = (unit_tf.rotation() * Vec3::NEG_Z)
             .with_y(0.0)
             .normalize_or_zero();
+        // Away from the killer, flat; backwards from the facing when there is none to hand.
+        let away = blow
+            .filter(|b| time.elapsed_secs() - b.at <= BLOW_WINDOW)
+            .and_then(|b| index.0.get(&b.attacker))
+            .and_then(|&a| frames.get(a).ok())
+            .and_then(|a| {
+                (unit_tf.translation() - a.translation())
+                    .with_y(0.0)
+                    .try_normalize()
+            })
+            .unwrap_or(-facing);
+        let max_health = store.0.unit_max_health().unwrap_or(0).max(1) as f32;
+        let blow_share = blow
+            .filter(|b| time.elapsed_secs() - b.at <= BLOW_WINDOW)
+            .map_or(0.0, |b| (b.damage as f32 / max_health).min(1.0));
+        let strength = (DEATH_PUSH + BLOW_PUSH * blow_share).min(MAX_PUSH);
         let (lo, hi) = profile
             .bodies
             .iter()
@@ -239,7 +266,7 @@ fn start_ragdolls(
             let len = body.segment.length() * scale;
             let radius = body.radius * scale;
             let up = ((body.pivot.y - lo) / span).clamp(0.0, 1.0);
-            let push = -facing * DEATH_PUSH * (0.25 + 0.75 * up) + Vec3::Y * DEATH_LIFT;
+            let push = away * strength * (0.25 + 0.75 * up) + Vec3::Y * DEATH_LIFT;
             let share = (body.segment.length() / span).max(MASS_FLOOR);
             let mass = if body.parent.is_none() {
                 share * HUB_MASS
@@ -327,8 +354,11 @@ fn start_ragdolls(
                 if j == k {
                     continue;
                 }
-                let jointed =
-                    profile.bodies[k].parent == Some(j) || profile.bodies[j].parent == Some(k);
+                // Across a joint, or two limbs off the same body (a spider's legs, the thighs).
+                let jointed = profile.bodies[k].parent == Some(j)
+                    || profile.bodies[j].parent == Some(k)
+                    || (profile.bodies[k].parent.is_some()
+                        && profile.bodies[k].parent == profile.bodies[j].parent);
                 if jointed {
                     ignore.joined.push(spawned[j]);
                 } else if capsules_overlap(capsules[k], capsules[j]) {
@@ -350,9 +380,19 @@ fn start_ragdolls(
             }
             None => Vec::new(),
         };
+        // Each body as `bone<parent bone`, so a model that falls badly can be read off the log.
+        let layout: Vec<String> = profile
+            .bodies
+            .iter()
+            .map(|b| match b.parent {
+                Some(p) => format!("{}<{}", b.bone, profile.bodies[p].bone),
+                None => format!("{}(hub)", b.bone),
+            })
+            .collect();
         info!(
-            "ragdoll: unit {unit} falls with {} bodies (scale {scale:.2})",
-            spawned.len()
+            "ragdoll: unit {unit} falls with {} bodies (scale {scale:.2}): {}",
+            spawned.len(),
+            layout.join(" ")
         );
         bodies.0.insert(unit, spawned);
         commands.entity(unit).insert(Ragdoll {
@@ -436,16 +476,14 @@ fn write_pose(
     }
     let n = rig.locals.len().min(rig.parents.len());
     let mut model = vec![Affine3A::IDENTITY; n];
-    let mut body_k = 0;
     for i in 0..n {
         let parent = usize::try_from(rig.parents[i])
             .ok()
             .filter(|&p| p < i)
             .map(|p| model[p]);
-        let is_body = profile.physical.get(i).copied().unwrap_or(false);
-        if is_body {
-            let tf = ids.get(body_k).and_then(|id| body_tfs.get(*id).ok());
-            body_k += 1;
+        let body = profile.body_of.get(i).copied().flatten();
+        if let Some(k) = body {
+            let tf = ids.get(k).and_then(|id| body_tfs.get(*id).ok());
             if let Some(tf) = tf {
                 let m = body_model(tf);
                 let local = parent.map_or(m, |p| p.inverse() * m);

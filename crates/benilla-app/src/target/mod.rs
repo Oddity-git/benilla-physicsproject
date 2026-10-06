@@ -142,6 +142,11 @@ pub(crate) struct HoveredObject {
 
 /// This frame's world hit along the cursor ray, by [`hover::update_pick_occlusion`]: a unit or
 /// GameObject behind a wall is not hoverable (`0x480df0`).
+/// Fork: between the unit pick and the GameObject pick that compares against its distance, where
+/// another writer of [`Hovered`] (the ragdoll loot bag) can override the unit pick.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UnitPickOverride;
+
 #[derive(Resource, Clone, Copy)]
 pub(crate) struct PickOcclusion {
     pub(crate) distance: f32,
@@ -309,8 +314,8 @@ impl Plugin for TargetPlugin {
                 (
                     // The latch first, before any pick refresh clears what the press was over.
                     (latch_press_pick, hover::update_pick_occlusion).chain(),
-                    hover::update_hover,
-                    hover::update_hovered_object,
+                    hover::update_hover.before(UnitPickOverride),
+                    hover::update_hovered_object.after(UnitPickOverride),
                     cursor_mode::classify_cursor,
                     // The right press's two legs of the reference's OnMouseDown hook (`0x492c20`),
                     // the targeting cancel and the repair-mode reset, before the cursor drive, so

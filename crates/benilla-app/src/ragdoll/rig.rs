@@ -7,8 +7,11 @@ use bevy::math::Vec3;
 /// A bone's segment must be at least this fraction of the skeleton's height to get a body; the
 /// fingers, face and toes fall below it and ride their parent body rigidly.
 const MIN_SEGMENT: f32 = 0.08;
-/// Most bodies a rig gets, keeping the longest segments.
-const MAX_BODIES: usize = 20;
+/// Most bodies a rig gets, keeping the hub and the longest segments: room for a spider's legs.
+const MAX_BODIES: usize = 32;
+/// Walking down from the root, the hub is the first bone no single child of which holds this share
+/// of its descendants: the pelvis, where the spine and the legs part.
+const HUB_SHARE: f32 = 0.75;
 /// Capsule radius as a fraction of its segment, clamped to a band of the skeleton's height.
 const RADIUS_OF_SEGMENT: f32 = 0.3;
 const RADIUS_MIN: f32 = 0.03;
@@ -31,8 +34,8 @@ pub(super) struct BodySpec {
 #[derive(Debug, Clone, Default)]
 pub(super) struct Profile {
     pub(super) bodies: Vec<BodySpec>,
-    /// Per bone, whether it has a body.
-    pub(super) physical: Vec<bool>,
+    /// Per bone, its body's index in `bodies`, if it has one.
+    pub(super) body_of: Vec<Option<usize>>,
 }
 
 /// Build the profile from bind-pose locals (`RigPose::binds`) and parents. `None` when fewer than
@@ -103,7 +106,17 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
         }
     }
 
+    let hub = find_hub(&subtree, &parent_of, n);
+    // The hub's ancestors ride it rigidly (the origin root, a bone above the pelvis): a body there
+    // would hang off the hub upside down.
+    let mut above_hub = vec![false; n];
+    let mut up = parent_of(hub);
+    while let Some(p) = up {
+        above_hub[p] = true;
+        up = parent_of(p);
+    }
     let mut candidates: Vec<(usize, Vec3)> = (0..n)
+        .filter(|&i| i != hub && !above_hub[i])
         .filter_map(|i| {
             let seg = pivots[main_child[i]?] - pivots[i];
             // A root bone at the model origin spans origin to pelvis: no limb.
@@ -111,16 +124,22 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
             (seg.length() >= MIN_SEGMENT * height && !root_like).then_some((i, seg))
         })
         .collect();
-    if candidates.len() > MAX_BODIES {
+    if candidates.len() + 1 > MAX_BODIES {
         candidates.sort_by(|a, b| b.1.length().total_cmp(&a.1.length()));
-        candidates.truncate(MAX_BODIES);
-        candidates.sort_by_key(|c| c.0);
+        candidates.truncate(MAX_BODIES - 1);
     }
-    if candidates.len() < 3 {
+    if candidates.len() < 2 {
         return None;
     }
+    candidates.sort_by_key(|c| c.0);
+    // The hub always has a body, however short its own segment: everything hangs off it. A hub
+    // with no child to run to gets a short stub up.
+    let hub_seg = main_child[hub]
+        .map(|c| pivots[c] - pivots[hub])
+        .filter(|s| s.length() >= 0.5 * MIN_SEGMENT * height)
+        .unwrap_or(Vec3::Y * MIN_SEGMENT * height);
+    candidates.insert(0, (hub, hub_seg));
 
-    let mut physical = vec![false; n];
     let mut body_of = vec![None; n];
     let mut bodies = Vec::with_capacity(candidates.len());
     for (i, seg) in candidates {
@@ -137,7 +156,6 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
         if parent.is_none() && !bodies.is_empty() {
             parent = Some(0);
         }
-        physical[i] = true;
         body_of[i] = Some(bodies.len());
         bodies.push(BodySpec {
             bone: i as u16,
@@ -148,7 +166,28 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
             parent,
         });
     }
-    Some(Profile { bodies, physical })
+    Some(Profile { bodies, body_of })
+}
+
+/// The hub: from the root with the largest subtree, step into the child that holds at least
+/// [`HUB_SHARE`] of the bone's descendants, until no child does. That is where the body branches
+/// (a pelvis, a spider's thorax), whatever its index or its own segment's length.
+fn find_hub(subtree: &[usize], parent_of: &impl Fn(usize) -> Option<usize>, n: usize) -> usize {
+    let mut at = (0..n)
+        .filter(|&i| parent_of(i).is_none())
+        .max_by_key(|&i| subtree[i])
+        .unwrap_or(0);
+    loop {
+        let below = subtree[at].saturating_sub(1).max(1) as f32;
+        let next = (at + 1..n)
+            .filter(|&c| parent_of(c) == Some(at))
+            .max_by_key(|&c| subtree[c])
+            .filter(|&c| subtree[c] as f32 >= HUB_SHARE * below);
+        match next {
+            Some(c) => at = c,
+            None => return at,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -181,8 +220,9 @@ mod tests {
         let (binds, parents) = stick();
         let p = build_profile(&binds, &parents).expect("a profile");
         let bones: Vec<u16> = p.bodies.iter().map(|b| b.bone).collect();
-        assert!(!p.physical[0], "the origin root spans no limb");
-        assert!(!p.physical[8], "a finger is under the threshold");
+        assert!(p.body_of[0].is_none(), "the origin root spans no limb");
+        assert!(p.body_of[8].is_none(), "a finger is under the threshold");
+        assert_eq!(p.bodies[0].bone, 1, "the pelvis is the hub");
         for limb in [1, 2, 5, 6, 9, 10] {
             assert!(
                 bones.contains(&limb),
