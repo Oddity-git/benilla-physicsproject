@@ -1,5 +1,6 @@
-//! A ragdoll's life: a unit seen alive that dies gets bodies at its current bone pose, the bodies
-//! drive the bones until they settle, and then the settled pose is frozen and the bodies go.
+//! A ragdoll's life: a unit seen alive that dies gets bodies at its current bone pose and the
+//! bodies drive the bones. Settled bodies sleep but stay, so a passing player can shove the corpse;
+//! a ragdoll that never settles, or the oldest past the cap, freezes its pose and the bodies go.
 //! A unit that streams in already dead keeps its Death pose: nothing was seen to fall.
 
 use avian3d::prelude::*;
@@ -17,14 +18,25 @@ use crate::entities::mount::MountBody;
 use crate::net::{NetEntity, ObjectStore, SelfPlayer};
 
 /// Joint limits about the bind pose: how far a limb may swing off its bind direction, and twist.
-const SWING_LIMIT: f32 = 70.0_f32.to_radians();
-const TWIST_LIMIT: f32 = 25.0_f32.to_radians();
-/// A ragdoll freezes once every body sleeps, or after this long regardless.
+const SWING_LIMIT: f32 = 55.0_f32.to_radians();
+const TWIST_LIMIT: f32 = 20.0_f32.to_radians();
+/// Damping of each joint's relative spin, so limbs stop swinging instead of sloshing.
+const JOINT_DAMPING: f32 = 4.0;
+/// Each body's own damping: a little air drag on its spin and fall.
+const BODY_ANGULAR_DAMPING: f32 = 0.8;
+const BODY_LINEAR_DAMPING: f32 = 0.1;
+/// A body's mass is its segment's share of the skeleton's height, floored so a hand is never so
+/// light the chain whips it, and the hub (the pelvis) weighs this many times its share.
+const MASS_FLOOR: f32 = 0.12;
+const HUB_MASS: f32 = 2.5;
+/// A ragdoll still moving after this long awake freezes where it is.
 const MAX_SIM_SECS: f32 = 12.0;
-/// Most ragdolls simulating at once; a death past it freezes the oldest.
-const MAX_ACTIVE: usize = 12;
-/// A small push at death so the body folds instead of dropping straight down (yd/s).
-const DEATH_NUDGE: f32 = 1.2;
+/// Most ragdolls keeping bodies (moving or asleep) at once; past it the oldest freezes.
+const MAX_LIVE: usize = 16;
+/// The push at death, away from where the unit faced (yd/s): full at the head, a quarter at the
+/// feet, so the body topples backwards instead of sliding; plus a little lift.
+const DEATH_PUSH: f32 = 3.0;
+const DEATH_LIFT: f32 = 0.5;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<RagdollBodies>()
@@ -49,7 +61,10 @@ pub(super) struct LastSpot(Vec3);
 #[derive(Component)]
 pub(super) struct Ragdoll {
     profile: Profile,
-    started: f32,
+    /// When it fell, for the cap's oldest-first order.
+    born: f32,
+    /// When its bodies last all slept (or it fell): awake past [`MAX_SIM_SECS`] from here freezes.
+    awake_since: f32,
     /// Frozen bone locals once settled, by profile body; `None` while the bodies simulate.
     frozen: Option<Vec<Transform>>,
 }
@@ -143,7 +158,13 @@ fn start_ragdolls(
         let facing = (unit_tf.rotation() * Vec3::NEG_Z)
             .with_y(0.0)
             .normalize_or_zero();
-        let nudge = (-facing + Vec3::Y * 0.3) * DEATH_NUDGE;
+        let (lo, hi) = profile
+            .bodies
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), b| {
+                (lo.min(b.pivot.y), hi.max(b.pivot.y))
+            });
+        let span = (hi - lo).max(f32::EPSILON);
 
         let mut spawned = Vec::with_capacity(profile.bodies.len());
         let mut isos = Vec::with_capacity(profile.bodies.len());
@@ -156,6 +177,14 @@ fn start_ragdolls(
             let rot = (frame_rot * bone_rot).normalize();
             let len = body.segment.length() * scale;
             let radius = body.radius * scale;
+            let up = ((body.pivot.y - lo) / span).clamp(0.0, 1.0);
+            let push = -facing * DEATH_PUSH * (0.25 + 0.75 * up) + Vec3::Y * DEATH_LIFT;
+            let share = (body.segment.length() / span).max(MASS_FLOOR);
+            let mass = if body.parent.is_none() {
+                share * HUB_MASS
+            } else {
+                share
+            };
             // The capsule along the segment, in the body's frame (bind rotations are identity, so
             // the bind segment is already bone-local).
             let axis = Quat::from_rotation_arc(Vec3::Y, body.segment / body.segment.length());
@@ -171,7 +200,10 @@ fn start_ragdolls(
                     RigidBody::Dynamic,
                     shape,
                     ragdoll_layers(),
-                    LinearVelocity(unit_velocity + nudge),
+                    Mass(mass),
+                    LinearDamping(BODY_LINEAR_DAMPING),
+                    AngularDamping(BODY_ANGULAR_DAMPING),
+                    LinearVelocity(unit_velocity + push),
                     TransformInterpolation,
                 ))
                 .id();
@@ -203,6 +235,10 @@ fn start_ragdolls(
                     .with_local_basis2(basis)
                     .with_swing_limits(-SWING_LIMIT, SWING_LIMIT)
                     .with_twist_limits(-TWIST_LIMIT, TWIST_LIMIT),
+                JointDamping {
+                    linear: 0.0,
+                    angular: JOINT_DAMPING,
+                },
             ));
         }
         info!(
@@ -212,22 +248,23 @@ fn start_ragdolls(
         bodies.0.insert(unit, spawned);
         commands.entity(unit).insert(Ragdoll {
             profile,
-            started: time.elapsed_secs(),
+            born: time.elapsed_secs(),
+            awake_since: time.elapsed_secs(),
             frozen: None,
         });
     }
 
-    // Past the cap, the oldest simulating ragdoll settles where it is.
+    // Past the cap, the oldest ragdoll with bodies freezes where it is.
     let mut live: Vec<(Entity, f32)> = active
         .iter()
         .filter(|(_, r)| r.frozen.is_none())
-        .map(|(e, r)| (e, r.started))
+        .map(|(e, r)| (e, r.born))
         .collect();
-    if live.len() > MAX_ACTIVE {
+    if live.len() > MAX_LIVE {
         live.sort_by(|a, b| a.1.total_cmp(&b.1));
-        for (e, _) in live.iter().take(live.len() - MAX_ACTIVE) {
+        for (e, _) in live.iter().take(live.len() - MAX_LIVE) {
             if let Ok((_, mut r)) = active.get_mut(*e) {
-                r.started = f32::NEG_INFINITY; // `freeze_settled` takes it this frame
+                r.awake_since = f32::NEG_INFINITY; // `freeze_settled` takes it this frame
             }
         }
     }
@@ -301,8 +338,9 @@ fn write_pose(
     rig.pose_dirty = true;
 }
 
-/// Freezes a ragdoll once all its bodies sleep (or [`MAX_SIM_SECS`] passes): its body bones keep
-/// their last locals and the bodies and joints go.
+/// Freezes a ragdoll awake for [`MAX_SIM_SECS`] without settling (or pushed past the cap): its
+/// body bones keep their last locals and the bodies and joints go. One whose bodies all sleep keeps
+/// them, its clock reset, so a player's push can wake it.
 fn freeze_settled(
     mut commands: Commands,
     time: Res<Time>,
@@ -320,7 +358,11 @@ fn freeze_settled(
             continue;
         };
         let asleep = ids.iter().all(|id| sleeping.get(*id).unwrap_or(true));
-        if !asleep && now - rag.started < MAX_SIM_SECS {
+        if asleep && rag.awake_since.is_finite() {
+            rag.awake_since = now;
+            continue;
+        }
+        if now - rag.awake_since < MAX_SIM_SECS {
             continue;
         }
         let frozen = rag

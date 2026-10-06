@@ -2,12 +2,13 @@
 //! are this fork's, kept apart so upstream merges stay small.
 //!
 //! A unit seen alive that dies falls as a ragdoll (`life`), its bodies picked automatically from
-//! its skeleton (`rig`); `WOW_NO_RAGDOLL=1` turns that off. The dev chord + `B` drops a test box
-//! (`testbox`).
+//! its skeleton (`rig`); `WOW_NO_RAGDOLL=1` turns that off. Living players carry a capsule that
+//! shoves the bodies aside (`pusher`). The dev chord + `B` drops a test box (`testbox`).
 
 use bevy::prelude::*;
 
 mod life;
+mod pusher;
 mod rig;
 mod testbox;
 
@@ -17,5 +18,6 @@ impl Plugin for RagdollPlugin {
     fn build(&self, app: &mut App) {
         testbox::plugin(app);
         life::plugin(app);
+        pusher::plugin(app);
     }
 }

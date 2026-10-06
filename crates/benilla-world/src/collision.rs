@@ -36,6 +36,9 @@ pub(crate) enum CollisionLayer {
     /// Fork: ragdoll bodies. They land on terrain, doodads and WMO walking faces, and no query
     /// asks for them, so the body, camera and pick traces pass through a corpse.
     Ragdoll,
+    /// Fork: a character's push capsule, which only ragdoll bodies feel: a player walks a corpse
+    /// aside, and no query or world collider sees it.
+    Pusher,
 }
 
 /// The camera probe's radius (yd) against the solid world. Deviation: the reference's camera
@@ -59,13 +62,23 @@ pub(crate) fn liquid_layers() -> CollisionLayers {
     CollisionLayers::new(CollisionLayer::Liquid, LayerMask::ALL)
 }
 
-/// Fork: `CollisionLayers` for a ragdoll body, which collides with the walking world only: not
-/// with other ragdoll bodies, so a rig's overlapping capsules never fight at spawn.
+/// Fork: `CollisionLayers` for a ragdoll body, which collides with the walking world and the
+/// characters' push capsules: not with other ragdoll bodies, so a rig's overlapping capsules never
+/// fight at spawn.
 pub fn ragdoll_layers() -> CollisionLayers {
     CollisionLayers::new(
         CollisionLayer::Ragdoll,
-        [CollisionLayer::Default, CollisionLayer::Walk],
+        [
+            CollisionLayer::Default,
+            CollisionLayer::Walk,
+            CollisionLayer::Pusher,
+        ],
     )
+}
+
+/// Fork: `CollisionLayers` for a character's push capsule, which collides with ragdoll bodies only.
+pub fn pusher_layers() -> CollisionLayers {
+    CollisionLayers::new(CollisionLayer::Pusher, CollisionLayer::Ragdoll)
 }
 
 /// How many times the world's collider set has changed: bumped when [`crate::terrain_stream`]
