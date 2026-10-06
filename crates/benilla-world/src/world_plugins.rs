@@ -12,14 +12,17 @@ pub struct WorldPlugins;
 
 impl PluginGroup for WorldPlugins {
     fn build(self) -> PluginGroupBuilder {
-        PluginGroupBuilder::start::<Self>()
+        let builder = PluginGroupBuilder::start::<Self>()
             // The engine's WGSL first: every material below specializes against it, and an
             // unregistered shader fails silently.
             .add(crate::shaders::plugin)
             .add(MaterialPlugin::<TerrainMaterial>::default())
             .add(MaterialPlugin::<WowModelMaterial>::default())
             // Physics (avian3d): colliders, their BVH and the shape-casts of controller and picker.
-            .add_group(PhysicsPlugins::default())
+            .add_group(PhysicsPlugins::default());
+        // Fork: with `dynamics` the solver, contacts and joints stay on, for ragdolls.
+        #[cfg(not(feature = "dynamics"))]
+        let builder = builder
             // No contact pipeline: nothing reads a contact (the player is a shape-cast controller,
             // units carry no colliders), and trimesh pairs against terrain tiles cost whole ticks.
             // The collider BVH the shape-casts ride is `ColliderTreePlugin`'s, kept.
@@ -44,7 +47,8 @@ impl PluginGroup for WorldPlugins {
             .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<RevoluteJoint>>()
             .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<PrismaticJoint>>()
             .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<DistanceJoint>>()
-            .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<SphericalJoint>>()
+            .disable::<avian3d::dynamics::solver::joint_graph::JointGraphPlugin<SphericalJoint>>();
+        builder
             .add(WorldFoundation)
             // The per-frame transition order (Input → Stream → Present) by which the loading
             // screen covers a teleport the frame it happens.
@@ -129,7 +133,8 @@ impl Plugin for WorldFoundation {
     fn build(&self, app: &mut App) {
         // One solver substep, not avian's 6: with no dynamic bodies, kinematic motion is exact at
         // any count. Revisit when a dynamic body enters the world.
-        app.insert_resource(SubstepCount(1))
+        // Fork: ragdoll joints need substeps to hold together; 1 is upstream's count.
+        app.insert_resource(SubstepCount(if cfg!(feature = "dynamics") { 8 } else { 1 }))
             // WoW's 19.29 yd/s² gravity for avian's 9.81; a feel knob, not a fidelity target.
             .insert_resource(Gravity(Vec3::NEG_Y * 19.291_105))
             // The view distance (`farclip`), one source for the far wall and the per-object cull.

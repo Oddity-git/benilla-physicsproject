@@ -90,6 +90,8 @@ const PUBLISHED: &[(&str, &str)] = &[
     ("build_id::banner", "record"),
     ("collision::ColliderEpoch", "record"),
     ("collision::MoverTraceExclusions", "record"),
+    // Fork: the ragdoll bodies' layer.
+    ("collision::ragdoll_layers", "record"),
     ("collision::WorldCollision", "record"),
     ("decal::WorldDecal", "record"),
     ("dev_state::STILL_INPUTS_CHANGED", "record"),

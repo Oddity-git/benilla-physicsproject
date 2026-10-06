@@ -15,6 +15,8 @@ default = ["dev"]
 # `bevy/debug` names systems and parameters in ECS diagnostics (else "Enable the debug feature to
 # see the name"); set here so `benilla-worldview`, which reports those names, gets it too.
 dev = ["benilla-formats/dev", "benilla-assets/dev", "bevy/debug"]
+# Fork: keeps avian's solver, contacts and joints on, which ragdolls need. Off upstream.
+dynamics = []
 
 [dependencies]
 avian3d = "0.6"

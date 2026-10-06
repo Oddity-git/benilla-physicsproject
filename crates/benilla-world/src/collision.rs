@@ -33,6 +33,9 @@ pub(crate) enum CollisionLayer {
     /// collision queries (`0x50e5ec`), and `0x69cc13` reads that nibble to gate the chunk's four
     /// MCLQ slots (`0x10000` river/lake, `0x20000` ocean, `0x40000` magma, `0x80000` slime).
     Liquid,
+    /// Fork: ragdoll bodies. They land on terrain, doodads and WMO walking faces, and no query
+    /// asks for them, so the body, camera and pick traces pass through a corpse.
+    Ragdoll,
 }
 
 /// The camera probe's radius (yd) against the solid world. Deviation: the reference's camera
@@ -54,6 +57,19 @@ pub(crate) fn camera_layers() -> CollisionLayers {
 /// swimmer is never stopped by the water they are in.
 pub(crate) fn liquid_layers() -> CollisionLayers {
     CollisionLayers::new(CollisionLayer::Liquid, LayerMask::ALL)
+}
+
+/// Fork: `CollisionLayers` for a ragdoll body, which collides with the walking world and with
+/// other ragdolls; the caller filters out its own rig's neighbours.
+pub fn ragdoll_layers() -> CollisionLayers {
+    CollisionLayers::new(
+        CollisionLayer::Ragdoll,
+        [
+            CollisionLayer::Default,
+            CollisionLayer::Walk,
+            CollisionLayer::Ragdoll,
+        ],
+    )
 }
 
 /// How many times the world's collider set has changed: bumped when [`crate::terrain_stream`]

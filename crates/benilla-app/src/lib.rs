@@ -84,6 +84,8 @@ mod preflight;
 mod probe_shield;
 mod query_cache;
 mod quest_markers;
+#[cfg(feature = "ragdoll")]
+mod ragdoll;
 mod raid_marks;
 mod ranged_flex;
 mod realm_select;
@@ -416,6 +418,10 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         connect: !capturing,
         start: run_mode::start_state(),
     });
+
+    // Fork: physics ragdolls, on top of the game.
+    #[cfg(feature = "ragdoll")]
+    app.add_plugins(ragdoll::RagdollPlugin);
 
     // benilla-assets' loaders go into the live `AssetServer`, so they register after `AssetPlugin`.
     benilla_assets::register_asset_loaders(&mut app);
