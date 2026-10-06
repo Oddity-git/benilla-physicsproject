@@ -29,7 +29,8 @@ pub struct RigPose {
     /// Bone flags `0x1/0x2/0x4`: how the parent matrix is rebuilt from the model root.
     pub(crate) arms: Vec<Option<benilla_formats::ParentArm>>,
     /// Bind-pose local translations, the pivots the arm preserves; `locals` hold the animated ones.
-    pub(crate) binds: Vec<Vec3>,
+    /// Fork: public so the ragdoll can rebuild the bind pivots.
+    pub binds: Vec<Vec3>,
     pub(crate) has_billboard: bool,
     /// A bone billboards or carries a parent arm, so the world pass's override walk runs.
     pub(crate) has_special: bool,

@@ -59,16 +59,12 @@ pub(crate) fn liquid_layers() -> CollisionLayers {
     CollisionLayers::new(CollisionLayer::Liquid, LayerMask::ALL)
 }
 
-/// Fork: `CollisionLayers` for a ragdoll body, which collides with the walking world and with
-/// other ragdolls; the caller filters out its own rig's neighbours.
+/// Fork: `CollisionLayers` for a ragdoll body, which collides with the walking world only: not
+/// with other ragdoll bodies, so a rig's overlapping capsules never fight at spawn.
 pub fn ragdoll_layers() -> CollisionLayers {
     CollisionLayers::new(
         CollisionLayer::Ragdoll,
-        [
-            CollisionLayer::Default,
-            CollisionLayer::Walk,
-            CollisionLayer::Ragdoll,
-        ],
+        [CollisionLayer::Default, CollisionLayer::Walk],
     )
 }
 
