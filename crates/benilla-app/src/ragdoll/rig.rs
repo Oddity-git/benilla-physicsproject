@@ -10,9 +10,9 @@ const MIN_SEGMENT: f32 = 0.08;
 /// Most bodies a rig gets, keeping the longest segments.
 const MAX_BODIES: usize = 20;
 /// Capsule radius as a fraction of its segment, clamped to a band of the skeleton's height.
-const RADIUS_OF_SEGMENT: f32 = 0.22;
-const RADIUS_MIN: f32 = 0.025;
-const RADIUS_MAX: f32 = 0.07;
+const RADIUS_OF_SEGMENT: f32 = 0.3;
+const RADIUS_MIN: f32 = 0.03;
+const RADIUS_MAX: f32 = 0.1;
 
 /// One body of the profile, in bind model space (bind rotations are identity in a 1.12 M2).
 #[derive(Debug, Clone, PartialEq)]

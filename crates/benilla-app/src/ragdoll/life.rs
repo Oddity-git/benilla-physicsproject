@@ -9,7 +9,7 @@ use bevy::math::Affine3A;
 use bevy::prelude::*;
 
 use benilla_protocol::EntityKind;
-use benilla_world::collision::ragdoll_layers;
+use benilla_world::collision::{ragdoll_layers, RagdollIgnore};
 use benilla_world::rig_anim::RigPose;
 
 use super::rig::{build_profile, Profile};
@@ -41,6 +41,7 @@ const DEATH_LIFT: f32 = 0.5;
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<RagdollBodies>()
         .add_systems(Update, (track_unit_motion, start_ragdolls).chain())
+        .add_systems(FixedUpdate, release_parted_pairs)
         .add_systems(
             PostUpdate,
             (drive_bones_from_bodies, freeze_settled, cleanup)
@@ -71,6 +72,62 @@ pub(super) struct Ragdoll {
     anchors: Vec<(usize, Affine3A)>,
     /// Every bone local once frozen; `None` while the bodies simulate.
     frozen: Option<Vec<Transform>>,
+}
+
+/// A ragdoll body's capsule in its own frame: from its origin to `end`, this thick (yd).
+#[derive(Component, Clone, Copy)]
+struct Capsule {
+    end: Vec3,
+    radius: f32,
+}
+
+impl Capsule {
+    /// The capsule's segment in the world, from the body's pose.
+    fn segment(&self, at: Vec3, rot: Quat) -> (Vec3, Vec3) {
+        (at, at + rot * self.end)
+    }
+}
+
+/// Two bodies' capsules overlap, with a little slack so a pair that only grazes at spawn is
+/// still let through until it parts.
+fn capsules_overlap(a: (Capsule, Vec3, Quat), b: (Capsule, Vec3, Quat)) -> bool {
+    let (a0, a1) = a.0.segment(a.1, a.2);
+    let (b0, b1) = b.0.segment(b.1, b.2);
+    segment_distance(a0, a1, b0, b1) < (a.0.radius + b.0.radius) * 1.1
+}
+
+/// The closest distance between segments `p0..p1` and `q0..q1`.
+fn segment_distance(p0: Vec3, p1: Vec3, q0: Vec3, q1: Vec3) -> f32 {
+    let (d1, d2, r) = (p1 - p0, q1 - q0, p0 - q0);
+    let (a, e, f) = (d1.length_squared(), d2.length_squared(), d2.dot(r));
+    let (s, t) = if a <= f32::EPSILON && e <= f32::EPSILON {
+        (0.0, 0.0)
+    } else if a <= f32::EPSILON {
+        (0.0, (f / e).clamp(0.0, 1.0))
+    } else {
+        let c = d1.dot(r);
+        if e <= f32::EPSILON {
+            ((-c / a).clamp(0.0, 1.0), 0.0)
+        } else {
+            let b = d1.dot(d2);
+            let denom = a * e - b * b;
+            let mut s = if denom > f32::EPSILON {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mut t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+            (s, t)
+        }
+    };
+    ((p0 + d1 * s) - (q0 + d2 * t)).length()
 }
 
 /// The body entities of each ragdolled unit, profile order, so a unit that vanishes or stands up
@@ -204,6 +261,11 @@ fn start_ragdolls(
                     RigidBody::Dynamic,
                     shape,
                     ragdoll_layers(),
+                    ActiveCollisionHooks::FILTER_PAIRS,
+                    Capsule {
+                        end: body.segment * scale,
+                        radius,
+                    },
                     Mass(mass),
                     LinearDamping(BODY_LINEAR_DAMPING),
                     AngularDamping(BODY_ANGULAR_DAMPING),
@@ -244,6 +306,36 @@ fn start_ragdolls(
                     angular: JOINT_DAMPING,
                 },
             ));
+        }
+        // A rig's own bodies collide, but never across a joint, and a pair overlapping now only
+        // once it has parted (`release_parted_pairs`).
+        let capsules: Vec<(Capsule, Vec3, Quat)> = profile
+            .bodies
+            .iter()
+            .zip(&isos)
+            .map(|(b, &(at, rot))| {
+                let capsule = Capsule {
+                    end: b.segment * scale,
+                    radius: b.radius * scale,
+                };
+                (capsule, at, rot)
+            })
+            .collect();
+        for k in 0..spawned.len() {
+            let mut ignore = RagdollIgnore::default();
+            for j in 0..spawned.len() {
+                if j == k {
+                    continue;
+                }
+                let jointed =
+                    profile.bodies[k].parent == Some(j) || profile.bodies[j].parent == Some(k);
+                if jointed {
+                    ignore.joined.push(spawned[j]);
+                } else if capsules_overlap(capsules[k], capsules[j]) {
+                    ignore.overlapping.push(spawned[j]);
+                }
+            }
+            commands.entity(spawned[k]).insert(ignore);
         }
         let hub = profile.bodies[0].bone as usize;
         let anchors = match rig.model.get(hub) {
@@ -446,5 +538,24 @@ fn despawn_bodies(
         if let Ok(mut e) = commands.get_entity(*id) {
             e.despawn();
         }
+    }
+}
+
+/// Lets a rig's bodies that overlapped at spawn collide once their capsules have parted, so an arm
+/// folded against the chest at death is let go but cannot pass back through it.
+fn release_parted_pairs(
+    mut bodies: Query<(&mut RagdollIgnore, &Capsule, &Position, &Rotation)>,
+    poses: Query<(&Capsule, &Position, &Rotation)>,
+) {
+    for (mut ignore, capsule, at, rot) in &mut bodies {
+        if ignore.overlapping.is_empty() {
+            continue;
+        }
+        let me = (*capsule, at.0, rot.0);
+        ignore.overlapping.retain(|other| {
+            poses
+                .get(*other)
+                .is_ok_and(|(c, p, r)| capsules_overlap(me, (*c, p.0, r.0)))
+        });
     }
 }

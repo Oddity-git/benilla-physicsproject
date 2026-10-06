@@ -62,18 +62,51 @@ pub(crate) fn liquid_layers() -> CollisionLayers {
     CollisionLayers::new(CollisionLayer::Liquid, LayerMask::ALL)
 }
 
-/// Fork: `CollisionLayers` for a ragdoll body, which collides with the walking world and the
-/// characters' push capsules: not with other ragdoll bodies, so a rig's overlapping capsules never
-/// fight at spawn.
+/// Fork: `CollisionLayers` for a ragdoll body, which collides with the walking world, the
+/// characters' push capsules and other ragdoll bodies, less the pairs [`RagdollIgnore`] names.
 pub fn ragdoll_layers() -> CollisionLayers {
     CollisionLayers::new(
         CollisionLayer::Ragdoll,
         [
             CollisionLayer::Default,
             CollisionLayer::Walk,
+            CollisionLayer::Ragdoll,
             CollisionLayer::Pusher,
         ],
     )
+}
+
+/// Fork: the ragdoll bodies this one never collides with: `joined`, the bodies it shares a joint
+/// with, for good; `overlapping`, the ones its capsule overlapped at spawn, until they part. Read
+/// by [`RagdollHooks`] on a collider that carries `ActiveCollisionHooks::FILTER_PAIRS`.
+#[derive(Component, Default)]
+pub struct RagdollIgnore {
+    pub joined: Vec<bevy::ecs::entity::Entity>,
+    pub overlapping: Vec<bevy::ecs::entity::Entity>,
+}
+
+impl RagdollIgnore {
+    fn ignores(&self, other: bevy::ecs::entity::Entity) -> bool {
+        self.joined.contains(&other) || self.overlapping.contains(&other)
+    }
+}
+
+/// Fork: the collision hooks, which drop the pairs a [`RagdollIgnore`] names.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct RagdollHooks<'w, 's> {
+    ignore: bevy::ecs::system::Query<'w, 's, &'static RagdollIgnore>,
+}
+
+impl CollisionHooks for RagdollHooks<'_, '_> {
+    fn filter_pairs(
+        &self,
+        collider1: bevy::ecs::entity::Entity,
+        collider2: bevy::ecs::entity::Entity,
+        _commands: &mut bevy::ecs::system::Commands,
+    ) -> bool {
+        let ignores = |a, b| self.ignore.get(a).is_ok_and(|i| i.ignores(b));
+        !ignores(collider1, collider2) && !ignores(collider2, collider1)
+    }
 }
 
 /// Fork: `CollisionLayers` for a character's push capsule, which collides with ragdoll bodies only.

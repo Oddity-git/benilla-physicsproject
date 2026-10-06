@@ -17,10 +17,16 @@ impl PluginGroup for WorldPlugins {
             // unregistered shader fails silently.
             .add(crate::shaders::plugin)
             .add(MaterialPlugin::<TerrainMaterial>::default())
-            .add(MaterialPlugin::<WowModelMaterial>::default())
-            // Physics (avian3d): colliders, their BVH and the shape-casts of controller and picker.
-            .add_group(PhysicsPlugins::default());
-        // Fork: with `dynamics` the solver, contacts and joints stay on, for ragdolls.
+            .add(MaterialPlugin::<WowModelMaterial>::default());
+        // Physics (avian3d): colliders, their BVH and the shape-casts of controller and picker.
+        #[cfg(not(feature = "dynamics"))]
+        let builder = builder.add_group(PhysicsPlugins::default());
+        // Fork: with `dynamics` the solver, contacts and joints stay on, for ragdolls, and the
+        // hooks drop the ragdoll body pairs that must not collide.
+        #[cfg(feature = "dynamics")]
+        let builder = builder.add_group(
+            PhysicsPlugins::default().with_collision_hooks::<crate::collision::RagdollHooks>(),
+        );
         #[cfg(not(feature = "dynamics"))]
         let builder = builder
             // No contact pipeline: nothing reads a contact (the player is a shape-cast controller,
