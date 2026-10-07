@@ -79,7 +79,6 @@ Everything here is **client side only**. The server, other players and their cli
 | 1.12 addons | Yes | Same addon support as benilla. |
 | MPQ patches | Mostly | benilla reads your install's patch chain as the stock client does. Blood patch mods are not needed and may draw oddly (a flat splat in the air); use the Blood option instead. |
 | Upstream benilla | Yes | The fork tracks upstream. The fork's code sits in its own module behind a `ragdoll` feature, so upstream changes merge in cleanly. It is never sent back upstream as a pull request. |
-| Other benilla forks | Not merged | Another fork (a skatecraft client, for example) can be built as its own second client next to this one. |
 | `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds its own settings (`violenceLevel`, `goreAmount`, `dismemberment`, `dismemberAmount`, `hitstop`, `hitstopStrength`, `ragdollSpellPush`), which upstream ignores. |
 | Warden (anticheat) | No | As with upstream, use a server with Warden off. |
 
@@ -112,7 +111,8 @@ Ragdolls are on by default.
 - `WOW_NO_RAGDOLL=1` turns them off for a session.
 - `cargo build --release -p benilla --no-default-features --features dev` builds without the fork's
   physics at all.
-- In a dev build, the dev chord plus `B` drops a test box, to check that physics runs.
+- In a dev build, the dev chord plus `B` drops a test crate, to check that physics runs. Each drop
+  uses the next crate model from your install.
 
 The rest works as in upstream:
 
@@ -142,7 +142,7 @@ The fork's code is kept in a few places so it stays easy to merge with upstream:
   - `bounds.rs`: keeps a flung ragdoll from being culled
   - `frost.rs`: the frozen body's ice tint
   - `hitstop.rs`: the hold on a landed hit
-  - `testbox.rs`: the test box
+  - `testbox.rs`: the test crate
 - `crates/benilla-world/src/collision.rs` and `world_plugins.rs` add the ragdoll collision layers
   and turn on avian's solver (the `dynamics` feature).
 - Small hooks elsewhere are marked `Fork:` in their comments.
