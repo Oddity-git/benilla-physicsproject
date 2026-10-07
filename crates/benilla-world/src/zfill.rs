@@ -105,7 +105,17 @@ fn trace(what: &str, part: Entity, tag: u32) {
 /// The depth-prime lane's registration.
 pub fn plugin(app: &mut App) {
     // PostUpdate, after every Update-side tag writer, so a twin arms on its episode's first frame.
-    app.add_systems(PostUpdate, sync_zfill_twins);
+    // Fork: and before Bevy reads which meshes need their pipelines, so a twin spawned this frame
+    // is never drawn without one (an unordered spawn can land between that read and the draw,
+    // which panics in `specialize_material_meshes`).
+    app.add_systems(
+        PostUpdate,
+        sync_zfill_twins.before(
+            bevy::pbr::check_entities_needing_specialization::<
+                benilla_assets::materials::WowModelMaterial,
+            >,
+        ),
+    );
 }
 
 #[cfg(test)]
