@@ -25,6 +25,9 @@ Everything here is **client side only**. The server, other players and their cli
   launches into the sky.
 - **Death push.** A body is thrown away from whoever killed it, harder the more of its health the
   killing blow took.
+- **Spell kills.** A spell's killing blow throws the body harder (the `ragdollSpellPush` setting,
+  2 by default). A frost spell's kill freezes it instead: the body stays stiff in the pose it died
+  in, topples over like a statue, and turns icy blue.
 - **Pushable corpses.** Living players carry an invisible capsule that shoves ragdolls aside as
   you walk through them.
 - **Loot bags.** Because a ragdoll no longer lies where the server thinks the corpse is, a lootable
@@ -59,7 +62,7 @@ Everything here is **client side only**. The server, other players and their cli
 | MPQ patches | Mostly | benilla reads your install's patch chain as the stock client does. Blood patch mods are not needed and may draw oddly (a flat splat in the air); use the Blood option instead. |
 | Upstream benilla | Yes | The fork tracks upstream. The fork's code sits in its own module behind a `ragdoll` feature, so upstream changes merge in cleanly. It is never sent back upstream as a pull request. |
 | Other benilla forks | Not merged | Another fork (a skatecraft client, for example) can be built as its own second client next to this one. |
-| `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds two settings, `violenceLevel` and `dismemberment`, which upstream ignores. |
+| `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds three settings, `violenceLevel`, `dismemberment` and `ragdollSpellPush`, which upstream ignores. |
 | Warden (anticheat) | No | As with upstream, use a server with Warden off. |
 
 ## Running it
@@ -119,6 +122,7 @@ The fork's code is kept in a few places so it stays easy to merge with upstream:
   - `lootbag.rs`: the sacks
   - `pusher.rs`: the player capsules
   - `bounds.rs`: keeps a flung ragdoll from being culled
+  - `frost.rs`: the frozen body's ice tint
   - `testbox.rs`: the test box
 - `crates/benilla-world/src/collision.rs` and `world_plugins.rs` add the ragdoll collision layers
   and turn on avian's solver (the `dynamics` feature).

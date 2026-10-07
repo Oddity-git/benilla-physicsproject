@@ -726,11 +726,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "benilla's own — the reference fixes the gore level by region (2 for enUS) and \
          offers no setting",
     ),
-    // benilla's own: ragdolls lose limbs on heavy killing blows. Saved, not yet read.
+    // benilla's own: ragdolls lose limbs on heavy killing blows (`ragdoll::life`).
     ours(
         "dismemberment",
         "0",
         "benilla's own — 1.12 ragdolls nothing, so it has nothing to dismember",
+    ),
+    // benilla's own: a spell's killing blow throws its ragdoll this many times harder.
+    ours(
+        "ragdollSpellPush",
+        "2",
+        "benilla's own — 1.12 ragdolls nothing, so it throws nothing",
     ),
     // `lastCharacterIndex` (`0x402d93`, "0" `0x82e570`, category 4, handle `[0x882674]`), help
     // "Last character selected": a 0-based row (the selection cell `[0x83856c]` under `"%d"`), so

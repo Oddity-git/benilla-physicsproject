@@ -28,6 +28,8 @@ pub(super) struct LastHit {
     pub(super) attacker: u64,
     pub(super) damage: u32,
     pub(super) at: f32,
+    /// A spell's school (0 physical, 4 frost), `None` for a swing.
+    pub(super) school: Option<u32>,
 }
 
 fn on_attacker_state(
@@ -43,6 +45,7 @@ fn on_attacker_state(
             victim: s.victim,
             damage: s.damage,
             physical: true,
+            school: None,
         };
         record(&mut commands, &index, &time, &mut hits, blow);
     }
@@ -62,6 +65,7 @@ fn on_spell_damage_log(
             damage: s.damage,
             // School 0 is physical; a bleed's tick is no fresh wound.
             physical: s.school == 0 && !s.periodic,
+            school: Some(u32::from(s.school)),
         };
         record(&mut commands, &index, &time, &mut hits, blow);
     }
@@ -72,6 +76,7 @@ struct Blow {
     victim: u64,
     damage: u32,
     physical: bool,
+    school: Option<u32>,
 }
 
 fn record(
@@ -90,6 +95,7 @@ fn record(
                 attacker: blow.attacker,
                 damage: blow.damage,
                 at: time.elapsed_secs(),
+                school: blow.school,
             });
             hits.write(Hit {
                 victim,

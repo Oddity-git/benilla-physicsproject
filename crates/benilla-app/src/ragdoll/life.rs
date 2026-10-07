@@ -48,6 +48,14 @@ const MAX_PUSH: f32 = 12.0;
 /// A hit older than this when the unit reads dead was not the killing blow (s).
 const BLOW_WINDOW: f32 = 2.0;
 const DEATH_LIFT: f32 = 0.5;
+/// The frost school: a frost killing blow freezes the body stiff, its joints locked this tight at
+/// the pose it died in, damped this hard, and tipped over by this push (yd/s) instead of thrown.
+const FROST_SCHOOL: u32 = 4;
+const FROZEN_LIMIT: f32 = 2.0_f32.to_radians();
+const FROZEN_DAMPING: f32 = 60.0;
+const FROZEN_TIP: f32 = 2.5;
+/// A spell killing blow's push is times this unless `ragdollSpellPush` says otherwise.
+const SPELL_PUSH: f32 = 2.0;
 /// A severed limb leaves its body this much faster (yd/s), away and up.
 const SEVER_FLING: f32 = 4.0;
 const SEVER_LIFT: f32 = 3.0;
@@ -305,20 +313,34 @@ fn start_ragdolls(
         let blow_share = blow
             .filter(|b| time.elapsed_secs() - b.at <= BLOW_WINDOW)
             .map_or(0.0, |b| (b.damage as f32 / max_health).min(1.0));
+        let killing = blow.filter(|b| time.elapsed_secs() - b.at <= BLOW_WINDOW && knock.is_none());
+        let frozen = killing.is_some_and(|b| b.school == Some(FROST_SCHOOL));
+        // A spell's killing blow throws harder, as the setting asks.
+        let spell_push = if killing.is_some_and(|b| b.school.is_some()) {
+            cvars
+                .as_deref()
+                .and_then(|c| c.num("ragdollSpellPush"))
+                .unwrap_or(SPELL_PUSH)
+                .max(0.0)
+        } else {
+            1.0
+        };
         let (away, strength, lift) = match knock {
             Some(k) => (
                 k.away.with_y(0.0).normalize_or_zero(),
                 k.away.length(),
                 k.lift,
             ),
+            // Frozen: a statue tips over, it is not thrown.
+            None if frozen => (away, FROZEN_TIP, 0.0),
             None => (
                 away,
-                (DEATH_PUSH + BLOW_PUSH * blow_share).min(MAX_PUSH),
+                (DEATH_PUSH + BLOW_PUSH * blow_share).min(MAX_PUSH) * spell_push,
                 DEATH_LIFT,
             ),
         };
         // A heavy killing blow takes limbs off, when the option allows.
-        let severed = if dismember && knock.is_none() {
+        let severed = if dismember && knock.is_none() && !frozen {
             super::dismember::choose_limbs(
                 &profile,
                 blow_share,
@@ -409,18 +431,25 @@ fn start_ragdolls(
             let (parent_at, parent_rot) = isos[p];
             let anchor1 = parent_rot.inverse() * (isos[k].0 - parent_at);
             let basis = Quat::from_rotation_arc(Vec3::Y, body.segment / body.segment.length());
+            // Frozen, the joint's rest is the pose it died in, held all but rigid.
+            let (basis1, swing, twist, damping) = if frozen {
+                let rest = (parent_rot.inverse() * isos[k].1 * basis).normalize();
+                (rest, FROZEN_LIMIT, FROZEN_LIMIT, FROZEN_DAMPING)
+            } else {
+                (basis, SWING_LIMIT, TWIST_LIMIT, JOINT_DAMPING)
+            };
             commands.spawn((
                 Name::new("ragdoll joint"),
                 SphericalJoint::new(spawned[p], spawned[k])
                     .with_local_anchor1(anchor1)
                     .with_local_anchor2(Vec3::ZERO)
-                    .with_local_basis1(basis)
+                    .with_local_basis1(basis1)
                     .with_local_basis2(basis)
-                    .with_swing_limits(-SWING_LIMIT, SWING_LIMIT)
-                    .with_twist_limits(-TWIST_LIMIT, TWIST_LIMIT),
+                    .with_swing_limits(-swing, swing)
+                    .with_twist_limits(-twist, twist),
                 JointDamping {
                     linear: 0.0,
-                    angular: JOINT_DAMPING,
+                    angular: damping,
                 },
             ));
         }
@@ -504,6 +533,9 @@ fn start_ragdolls(
         commands
             .entity(unit)
             .insert(crate::blob_shadow::NoBlobShadow);
+        if frozen {
+            commands.entity(unit).insert(super::frost::Frozen);
+        }
         commands.entity(unit).insert(Ragdoll {
             profile,
             born: now,
@@ -661,6 +693,7 @@ fn cleanup(
                 Ragdoll,
                 crate::blob_shadow::NoBlobShadow,
                 crate::creature_anim::LootSparkleOn,
+                super::frost::Frozen,
             )>();
             super::dismember::heal(&mut commands, unit);
             if let Some(ids) = bodies.0.remove(&unit) {
