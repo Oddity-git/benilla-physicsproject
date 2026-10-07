@@ -12,6 +12,7 @@
 use bevy::prelude::*;
 
 mod blow;
+mod bounds;
 mod dismember;
 mod gore;
 mod knock;
@@ -27,6 +28,7 @@ impl Plugin for RagdollPlugin {
     fn build(&self, app: &mut App) {
         testbox::plugin(app);
         blow::plugin(app);
+        bounds::plugin(app);
         dismember::plugin(app);
         gore::plugin(app);
         knock::plugin(app);

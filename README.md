@@ -118,6 +118,7 @@ The fork's code is kept in a few places so it stays easy to merge with upstream:
   - `gore.rs`: droplets, splats and pools
   - `lootbag.rs`: the sacks
   - `pusher.rs`: the player capsules
+  - `bounds.rs`: keeps a flung ragdoll from being culled
   - `testbox.rs`: the test box
 - `crates/benilla-world/src/collision.rs` and `world_plugins.rs` add the ragdoll collision layers
   and turn on avian's solver (the `dynamics` feature).
