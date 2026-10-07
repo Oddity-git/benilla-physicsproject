@@ -32,7 +32,8 @@ Everything here is **client side only**. The server, other players and their cli
 <p align="center">
   <img width="800" height="918" alt="ezgif-1a2cb90c93966869" src="https://github.com/user-attachments/assets/a6ad0691-8040-4afe-afac-edf1140b07a4" />
 </p>
--   A spell's killing blow throws the body harder (the `ragdollSpellPush` setting,
+
+- A spell's killing blow throws the body harder (the `ragdollSpellPush` setting,
   2 by default). A frost spell's kill freezes it instead: the body stays stiff in the pose it died
   in, topples over like a statue, and turns icy blue.
 - **Pushable corpses.** Living players carry an invisible capsule that shoves ragdolls aside as
