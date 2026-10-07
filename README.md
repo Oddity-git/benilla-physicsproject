@@ -17,6 +17,9 @@ Everything here is **client side only**. The server, other players and their cli
 1.12.1 game; the ragdolls, blood and loot bags exist only on your screen.
 
 ### What it adds
+<p align="center">
+<img width="800" height="918" alt="ezgif-13c5c7c3d95d6217" src="https://github.com/user-attachments/assets/6634af5a-7ee9-49e5-996d-ef1e53fb1878" />
+</p>
 
 - **Ragdolls.** A unit or player that dies falls as a physics ragdoll instead of playing its death
   animation. The ragdoll is built automatically from each model's skeleton, so it works for every
@@ -25,7 +28,11 @@ Everything here is **client side only**. The server, other players and their cli
   launches into the sky.
 - **Death push.** A body is thrown away from whoever killed it, harder the more of its health the
   killing blow took.
-- **Spell kills.** A spell's killing blow throws the body harder (the `ragdollSpellPush` setting,
+- **Spell kills.**
+<p align="center">
+  <img width="800" height="918" alt="ezgif-1a2cb90c93966869" src="https://github.com/user-attachments/assets/a6ad0691-8040-4afe-afac-edf1140b07a4" />
+</p>
+-   A spell's killing blow throws the body harder (the `ragdollSpellPush` setting,
   2 by default). A frost spell's kill freezes it instead: the body stays stiff in the pose it died
   in, topples over like a statue, and turns icy blue.
 - **Pushable corpses.** Living players carry an invisible capsule that shoves ragdolls aside as
@@ -43,7 +50,14 @@ Everything here is **client side only**. The server, other players and their cli
 - **Kick.** In a dev build, Ctrl+Shift+K kicks the creature you have targeted (within 5 yards):
   it flies, lies there a moment and gets up. This happens only on your screen; the server still
   has it standing, so a creature you are fighting keeps fighting.
-- **Dismemberment.** With the option on, a killing blow that takes a fifth of the target's health
+
+- **Dismemberment.**
+
+<p align="center">
+  <img width="800" height="918" alt="ezgif-15b6cb2616fe2b38" src="https://github.com/user-attachments/assets/e8fcf710-4343-4944-ad31-39cf5adf8712" />
+</p>
+
+  With the option on, a killing blow that takes a fifth of the target's health
   severs a limb (the head included), and one that takes half severs two. The limb flies off.
 - **Hitstop.** When a melee hit lands, the attacker's and the target's drawn poses hold for a
   moment (longer on a crit or a heavy hit), so blows feel weightier. Only the animation stops.
