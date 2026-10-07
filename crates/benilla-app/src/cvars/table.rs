@@ -716,6 +716,22 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "benilla's own — 1.12 has no player-side perf log; its nearest thing is the \
          Ctrl+R framerate label, a number with no file behind it",
     ),
+    // `violenceLevel` (0 none, 1 green, 2 true colors): the reference defaults it to its region's
+    // maximum (`0x6c5aa0`, table `0x86c3f8`, clamped by the setter `0x6c5af0`), 2 for enUS, and
+    // registers no CVar a player can move. benilla's Blood dropdown sets it. The knobs are the
+    // melee spurt (`creature_anim::blood`) and the ragdoll gore (`ragdoll::gore`).
+    ours(
+        "violenceLevel",
+        "2",
+        "benilla's own — the reference fixes the gore level by region (2 for enUS) and \
+         offers no setting",
+    ),
+    // benilla's own: ragdolls lose limbs on heavy killing blows. Saved, not yet read.
+    ours(
+        "dismemberment",
+        "0",
+        "benilla's own — 1.12 ragdolls nothing, so it has nothing to dismember",
+    ),
     // `lastCharacterIndex` (`0x402d93`, "0" `0x82e570`, category 4, handle `[0x882674]`), help
     // "Last character selected": a 0-based row (the selection cell `[0x83856c]` under `"%d"`), so
     // "0" is the first character. It mirrors [`crate::char_select::Roster::pending_index`].

@@ -1089,12 +1089,19 @@ pub(crate) fn arm_aura_state_fx(
 /// viewer; the falling edge reaps with no fade (`0x600680`).
 pub(super) fn arm_loot_fx(
     // Re-read on an edge of any of the four fields and on first sight (armed at build, `0x5d6e30`).
-    units: Query<(Entity, &ObjectStore, &crate::net::NetEntity)>,
+    units: Query<(
+        Entity,
+        &ObjectStore,
+        &crate::net::NetEntity,
+        Option<&super::LootSparkleOn>,
+    )>,
     arrived: Query<Entity, (Added<ObjectStore>, Without<ItemObject>)>,
+    moved: Query<Entity, Changed<super::LootSparkleOn>>,
     mut edges: MessageReader<FieldChanged>,
     visuals: Option<Res<SpellVisuals>>,
     mut fx: MessageWriter<SpellKitFx>,
-    mut armed: Local<EntityHashSet>,
+    // Each armed unit's sparkle and the entity it hangs on.
+    mut armed: Local<EntityHashMap<Entity>>,
     mut tutorials: Option<MessageWriter<crate::tutorial::TutorialEvent>>,
 ) {
     let full_sweep = visuals.as_ref().is_some_and(|v| v.is_changed());
@@ -1108,7 +1115,7 @@ pub(super) fn arm_loot_fx(
             FIELD_CORPSE_DYNAMIC_FLAGS, FIELD_UNIT_DYNAMIC_FLAGS, FIELD_UNIT_HEALTH,
             FIELD_UNIT_MAXHEALTH,
         };
-        let mut due: EntityHashSet = arrived.iter().collect();
+        let mut due: EntityHashSet = arrived.iter().chain(&moved).collect();
         due.extend(
             edges
                 .read()
@@ -1123,14 +1130,28 @@ pub(super) fn arm_loot_fx(
         );
         due.into_iter().filter_map(|e| units.get(e).ok()).collect()
     };
-    for (entity, store, net) in scan {
+    for (entity, store, net, on) in scan {
+        // A ragdoll's sparkle sits on its loot bag, not the body.
+        let host = on.map_or(entity, |o| o.0);
         // A corpse object's sparkle: bit 0 rising calls `0x5d6e30`, the same row at the same tag.
         let lootable = if net.kind == benilla_protocol::EntityKind::Corpse {
             store.0.corpse_lootable()
         } else {
             store.0.unit_is_dead() && store.0.unit_lootable()
         };
-        if lootable && armed.insert(entity) {
+        // The sparkle moved hosts (a bag dropped): reap it where it was and arm it anew.
+        if let Some(&was) = armed.get(&entity) {
+            if !lootable || was != host {
+                armed.remove(&entity);
+                fx.write(SpellKitFx::Reap {
+                    entity: was,
+                    spell_id: LOOT_FX_KEY,
+                    class: FxClass::Hold,
+                });
+            }
+        }
+        if lootable && !armed.contains_key(&entity) {
+            armed.insert(entity, host);
             // The Looting tutorial on the rise (`0x60049b`).
             if let Some(t) = tutorials.as_mut() {
                 t.write(crate::tutorial::TutorialEvent::trigger(
@@ -1138,7 +1159,7 @@ pub(super) fn arm_loot_fx(
                 ));
             }
             fx.write(SpellKitFx::Begin {
-                entity,
+                entity: host,
                 spell_id: LOOT_FX_KEY,
                 persistent: true,
                 class: FxClass::Hold,
@@ -1156,16 +1177,10 @@ pub(super) fn arm_loot_fx(
                     path: path.to_string(),
                 }],
             });
-        } else if !lootable && armed.remove(&entity) {
-            fx.write(SpellKitFx::Reap {
-                entity,
-                spell_id: LOOT_FX_KEY,
-                class: FxClass::Hold,
-            });
         }
     }
     // Streamed units despawn on range-out; drop their rows.
-    armed.retain(|e| units.contains(*e));
+    armed.retain(|e, _| units.contains(*e));
 }
 
 /// The level-up ding: any streamed unit's `UNIT_FIELD_LEVEL` change (`0x6045b0`) spawns

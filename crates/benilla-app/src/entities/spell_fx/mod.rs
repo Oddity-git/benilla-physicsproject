@@ -726,6 +726,7 @@ pub(super) fn attach_spell_fx(
     ibps: Res<Assets<bevy::mesh::skinning::SkinnedMeshInverseBindposes>>,
     mut palettes: ResMut<benilla_world::rig_palette::RigPalettes>,
     mut emitters: Query<&mut benilla_world::particles::ParticleEmitter>,
+    scales: Option<Res<crate::creature_anim::FxEffectScale>>,
 ) {
     let Some(mut fx) = fx else {
         return;
@@ -829,8 +830,16 @@ pub(super) fn attach_spell_fx(
                 });
                 let ground_anchor = point.is_none_or(|(tag, ..)| tag == 0x13);
                 let (parent, offset) = point.map_or((unit, Vec3::ZERO), |(_, j, o)| (j, o));
+                // Fork: an effect the gore enlarges (the blood spurt) scales about its point.
+                let scale = scales
+                    .as_ref()
+                    .and_then(|s| s.0.get(&inst.effect).copied())
+                    .unwrap_or(1.0);
                 let root = commands
-                    .spawn((Transform::from_translation(offset), Visibility::default()))
+                    .spawn((
+                        Transform::from_translation(offset).with_scale(Vec3::splat(scale)),
+                        Visibility::default(),
+                    ))
                     // Chain-only, as above.
                     .vis_chain_only()
                     .id();

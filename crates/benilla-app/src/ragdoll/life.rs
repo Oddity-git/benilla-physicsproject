@@ -26,6 +26,10 @@ const JOINT_DAMPING: f32 = 4.0;
 /// Each body's own damping: a little air drag on its spin and fall.
 const BODY_ANGULAR_DAMPING: f32 = 0.8;
 const BODY_LINEAR_DAMPING: f32 = 0.1;
+/// The fastest a body may move (yd/s) and spin (rad/s): a solver kick on a tangled rig (a spider's
+/// eight legs) can otherwise fling it off into the sky.
+const MAX_BODY_SPEED: f32 = 25.0;
+const MAX_BODY_SPIN: f32 = 20.0;
 /// A body's mass is its segment's share of the skeleton's height, floored so a hand is never so
 /// light the chain whips it, and the hub (the pelvis) weighs this many times its share.
 const MASS_FLOOR: f32 = 0.12;
@@ -140,7 +144,7 @@ fn segment_distance(p0: Vec3, p1: Vec3, q0: Vec3, q1: Vec3) -> f32 {
 /// The body entities of each ragdolled unit, profile order, so a unit that vanishes or stands up
 /// takes its bodies with it.
 #[derive(Resource, Default)]
-struct RagdollBodies(EntityHashMap<Vec<Entity>>);
+pub(super) struct RagdollBodies(pub(super) EntityHashMap<Vec<Entity>>);
 
 fn ragdolls_off() -> bool {
     std::env::var_os("WOW_NO_RAGDOLL").is_some()
@@ -296,6 +300,8 @@ fn start_ragdolls(
                     Mass(mass),
                     LinearDamping(BODY_LINEAR_DAMPING),
                     AngularDamping(BODY_ANGULAR_DAMPING),
+                    MaxLinearSpeed(MAX_BODY_SPEED),
+                    MaxAngularSpeed(MAX_BODY_SPIN),
                     LinearVelocity(unit_velocity + push),
                     TransformInterpolation,
                 ))
@@ -546,9 +552,11 @@ fn cleanup(
 ) {
     for (unit, store) in &rags {
         if !store.0.unit_is_dead() {
-            commands
-                .entity(unit)
-                .remove::<(Ragdoll, crate::blob_shadow::NoBlobShadow)>();
+            commands.entity(unit).remove::<(
+                Ragdoll,
+                crate::blob_shadow::NoBlobShadow,
+                crate::creature_anim::LootSparkleOn,
+            )>();
             if let Some(ids) = bodies.0.remove(&unit) {
                 despawn_bodies(&mut commands, &ids, &joints);
             }

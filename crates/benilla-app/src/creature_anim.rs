@@ -101,6 +101,16 @@ impl Wielded {
 #[derive(Component)]
 pub(crate) struct Engaged(pub(crate) u64);
 
+/// Hangs a unit's loot sparkle on another entity instead of the unit: a ragdoll's loot bag.
+#[derive(Component)]
+#[cfg_attr(not(feature = "ragdoll"), allow(dead_code))]
+pub(crate) struct LootSparkleOn(pub(crate) Entity);
+
+/// Effect models (`SpellVisualEffectName` ids) drawn at a multiple of their authored size: the
+/// fork's doubled blood spurt.
+#[derive(Resource, Default)]
+pub(crate) struct FxEffectScale(pub(crate) std::collections::HashMap<u32, f32>);
+
 /// The local player's auto-repeat is armed: the reference's `[+0xd58] & 0x200`, set only by the
 /// local cast-send (`0x6e593b`); with the ranged sheath drawn a standing unit idles on the Load
 /// clip (`0x5fd460`). Cleared only through `cancel_auto_repeat_local`, including on
@@ -546,6 +556,8 @@ mod env_damage;
 pub(crate) mod net;
 pub(crate) mod spell_visual;
 use blood::{blood_spurts, load_blood_tables};
+#[cfg_attr(not(feature = "ragdoll"), allow(unused_imports))]
+pub(crate) use blood::{unit_blood_id, violence_level, BloodTables};
 use env_damage::{hard_landing_dust, load_env_damage_table};
 pub(crate) use env_damage::{EnvDamageTable, HardLanding, HARD_LANDING_DESCENT};
 use spell_visual::{
@@ -800,6 +812,7 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<HardLanding>()
             // The pending-morph latch, the reference's per-unit `[+0xd54]`.
             .init_resource::<MorphLatch>()
+            .init_resource::<FxEffectScale>()
             .add_systems(
                 Startup,
                 (

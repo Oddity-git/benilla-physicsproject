@@ -8,8 +8,18 @@ use bevy::prelude::*;
 use crate::net::{GuidIndex, NetHandlerApp};
 
 pub(super) fn plugin(app: &mut App) {
-    app.net_handler(K::AttackerState, on_attacker_state)
+    app.add_message::<Hit>()
+        .net_handler(K::AttackerState, on_attacker_state)
         .net_handler(K::SpellDamageLog, on_spell_damage_log);
+}
+
+/// One damaging hit, for the gore's spray: `physical` is a swing or a physical spell's direct hit.
+#[derive(Message, Clone, Copy)]
+pub(super) struct Hit {
+    pub(super) victim: Entity,
+    pub(super) attacker: u64,
+    pub(super) damage: u32,
+    pub(super) physical: bool,
 }
 
 /// The latest damage a unit took, who dealt it, and when.
@@ -25,9 +35,16 @@ fn on_attacker_state(
     mut commands: Commands,
     index: Res<GuidIndex>,
     time: Res<Time>,
+    mut hits: MessageWriter<Hit>,
 ) {
     if let SessionEvent::AttackerState(s) = ev {
-        record(&mut commands, &index, &time, s.attacker, s.victim, s.damage);
+        let blow = Blow {
+            attacker: s.attacker,
+            victim: s.victim,
+            damage: s.damage,
+            physical: true,
+        };
+        record(&mut commands, &index, &time, &mut hits, blow);
     }
 }
 
@@ -36,29 +53,49 @@ fn on_spell_damage_log(
     mut commands: Commands,
     index: Res<GuidIndex>,
     time: Res<Time>,
+    mut hits: MessageWriter<Hit>,
 ) {
     if let SessionEvent::SpellDamageLog(s) = ev {
-        record(&mut commands, &index, &time, s.attacker, s.target, s.damage);
+        let blow = Blow {
+            attacker: s.attacker,
+            victim: s.target,
+            damage: s.damage,
+            // School 0 is physical; a bleed's tick is no fresh wound.
+            physical: s.school == 0 && !s.periodic,
+        };
+        record(&mut commands, &index, &time, &mut hits, blow);
     }
+}
+
+struct Blow {
+    attacker: u64,
+    victim: u64,
+    damage: u32,
+    physical: bool,
 }
 
 fn record(
     commands: &mut Commands,
     index: &GuidIndex,
     time: &Time,
-    attacker: u64,
-    victim: u64,
-    damage: u32,
+    hits: &mut MessageWriter<Hit>,
+    blow: Blow,
 ) {
-    if damage == 0 {
+    if blow.damage == 0 {
         return;
     }
-    if let Some(&e) = index.0.get(&victim) {
-        if let Ok(mut e) = commands.get_entity(e) {
+    if let Some(&victim) = index.0.get(&blow.victim) {
+        if let Ok(mut e) = commands.get_entity(victim) {
             e.insert(LastHit {
-                attacker,
-                damage,
+                attacker: blow.attacker,
+                damage: blow.damage,
                 at: time.elapsed_secs(),
+            });
+            hits.write(Hit {
+                victim,
+                attacker: blow.attacker,
+                damage: blow.damage,
+                physical: blow.physical,
             });
         }
     }

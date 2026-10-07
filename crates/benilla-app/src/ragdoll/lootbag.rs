@@ -140,6 +140,19 @@ fn sync_bags(mut commands: Commands, units: Query<BagUnit, With<Ragdoll>>, mut b
                 Visibility::default(),
             ))
             .id();
+        // The loot sparkle hangs here, unscaled by the sack, instead of on the body.
+        let sparkle = commands
+            .spawn((
+                Name::new("loot bag sparkle"),
+                Transform::from_scale(Vec3::splat(1.0 / scale)),
+                Visibility::default(),
+                crate::entities::VisualAttached,
+            ))
+            .id();
+        commands.entity(root).add_child(sparkle);
+        commands
+            .entity(unit)
+            .insert(crate::creature_anim::LootSparkleOn(sparkle));
         bags.0.insert(unit, root);
     }
     bags.0.retain(|unit, root| {
@@ -149,6 +162,9 @@ fn sync_bags(mut commands: Commands, units: Query<BagUnit, With<Ragdoll>>, mut b
         if !keep {
             if let Ok(mut e) = commands.get_entity(*root) {
                 e.despawn();
+            }
+            if let Ok(mut e) = commands.get_entity(*unit) {
+                e.remove::<crate::creature_anim::LootSparkleOn>();
             }
         }
         keep

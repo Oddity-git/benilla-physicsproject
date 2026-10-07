@@ -14,11 +14,32 @@ use super::spell_visual::FxSlot;
 use super::spell_visual::SpellVisuals;
 use super::{SpellKitFx, SwingImpact, SwingMessage};
 
+/// The spurt plays at this many times its authored size: the fork's gore, louder than 1.12's.
+const SPURT_SCALE: f32 = 2.0;
+
 /// The gore level, the client's `violenceLevel` (0 none, 1 green, 2 true colors). The reference
 /// defaults it to its region's maximum (`0x6c5aa0`, from the table at `0x86c3f8`, which the setter
-/// `0x6c5af0` also clamps to): 2 for enUS, 1 only for koKR, whose blood turns green. Fixed here,
-/// not a CVar row: `cvars::REGISTERED` holds only the knobs a settings page wires.
-const VIOLENCE_LEVEL: usize = 2;
+/// `0x6c5af0` also clamps to): 2 for enUS, 1 only for koKR, whose blood turns green. Here the
+/// options window's Blood dropdown sets it.
+pub(crate) fn violence_level(cvars: Option<&crate::cvars::Cvars>) -> usize {
+    cvars
+        .and_then(|c| c.num("violenceLevel"))
+        .map_or(2, |v| v.clamp(0.0, 2.0) as usize)
+}
+
+/// A unit's `UnitBloodLevels` key by [`BloodCatalog::level_key`]; a display the creature catalog
+/// does not know (a player's) takes the tier-3 default, red.
+#[cfg_attr(not(feature = "ragdoll"), allow(dead_code))]
+pub(crate) fn unit_blood_id(
+    creatures: Option<&crate::entities::Creatures>,
+    blood: &BloodTables,
+    display_id: Option<u32>,
+) -> Option<i32> {
+    let (display, model) = display_id
+        .and_then(|id| creatures?.blood_candidates(id))
+        .unwrap_or((-1, -1));
+    blood.0.level_key(display, model).map(|k| k as i32)
+}
 
 /// The victim attachments the spurt hangs on, `0xf` front and `0x10` back (`0x625010`).
 const ATTACH_FRONT: u16 = 15;
@@ -26,7 +47,7 @@ const ATTACH_BACK: u16 = 16;
 
 /// The `UnitBlood` and `UnitBloodLevels` tables; absent, no spurts.
 #[derive(Resource)]
-pub(super) struct BloodTables(pub(super) BloodCatalog);
+pub(crate) struct BloodTables(pub(crate) BloodCatalog);
 
 /// Load the blood tables off the patch chain at startup.
 pub(super) fn load_blood_tables(mut commands: Commands, assets: Option<Res<WorldAssets>>) {
@@ -54,8 +75,11 @@ pub(super) fn blood_spurts(
     creatures: Option<Res<crate::entities::Creatures>>,
     blood: Option<Res<BloodTables>>,
     visuals: Option<Res<SpellVisuals>>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+    mut scales: Option<ResMut<super::FxEffectScale>>,
     mut fx: MessageWriter<SpellKitFx>,
 ) {
+    let violence = violence_level(cvars.as_deref());
     let (Some(creatures), Some(blood), Some(visuals)) = (creatures, blood, visuals) else {
         for _ in swings.read() {} // tables not loaded: drain, do not backlog
         return;
@@ -109,13 +133,16 @@ pub(super) fn blood_spurts(
         let large = swing.hit_info & 0x2000 != 0; // crushing picks the large row; a crit does not
         let Some((effect, path)) = blood
             .0
-            .effect_id(blood_id, VIOLENCE_LEVEL, front, large)
+            .effect_id(blood_id, violence, front, large)
             .and_then(|id| visuals.0.effect_path(id).map(|path| (id, path)))
         else {
             info!("blood: dropped — no effect for blood {blood_id} (front {front}, large {large})");
             continue;
         };
         debug!("blood: spurt {path} (blood {blood_id}, front {front}, large {large})");
+        if let Some(scales) = scales.as_mut() {
+            scales.0.insert(effect, SPURT_SCALE);
+        }
         fx.write(SpellKitFx::Begin {
             entity: victim,
             spell_id: 0, // no spell: a self-terminating effect is never reaped by id
