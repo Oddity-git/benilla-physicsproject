@@ -292,8 +292,12 @@ pub(super) fn pose_limbs(
                 }
             }
         }
+        // The stump: the limb's root folded to nothing where it joins its parent, not out where
+        // its flying body is, which would stretch the skin between the two.
         for limb in &cut.limbs {
-            if let Some(local) = rig.locals.get_mut(limb.root) {
+            let bind = rig.binds.get(limb.root).copied();
+            if let (Some(local), Some(bind)) = (rig.locals.get_mut(limb.root), bind) {
+                local.translation = bind;
                 local.scale = Vec3::splat(TINY);
             }
         }
