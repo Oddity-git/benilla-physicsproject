@@ -9,6 +9,7 @@ use bevy::prelude::*;
 use benilla_protocol::EntityKind;
 use benilla_world::collision::pusher_layers;
 
+use super::life::Ragdoll;
 use crate::net::{NetEntity, ObjectStore};
 
 /// The capsule: radius and the straight length between its caps (yd), centred this high above the
@@ -34,14 +35,21 @@ struct Pushers(EntityHashMap<Entity>);
 fn follow_players(
     mut commands: Commands,
     time: Res<Time>,
-    players: Query<(Entity, &NetEntity, &ObjectStore, &GlobalTransform)>,
+    players: Query<(
+        Entity,
+        &NetEntity,
+        &ObjectStore,
+        &GlobalTransform,
+        Has<Ragdoll>,
+    )>,
     mut capsules: Query<(&mut Position, &mut LinearVelocity)>,
     mut pushers: ResMut<Pushers>,
 ) {
     let dt = time.delta_secs().max(1e-4);
     let mut seen = EntityHashSet::default();
-    for (player, net, store, tf) in &players {
-        if net.kind != EntityKind::Player || store.0.unit_is_dead() {
+    for (player, net, store, tf, fallen) in &players {
+        // A knocked-down player lies in its own ragdoll: its capsule would shove it.
+        if net.kind != EntityKind::Player || store.0.unit_is_dead() || fallen {
             continue;
         }
         seen.insert(player);

@@ -162,13 +162,15 @@ fn rebase(mut world: Affine3A, origin: Vec3) -> Affine3A {
 }
 
 /// [`rebase`] for a `GlobalTransform`.
-pub(crate) fn rebase_global(g: GlobalTransform, origin: Vec3) -> GlobalTransform {
+/// Fork: public for the dismembered limb's second palette.
+pub fn rebase_global(g: GlobalTransform, origin: Vec3) -> GlobalTransform {
     GlobalTransform::from(rebase(g.affine(), origin))
 }
 
 /// The origin a rig's rows are measured from, its root's world translation: the rebase's one
 /// switch. `WOW_NO_RIG_REBASE=1` makes it the map origin, an A/B that brings the shimmer back.
-pub(crate) fn rebase_origin(root_world: Vec3) -> Vec3 {
+/// Fork: public for the dismembered limb's second palette.
+pub fn rebase_origin(root_world: Vec3) -> Vec3 {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     match *ON.get_or_init(|| std::env::var_os("WOW_NO_RIG_REBASE").is_none()) {
         true => root_world,
@@ -332,8 +334,9 @@ impl RigPalettes {
     }
 
     /// The collapsed lane's row write, `frame × ibp` over frames the world pass composed from a
-    /// zero-translation root, so the rows are exact at rig scale.
-    pub(crate) fn write_rig_worlds(
+    /// zero-translation root, so the rows are exact at rig scale. Fork: public, so a dismembered
+    /// limb can pose a second palette over its unit's mesh.
+    pub fn write_rig_worlds(
         &mut self,
         rig: &RigSkin,
         worlds: &[GlobalTransform],

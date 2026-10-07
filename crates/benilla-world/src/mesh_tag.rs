@@ -129,7 +129,8 @@ pub fn rig_of(tag: u32) -> u16 {
 
 /// Rewrites the rig field alone: the lazy-rig writer, the one exception to written-once, whose
 /// doodad slot arrives at its first draw-wake and leaves under table pressure.
-pub(crate) fn with_rig(tag: u32, slot: u16) -> u32 {
+/// Fork: public for the dismembered limb's mesh copies.
+pub fn with_rig(tag: u32, slot: u16) -> u32 {
     (tag & !RIG_MASK) | rig_bits(slot)
 }
 

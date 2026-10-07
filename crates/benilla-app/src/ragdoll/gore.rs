@@ -73,6 +73,13 @@ const BELOW: f32 = 1.5;
 const ABOVE: f32 = 0.8;
 /// Unlit decals are dimmed this much so a night-time splat does not glow.
 const DIM: f32 = 0.7;
+/// A cut bursts this many droplets, then its stump spurts this many each pulse for a while, at this
+/// speed range (yd/s).
+const CUT_DROPS: usize = 30;
+const PULSE_DROPS: usize = 5;
+const GUSH_PULSE: f32 = 0.15;
+const GUSH_SECS: f32 = 2.0;
+const GUSH_SPEED: (f32, f32) = (1.5, 4.5);
 /// The height a unit with no model bound counts as (yd).
 const DEFAULT_HEIGHT: f32 = 1.8;
 
@@ -83,6 +90,7 @@ pub(super) fn plugin(app: &mut App) {
             Update,
             (
                 spray_hits,
+                gush_stumps,
                 fly_droplets,
                 start_pools,
                 grow_pools,
@@ -403,32 +411,17 @@ fn spray_hits(
             let climb = gore.range((MIN_CLIMB, MAX_CLIMB));
             let dir = Quat::from_rotation_y(yaw) * away;
             let v = (dir * climb.cos() + Vec3::Y * climb.sin()) * speed * gore.range((0.45, 1.2));
-            let colour = droplet_colour(&gore, &b);
-            let key = colour.map(|c| (c * 255.0) as u8);
-            let material = gore
-                .materials
-                .entry(key)
-                .or_insert_with(|| {
-                    materials.add(StandardMaterial {
-                        base_color: Color::srgb(colour[0], colour[1], colour[2]),
-                        unlit: true,
-                        ..default()
-                    })
-                })
-                .clone();
             let start = chest + Vec3::new(gore.range((-0.1, 0.1)), 0.0, gore.range((-0.1, 0.1)));
-            commands.spawn((
-                Name::new("blood droplet"),
-                Mesh3d(gore.droplet_mesh.clone()),
-                MeshMaterial3d(material),
-                Transform::from_translation(start).with_scale(Vec3::splat(DROP_RADIUS)),
-                Droplet {
-                    velocity: v,
-                    ground: feet.y,
-                    born: now,
-                    blood: b,
-                },
-            ));
+            throw_droplet(
+                &mut commands,
+                &mut gore,
+                &mut materials,
+                b,
+                start,
+                v,
+                feet.y,
+                now,
+            );
         }
         // The splat under the victim.
         if let Some(texture) = gore.pick_texture(&server, &splats) {
@@ -437,6 +430,168 @@ fn spray_hits(
             let b = Blood { texture, violence };
             lay_splat(&mut commands, &mut gore, &decals, at, half, b, now);
         }
+    }
+}
+
+/// Launch one droplet of `blood` from `start` at `velocity`, to splat at height `ground`.
+#[allow(clippy::too_many_arguments)] // the droplet's whole state
+fn throw_droplet(
+    commands: &mut Commands,
+    gore: &mut Gore,
+    materials: &mut Assets<StandardMaterial>,
+    blood: Blood,
+    start: Vec3,
+    velocity: Vec3,
+    ground: f32,
+    now: f32,
+) {
+    let colour = droplet_colour(gore, &blood);
+    let key = colour.map(|c| (c * 255.0) as u8);
+    let material = gore
+        .materials
+        .entry(key)
+        .or_insert_with(|| {
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(colour[0], colour[1], colour[2]),
+                unlit: true,
+                ..default()
+            })
+        })
+        .clone();
+    commands.spawn((
+        Name::new("blood droplet"),
+        Mesh3d(gore.droplet_mesh.clone()),
+        MeshMaterial3d(material),
+        Transform::from_translation(start).with_scale(Vec3::splat(DROP_RADIUS)),
+        Droplet {
+            velocity,
+            ground,
+            born: now,
+            blood,
+        },
+    ));
+}
+
+/// A stump spurting: pulses of droplets from where a limb came off, for a while.
+#[derive(Component)]
+struct Gusher {
+    at: Vec3,
+    away: Vec3,
+    ground: f32,
+    until: f32,
+    next: f32,
+    splats: Vec<String>,
+    violence: usize,
+}
+
+/// A severed limb bursts blood from the cut, and its stump keeps spurting.
+#[allow(clippy::too_many_arguments)] // one Bevy system's resources
+fn gush_stumps(
+    mut commands: Commands,
+    mut severs: MessageReader<super::dismember::Severed>,
+    units: Query<(&Transform, &NetEntity)>,
+    mut gushers: Query<(Entity, &mut Gusher)>,
+    creatures: Option<Res<Creatures>>,
+    blood: Option<Res<BloodTables>>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+    server: Res<AssetServer>,
+    time: Res<Time>,
+    mut gore: ResMut<Gore>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let now = time.elapsed_secs();
+    let violence = violence_level(cvars.as_deref());
+    let blood = blood.filter(|_| violence > 0);
+    for cut in severs.read() {
+        let Some(blood) = blood.as_deref() else {
+            continue;
+        };
+        let Ok((tf, net)) = units.get(cut.unit) else {
+            continue;
+        };
+        let Some(id) = unit_blood_id(creatures.as_deref(), blood, net.display_id) else {
+            continue;
+        };
+        let splats = blood.0.splats(id, violence).to_vec();
+        if splats.is_empty() {
+            continue;
+        }
+        let gusher = Gusher {
+            at: cut.at,
+            away: cut.away,
+            ground: tf.translation.y,
+            until: now + GUSH_SECS,
+            next: now + GUSH_PULSE,
+            splats,
+            violence,
+        };
+        spurt(
+            &mut commands,
+            &mut gore,
+            &mut materials,
+            &server,
+            &gusher,
+            CUT_DROPS,
+            now,
+        );
+        commands.spawn((Name::new("blood gusher"), gusher));
+    }
+    for (e, mut gusher) in &mut gushers {
+        if now >= gusher.until {
+            commands.entity(e).despawn();
+            continue;
+        }
+        if now < gusher.next {
+            continue;
+        }
+        gusher.next = now + GUSH_PULSE;
+        spurt(
+            &mut commands,
+            &mut gore,
+            &mut materials,
+            &server,
+            &gusher,
+            PULSE_DROPS,
+            now,
+        );
+    }
+}
+
+/// One spurt of `count` droplets from a gusher, up and out along the throw.
+fn spurt(
+    commands: &mut Commands,
+    gore: &mut Gore,
+    materials: &mut Assets<StandardMaterial>,
+    server: &AssetServer,
+    gusher: &Gusher,
+    count: usize,
+    now: f32,
+) {
+    for _ in 0..count {
+        let Some(texture) = gore.pick_texture(server, &gusher.splats) else {
+            return;
+        };
+        let blood = Blood {
+            texture,
+            violence: gusher.violence,
+        };
+        let jitter = Vec3::new(
+            gore.range((-1.0, 1.0)),
+            gore.range((0.0, 1.0)),
+            gore.range((-1.0, 1.0)),
+        );
+        let v = (gusher.away * 0.6 + Vec3::Y * 1.2 + jitter * 0.6).normalize_or_zero()
+            * gore.range(GUSH_SPEED);
+        throw_droplet(
+            commands,
+            gore,
+            materials,
+            blood,
+            gusher.at,
+            v,
+            gusher.ground,
+            now,
+        );
     }
 }
 
@@ -536,14 +691,33 @@ fn fly_droplets(
     }
 }
 
-/// A new ragdoll bleeds once its body has fallen.
-fn start_pools(mut commands: Commands, fresh: Query<Entity, Added<Ragdoll>>, time: Res<Time>) {
-    for unit in &fresh {
-        commands.entity(unit).insert(PoolDue {
-            at: time.elapsed_secs() + POOL_DELAY,
-        });
+/// A dead ragdoll bleeds once its body has fallen; a knocked-down one does not. A unit risen again
+/// may bleed again on its next death.
+#[allow(clippy::type_complexity)] // the filtered queries
+fn start_pools(
+    mut commands: Commands,
+    fresh: Query<(Entity, &ObjectStore), (With<Ragdoll>, Without<Bled>)>,
+    risen: Query<Entity, (With<Bled>, Without<Ragdoll>)>,
+    time: Res<Time>,
+) {
+    for (unit, store) in &fresh {
+        if store.0.unit_is_dead() {
+            commands.entity(unit).insert((
+                Bled,
+                PoolDue {
+                    at: time.elapsed_secs() + POOL_DELAY,
+                },
+            ));
+        }
+    }
+    for unit in &risen {
+        commands.entity(unit).remove::<Bled>();
     }
 }
+
+/// This ragdoll's pool has been started.
+#[derive(Component)]
+struct Bled;
 
 /// What a pool reads of its ragdolled unit.
 type Bleeder = (

@@ -35,13 +35,19 @@ Everything here is **client side only**. The server, other players and their cli
   under them. The stock melee blood spurt plays at twice its size. The colours and art come from
   the game's own blood tables, so each creature bleeds its own kind of blood, and bloodless ones
   (elementals, for example) leave nothing.
+- **Knockdowns.** When the game knocks a unit down (Warrior Charge's stun, Lash and others that
+  play the Knockdown animation), it falls as a ragdoll and then gets back up.
+- **Kick.** In a dev build, Ctrl+Shift+K kicks the creature you have targeted (within 5 yards):
+  it flies, lies there a moment and gets up. This happens only on your screen; the server still
+  has it standing, so a creature you are fighting keeps fighting.
+- **Dismemberment.** With the option on, a killing blow that takes a fifth of the target's health
+  severs a limb (the head included), and one that takes half severs two. The limb flies off and
+  the stump spurts blood.
 - **Options.** Settings → Graphics has a **Blood** choice (Red, Green or Off, the game's own
-  `violenceLevel`) and a **Dismemberment** checkbox. Dismemberment is not built yet; the box is
-  saved but does nothing for now.
+  `violenceLevel`) and a **Dismemberment** checkbox (off by default).
 
 ### Planned
 
-- Dismemberment on heavy killing blows, behind its checkbox.
 - Physics cloaks.
 
 ## Compatibility

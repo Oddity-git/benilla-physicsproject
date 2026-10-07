@@ -48,14 +48,33 @@ const MAX_PUSH: f32 = 12.0;
 /// A hit older than this when the unit reads dead was not the killing blow (s).
 const BLOW_WINDOW: f32 = 2.0;
 const DEATH_LIFT: f32 = 0.5;
+/// A severed limb leaves its body this much faster (yd/s), away and up.
+const SEVER_FLING: f32 = 4.0;
+const SEVER_LIFT: f32 = 3.0;
+/// A knocked-down unit blends from where its ragdoll lies back into its animation over this long.
+const GET_UP_SECS: f32 = 0.6;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<RagdollBodies>()
         .add_systems(Update, (track_unit_motion, start_ragdolls).chain())
         .add_systems(FixedUpdate, release_parted_pairs)
+        // The getting-up rigs restart from their pre-fall pose, so a bone the clips never key
+        // returns too; the evaluator then writes the animated ones.
         .add_systems(
             PostUpdate,
-            (drive_bones_from_bodies, freeze_settled, cleanup)
+            reset_getting_up.before(bevy::app::AnimationSystems),
+        )
+        .add_systems(
+            PostUpdate,
+            (
+                drive_bones_from_bodies,
+                super::dismember::pose_limbs,
+                knocked_to_death,
+                get_up,
+                blend_getting_up,
+                freeze_settled,
+                cleanup,
+            )
                 .chain()
                 .in_set(benilla_world::rig_anim::PosePost),
         );
@@ -82,7 +101,26 @@ pub(super) struct Ragdoll {
     /// rides the hub instead of holding the death animation where the unit stood.
     anchors: Vec<(usize, Affine3A)>,
     /// Every bone local once frozen; `None` while the bodies simulate.
-    frozen: Option<Vec<Transform>>,
+    pub(super) frozen: Option<Vec<Transform>>,
+    /// A knockdown, not a death: when it gets up, and the bone locals it fell from.
+    getting_up: Option<(f32, Vec<Transform>)>,
+}
+
+/// A request to knock a living unit down: it falls as a ragdoll pushed `away` (yd/s, weighted
+/// to the head like a death push) plus `lift`, lies `hold` seconds, then gets up.
+#[derive(Component, Clone, Copy)]
+pub(super) struct KnockDown {
+    pub(super) away: Vec3,
+    pub(super) lift: f32,
+    pub(super) hold: f32,
+}
+
+/// A unit back on its feet, blending from the pose it lay in into its animation.
+#[derive(Component)]
+struct GettingUp {
+    from: Vec<Transform>,
+    rest: Vec<Transform>,
+    start: f32,
 }
 
 /// A ragdoll body's capsule in its own frame: from its origin to `end`, this thick (yd).
@@ -196,6 +234,8 @@ fn start_ragdolls(
             &GlobalTransform,
             Option<&LastSpot>,
             Option<&LastHit>,
+            Option<&KnockDown>,
+            Option<&GettingUp>,
         ),
         (
             With<SeenAlive>,
@@ -208,19 +248,35 @@ fn start_ragdolls(
     index: Res<GuidIndex>,
     mut active: Query<(Entity, &mut Ragdoll)>,
     mut bodies: ResMut<RagdollBodies>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+    mut severs: MessageWriter<super::dismember::Severed>,
 ) {
     if ragdolls_off() {
         return;
     }
     let dt = time.delta_secs().max(1e-3);
-    for (unit, store, net, rig, unit_tf, spot, blow) in &dying {
+    let now = time.elapsed_secs();
+    let dismember = cvars
+        .as_deref()
+        .and_then(|c| c.flag("dismemberment"))
+        .unwrap_or(false);
+    for (unit, store, net, rig, unit_tf, spot, blow, knock, rising) in &dying {
         // Creatures and players alike, our own character included; a ghost reads alive again and
         // `cleanup` hands it back to its animation.
         let living_kind = matches!(net.kind, EntityKind::Unit | EntityKind::Player);
-        if !living_kind || !store.0.unit_is_dead() {
+        let dead = store.0.unit_is_dead();
+        if !living_kind || (!dead && knock.is_none()) {
+            if knock.is_some() {
+                commands.entity(unit).remove::<KnockDown>();
+            }
             continue;
         }
-        commands.entity(unit).remove::<SeenAlive>();
+        // A knockdown is spent whether or not it falls; death wins over it.
+        let knock = knock.copied().filter(|_| !dead);
+        commands.entity(unit).remove::<(KnockDown, GettingUp)>();
+        if dead {
+            commands.entity(unit).remove::<SeenAlive>();
+        }
         let Some(profile) = build_profile(&rig.binds, &rig.parents) else {
             continue;
         };
@@ -249,7 +305,28 @@ fn start_ragdolls(
         let blow_share = blow
             .filter(|b| time.elapsed_secs() - b.at <= BLOW_WINDOW)
             .map_or(0.0, |b| (b.damage as f32 / max_health).min(1.0));
-        let strength = (DEATH_PUSH + BLOW_PUSH * blow_share).min(MAX_PUSH);
+        let (away, strength, lift) = match knock {
+            Some(k) => (
+                k.away.with_y(0.0).normalize_or_zero(),
+                k.away.length(),
+                k.lift,
+            ),
+            None => (
+                away,
+                (DEATH_PUSH + BLOW_PUSH * blow_share).min(MAX_PUSH),
+                DEATH_LIFT,
+            ),
+        };
+        // A heavy killing blow takes limbs off, when the option allows.
+        let severed = if dismember && knock.is_none() {
+            super::dismember::choose_limbs(
+                &profile,
+                blow_share,
+                unit.to_bits() ^ now.to_bits() as u64,
+            )
+        } else {
+            Vec::new()
+        };
         let (lo, hi) = profile
             .bodies
             .iter()
@@ -270,7 +347,10 @@ fn start_ragdolls(
             let len = body.segment.length() * scale;
             let radius = body.radius * scale;
             let up = ((body.pivot.y - lo) / span).clamp(0.0, 1.0);
-            let push = away * strength * (0.25 + 0.75 * up) + Vec3::Y * DEATH_LIFT;
+            let mut push = away * strength * (0.25 + 0.75 * up) + Vec3::Y * lift;
+            if severed.contains(&spawned.len()) {
+                push += away * SEVER_FLING + Vec3::Y * SEVER_LIFT;
+            }
             let share = (body.segment.length() / span).max(MASS_FLOOR);
             let mass = if body.parent.is_none() {
                 share * HUB_MASS
@@ -319,6 +399,10 @@ fn start_ragdolls(
             let Some(p) = body.parent else {
                 continue;
             };
+            // A severed limb keeps no joint to its parent: it flies off on its own.
+            if severed.contains(&k) {
+                continue;
+            }
             // The joint sits on this body's pivot (its origin), and in the parent body's frame at
             // the same world point. Both bases put +Y down this body's bind segment, so the limits
             // are measured from the bind pose.
@@ -400,16 +484,37 @@ fn start_ragdolls(
             spawned.len(),
             layout.join(" ")
         );
+        if !severed.is_empty() {
+            let roots: Vec<usize> = severed
+                .iter()
+                .map(|&k| profile.bodies[k].bone as usize)
+                .collect();
+            for &bone in &roots {
+                let at = rig.model.get(bone).map_or(unit_tf.translation(), |m| {
+                    world.transform_point3(m.translation.into())
+                });
+                severs.write(super::dismember::Severed { unit, at, away });
+            }
+            info!("ragdoll: unit {unit} loses bones {roots:?}");
+            commands
+                .entity(unit)
+                .insert(super::dismember::Dismembered::new(&rig.parents, &roots));
+        }
         bodies.0.insert(unit, spawned);
         commands
             .entity(unit)
             .insert(crate::blob_shadow::NoBlobShadow);
         commands.entity(unit).insert(Ragdoll {
             profile,
-            born: time.elapsed_secs(),
-            awake_since: time.elapsed_secs(),
+            born: now,
+            awake_since: now,
             anchors,
             frozen: None,
+            // Knocked down again mid-rise, it still returns to the pose it first fell from.
+            getting_up: knock.map(|k| {
+                let rest = rising.map_or_else(|| rig.locals.clone(), |r| r.rest.clone());
+                (now + k.hold, rest)
+            }),
         });
     }
 
@@ -521,7 +626,7 @@ fn freeze_settled(
 ) {
     let now = time.elapsed_secs();
     for (unit, mut rag, rig) in &mut rigs {
-        if rag.frozen.is_some() {
+        if rag.frozen.is_some() || rag.getting_up.is_some() {
             continue;
         }
         let Some(ids) = bodies.0.get(&unit) else {
@@ -546,17 +651,18 @@ fn freeze_settled(
 fn cleanup(
     mut commands: Commands,
     units: Query<&ObjectStore>,
-    rags: Query<(Entity, &ObjectStore), With<Ragdoll>>,
+    rags: Query<(Entity, &ObjectStore, &Ragdoll)>,
     joints: Query<(Entity, &SphericalJoint)>,
     mut bodies: ResMut<RagdollBodies>,
 ) {
-    for (unit, store) in &rags {
-        if !store.0.unit_is_dead() {
+    for (unit, store, rag) in &rags {
+        if !store.0.unit_is_dead() && rag.getting_up.is_none() {
             commands.entity(unit).remove::<(
                 Ragdoll,
                 crate::blob_shadow::NoBlobShadow,
                 crate::creature_anim::LootSparkleOn,
             )>();
+            super::dismember::heal(&mut commands, unit);
             if let Some(ids) = bodies.0.remove(&unit) {
                 despawn_bodies(&mut commands, &ids, &joints);
             }
@@ -572,6 +678,79 @@ fn cleanup(
         if let Some(ids) = bodies.0.remove(&unit) {
             despawn_bodies(&mut commands, &ids, &joints);
         }
+    }
+}
+
+/// A knocked-down unit that dies where it lies stays down: its ragdoll becomes its death's.
+fn knocked_to_death(mut commands: Commands, mut rags: Query<(Entity, &ObjectStore, &mut Ragdoll)>) {
+    for (unit, store, mut rag) in &mut rags {
+        if rag.getting_up.is_some() && store.0.unit_is_dead() {
+            rag.getting_up = None;
+            commands.entity(unit).remove::<SeenAlive>();
+        }
+    }
+}
+
+/// A knockdown past its hold gets up: the bodies go, and the rig blends from the pose it lay in
+/// back into its animation.
+fn get_up(
+    mut commands: Commands,
+    time: Res<Time>,
+    rags: Query<(Entity, &Ragdoll, &RigPose)>,
+    joints: Query<(Entity, &SphericalJoint)>,
+    mut bodies: ResMut<RagdollBodies>,
+) {
+    let now = time.elapsed_secs();
+    for (unit, rag, rig) in &rags {
+        let Some((at, rest)) = &rag.getting_up else {
+            continue;
+        };
+        if now < *at {
+            continue;
+        }
+        if let Some(ids) = bodies.0.remove(&unit) {
+            despawn_bodies(&mut commands, &ids, &joints);
+        }
+        commands
+            .entity(unit)
+            .remove::<(Ragdoll, crate::blob_shadow::NoBlobShadow)>()
+            .insert(GettingUp {
+                from: rig.locals.clone(),
+                rest: rest.clone(),
+                start: now,
+            });
+    }
+}
+
+/// Before the evaluator: a getting-up rig starts each frame from its pre-fall locals.
+fn reset_getting_up(mut rigs: Query<(&GettingUp, &mut RigPose), Without<Ragdoll>>) {
+    for (up, mut rig) in &mut rigs {
+        let n = rig.locals.len().min(up.rest.len());
+        rig.locals[..n].copy_from_slice(&up.rest[..n]);
+    }
+}
+
+/// Eases each getting-up rig from where it lay into this frame's animated pose.
+fn blend_getting_up(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut rigs: Query<(Entity, &GettingUp, &mut RigPose), Without<Ragdoll>>,
+) {
+    let now = time.elapsed_secs();
+    for (unit, up, rig) in &mut rigs {
+        let t = ((now - up.start) / GET_UP_SECS).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            commands.entity(unit).remove::<GettingUp>();
+            continue;
+        }
+        let t = t * t * (3.0 - 2.0 * t);
+        let rig = rig.into_inner();
+        for (local, from) in rig.locals.iter_mut().zip(&up.from) {
+            local.translation = from.translation.lerp(local.translation, t);
+            local.rotation = from.rotation.slerp(local.rotation, t);
+            local.scale = from.scale.lerp(local.scale, t);
+        }
+        rig.pose_dirty = true;
     }
 }
 
