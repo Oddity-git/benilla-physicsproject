@@ -26,15 +26,15 @@ Everything here is **client side only**. The server, other players and their cli
   creature model, not only the ones it was tuned on. Limbs have joint limits and damping, body
   parts collide with each other and with other corpses, and parts are speed-capped so nothing
   launches into the sky.
-- **Death push.** A body is thrown away from whoever killed it, harder the more of its health the
-  killing blow took.
+- **Death push.** A body is thrown away from whoever killed it, and pops up a little before it
+  falls, both more the more of its health the killing blow took.
 - **Spell kills.**
 <p align="center">
   <img width="800" height="918" alt="ezgif-1a2cb90c93966869" src="https://github.com/user-attachments/assets/a6ad0691-8040-4afe-afac-edf1140b07a4" />
 </p>
 
-- A spell's killing blow throws the body harder (the `ragdollSpellPush` setting,
-  2 by default). A frost spell's kill freezes it instead: the body stays stiff in the pose it died
+- A spell's killing blow throws the body harder (the **Spell Push** slider,
+  twice as hard by default). A frost spell's kill freezes it instead: the body stays stiff in the pose it died
   in, topples over like a statue, and turns icy blue.
 - **Pushable corpses.** Living players carry an invisible capsule that shoves ragdolls aside as
   you walk through them.
@@ -43,7 +43,7 @@ Everything here is **client side only**. The server, other players and their cli
   the loot sparkle sits on the sack instead of the body.
 - **Blood.** Hits spray droplets away from the attacker, which leave splats where they land. More
   damage means more spray, and killing blows spray the most. Ragdolls bleed a pool that spreads
-  under them. The stock melee blood spurt plays at twice its size. The colours and art come from
+  under them. The stock melee blood spurt, and the yellow hit flash in it, play at half size. The colours and art come from
   the game's own blood tables, so each creature bleeds its own kind of blood, and bloodless ones
   (elementals, for example) leave nothing.
 - **Knockdowns.** When the game knocks a unit down (Warrior Charge's stun, Lash and others that
@@ -62,10 +62,11 @@ Everything here is **client side only**. The server, other players and their cli
   severs a limb (the head included), and one that takes half severs two. The limb flies off.
 - **Hitstop.** When a melee hit lands, the attacker's and the target's drawn poses hold for a
   moment (longer on a crit or a heavy hit), so blows feel weightier. Only the animation stops.
-- **Options.** Settings → Graphics has a **Blood** choice (Red, Green or Off, the game's own
-  `violenceLevel`), a **Gore Amount** slider, a **Dismemberment** checkbox (off by default) with a
-  **Dismemberment Amount** slider for how easily limbs come off, and a **Hitstop** checkbox (on by
-  default) with a **Hitstop Strength** slider.
+- **Options.** The options window has its own **Physics** page, under Audio: a **Blood** choice
+  (Red, Green or Off, the game's own `violenceLevel`), a **Gore Amount** slider, a
+  **Dismemberment** checkbox (off by default) with a **Dismemberment Amount** slider for how easily
+  limbs come off, a **Hitstop** checkbox (on by default) with a **Hitstop Strength** slider, a
+  **Death Lift** slider for how much a dying body pops up, and the **Spell Push** slider.
 
 ### Planned
 
@@ -80,7 +81,7 @@ Everything here is **client side only**. The server, other players and their cli
 | 1.12 addons | Yes | Same addon support as benilla. |
 | MPQ patches | Mostly | benilla reads your install's patch chain as the stock client does. Blood patch mods are not needed and may draw oddly (a flat splat in the air); use the Blood option instead. |
 | Upstream benilla | Yes | The fork tracks upstream. The fork's code sits in its own module behind a `ragdoll` feature, so upstream changes merge in cleanly. It is never sent back upstream as a pull request. |
-| `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds its own settings (`violenceLevel`, `goreAmount`, `dismemberment`, `dismemberAmount`, `hitstop`, `hitstopStrength`, `ragdollSpellPush`), which upstream ignores. |
+| `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds its own settings (`violenceLevel`, `goreAmount`, `dismemberment`, `dismemberAmount`, `hitstop`, `hitstopStrength`, `ragdollLift`, `ragdollSpellPush`), which upstream ignores. |
 | Warden (anticheat) | No | As with upstream, use a server with Warden off. |
 
 ## Running it
@@ -144,6 +145,8 @@ The fork's code is kept in a few places so it stays easy to merge with upstream:
   - `frost.rs`: the frozen body's ice tint
   - `hitstop.rs`: the hold on a landed hit
   - `testbox.rs`: the test crate
+- `crates/benilla-app/assets/ui/PhysicsOptions.xml`: the Physics options page, which adds itself
+  to the options window at load, so upstream's `OptionsFrame.xml` is untouched.
 - `crates/benilla-world/src/collision.rs` and `world_plugins.rs` add the ragdoll collision layers
   and turn on avian's solver (the `dynamics` feature).
 - Small hooks elsewhere are marked `Fork:` in their comments.

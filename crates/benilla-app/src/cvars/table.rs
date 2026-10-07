@@ -759,6 +759,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "2",
         "benilla's own — 1.12 ragdolls nothing, so it throws nothing",
     ),
+    // benilla's own: how much a dying ragdoll pops up, times the fork's own lift.
+    ours(
+        "ragdollLift",
+        "1",
+        "benilla's own — 1.12 ragdolls nothing, so it lifts nothing",
+    ),
     // `lastCharacterIndex` (`0x402d93`, "0" `0x82e570`, category 4, handle `[0x882674]`), help
     // "Last character selected": a 0-based row (the selection cell `[0x83856c]` under `"%d"`), so
     // "0" is the first character. It mirrors [`crate::char_select::Roster::pending_index`].

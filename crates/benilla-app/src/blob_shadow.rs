@@ -50,12 +50,6 @@ const BOX_CLAMP: f32 = 5.0;
 /// The reference's degenerate-box epsilon (`[0x8029d4]`).
 const DEGENERATE_EPS: f32 = 2.384e-7;
 
-/// Fork: the unit casts no shadow while it carries this: a ragdoll, whose body has left the spot
-/// the unit's transform still marks.
-#[derive(Component)]
-#[cfg_attr(not(feature = "ragdoll"), allow(dead_code))]
-pub(crate) struct NoBlobShadow;
-
 /// One unit's shadow record, a top-level entity despawned with its owner.
 #[derive(Component)]
 struct BlobShadow {
@@ -176,7 +170,6 @@ fn update_shadows(
             Option<&crate::entities::mount::MountChild>,
             // The exterior-scene election's verdict on the root, after propagation.
             Option<&InheritedVisibility>,
-            Has<NoBlobShadow>,
         ),
         Without<BlobShadow>,
     >,
@@ -200,15 +193,14 @@ fn update_shadows(
     let surface_count = decals.receiver_count();
     for (shadow, mut key, mut verts) in &mut shadows {
         n_total += 1;
-        let Ok((unit, anims, is_self, mount_child, drawn, no_shadow)) = owners.get(shadow.owner)
-        else {
+        let Ok((unit, anims, is_self, mount_child, drawn)) = owners.get(shadow.owner) else {
             // `sync_shadows` despawns it next frame.
             hide(&mut key, &mut verts);
             n_no_owner += 1;
             continue;
         };
         // The visibility deviation (module docs): an undrawn owner casts nothing.
-        if !drawn.is_none_or(|v| v.get()) || no_shadow {
+        if !drawn.is_none_or(|v| v.get()) {
             hide(&mut key, &mut verts);
             n_undrawn += 1;
             continue;
@@ -498,5 +490,38 @@ mod tests {
         assert_eq!(clamped, Vec3::new(-5.0, 0.0, 3.0));
         // A scale-2 unit's clamped box still doubles.
         assert_eq!(clamped * 2.0, Vec3::new(-10.0, 0.0, 6.0));
+    }
+}
+
+// Fork: the ragdoll fork's one change here, kept apart at the end of the file so other forks'
+// edits above merge cleanly.
+
+/// The unit casts no shadow while it carries this: a ragdoll, whose body has left the spot the
+/// unit's transform still marks.
+#[derive(Component)]
+#[cfg_attr(not(feature = "ragdoll"), allow(dead_code))]
+pub(crate) struct NoBlobShadow;
+
+/// Fork: registers [`drop_ragdoll_shadows`], from the ragdoll plugin.
+#[cfg_attr(not(feature = "ragdoll"), allow(dead_code))]
+pub(crate) fn ragdoll_shadows(app: &mut App) {
+    app.add_systems(Update, drop_ragdoll_shadows.after(update_shadows));
+}
+
+/// Empties the triangles [`update_shadows`] built for a ragdolled unit, before [`push_shadows`]
+/// draws them; one whose unit stands back up is cleared so the next frame rebuilds it.
+#[cfg_attr(not(feature = "ragdoll"), allow(dead_code))]
+fn drop_ragdoll_shadows(
+    mut shadows: Query<(&BlobShadow, &mut ShadowKey, &mut ShadowVerts)>,
+    ragdolls: Query<(), With<NoBlobShadow>>,
+    mut restored: RemovedComponents<NoBlobShadow>,
+) {
+    let restored: bevy::ecs::entity::EntityHashSet = restored.read().collect();
+    for (shadow, mut key, mut verts) in &mut shadows {
+        if ragdolls.contains(shadow.owner) {
+            verts.0.clear();
+        } else if restored.contains(&shadow.owner) {
+            hide(&mut key, &mut verts);
+        }
     }
 }

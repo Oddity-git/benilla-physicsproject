@@ -433,31 +433,6 @@
             .. "which it could only do in exclusive fullscreen. benilla applies it to the "
             .. "finished image instead, so it works in both display modes."
 
-        -- 1.12 has no setting for either: violenceLevel was fixed by region.
-        BENILLA_TOOLTIP_BLOOD =
-            "How much blood combat shows: the spurt on a hit, the spray of droplets, and the "
-            .. "splats and pools left on the ground.\n\n"
-            .. "Green turns red blood green, as the game did in regions that censored it. Off "
-            .. "shows none."
-
-        BENILLA_TOOLTIP_DISMEMBERMENT =
-            "Lets heavy killing blows tear limbs off a ragdolled body: one limb when the blow "
-            .. "takes a fifth of its health, two when it takes half."
-
-        BENILLA_TOOLTIP_GORE_AMOUNT =
-            "How much blood each hit throws: the droplets, the splats they leave, and the size "
-            .. "of the pools under the dead."
-
-        BENILLA_TOOLTIP_DISMEMBER_AMOUNT =
-            "How easily limbs come off. Higher lets lighter killing blows sever limbs."
-
-        BENILLA_TOOLTIP_HITSTOP =
-            "Holds the attacker's and the target's animations for a moment when a melee hit "
-            .. "lands, longer on a crit or a heavy hit, so blows feel weightier."
-
-        BENILLA_TOOLTIP_HITSTOP_STRENGTH =
-            "How long the hitstop holds."
-
         BENILLA_OPTIONS_PAGE_ROWS = {
             -- The era Controls order first; the rest follow their 1.12 box's columns.
             Controls = {
@@ -477,8 +452,6 @@
                 "RowUiScale", "RowFarclip", "RowWorldDetail", "RowSpellDetail", "RowBrightness",
                 "RowWeatherDensity",
                 "RowDisplayMode", "RowVerticalSync", "RowRenderScale",
-                "RowBlood", "RowGoreAmount", "RowDismemberment", "RowDismemberAmount",
-                "RowHitstop", "RowHitstopStrength",
             },
             -- Guild Names and Player Titles are children of Player Names
             -- (UIOptionsFrame.lua:703-709).
@@ -2017,76 +1990,6 @@
                                                     "BENILLA_TOOLTIP_RENDER_SCALE")
                                                 BenillaOptionsSliderRow_Setup(this, 0.5, 2.0, 0.05)
                                                 this.deferred = 1
-                                            </OnLoad></Scripts>
-                                        </Frame>
-                                        <Frame name="$parentRowBlood" inherits="BenillaOptionsDropdownRowTemplate">
-                                            <Anchors>
-                                                <Anchor point="TOPLEFT" relativeTo="$parentRowRenderScale" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowRenderScale" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                            </Anchors>
-                                            <Scripts><OnLoad>
-                                                -- Deviation: our own row over the reference's
-                                                -- violenceLevel, which 1.12 never let a player set.
-                                                BenillaOptionsRow_OnLoad(this, "violenceLevel", "Blood",
-                                                    "BENILLA_TOOLTIP_BLOOD")
-                                                BenillaOptionsDropdownRow_Setup(this, {
-                                                    { text = "Red", value = "2" },
-                                                    { text = "Green", value = "1" },
-                                                    { text = "Off", value = "0" },
-                                                })
-                                            </OnLoad></Scripts>
-                                        </Frame>
-                                        <Frame name="$parentRowGoreAmount" inherits="BenillaOptionsSliderRowTemplate">
-                                            <Anchors>
-                                                <Anchor point="TOPLEFT" relativeTo="$parentRowBlood" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowBlood" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                            </Anchors>
-                                            <Scripts><OnLoad>
-                                                BenillaOptionsRow_OnLoad(this, "goreAmount", "Gore Amount",
-                                                    "BENILLA_TOOLTIP_GORE_AMOUNT")
-                                                BenillaOptionsSliderRow_Setup(this, 0.25, 3, 0.25)
-                                            </OnLoad></Scripts>
-                                        </Frame>
-                                        <Frame name="$parentRowDismemberment" inherits="BenillaOptionsCheckboxRowTemplate">
-                                            <Anchors>
-                                                <Anchor point="TOPLEFT" relativeTo="$parentRowGoreAmount" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowGoreAmount" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                            </Anchors>
-                                            <Scripts><OnLoad>
-                                                BenillaOptionsRow_OnLoad(this, "dismemberment", "Dismemberment",
-                                                    "BENILLA_TOOLTIP_DISMEMBERMENT")
-                                            </OnLoad></Scripts>
-                                        </Frame>
-                                        <Frame name="$parentRowDismemberAmount" inherits="BenillaOptionsSliderRowTemplate">
-                                            <Anchors>
-                                                <Anchor point="TOPLEFT" relativeTo="$parentRowDismemberment" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowDismemberment" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                            </Anchors>
-                                            <Scripts><OnLoad>
-                                                BenillaOptionsRow_OnLoad(this, "dismemberAmount", "Dismemberment Amount",
-                                                    "BENILLA_TOOLTIP_DISMEMBER_AMOUNT")
-                                                BenillaOptionsSliderRow_Setup(this, 0.5, 3, 0.25)
-                                            </OnLoad></Scripts>
-                                        </Frame>
-                                        <Frame name="$parentRowHitstop" inherits="BenillaOptionsCheckboxRowTemplate">
-                                            <Anchors>
-                                                <Anchor point="TOPLEFT" relativeTo="$parentRowDismemberAmount" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowDismemberAmount" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                            </Anchors>
-                                            <Scripts><OnLoad>
-                                                BenillaOptionsRow_OnLoad(this, "hitstop", "Hitstop",
-                                                    "BENILLA_TOOLTIP_HITSTOP")
-                                            </OnLoad></Scripts>
-                                        </Frame>
-                                        <Frame name="$parentRowHitstopStrength" inherits="BenillaOptionsSliderRowTemplate">
-                                            <Anchors>
-                                                <Anchor point="TOPLEFT" relativeTo="$parentRowHitstop" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowHitstop" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                                            </Anchors>
-                                            <Scripts><OnLoad>
-                                                BenillaOptionsRow_OnLoad(this, "hitstopStrength", "Hitstop Strength",
-                                                    "BENILLA_TOOLTIP_HITSTOP_STRENGTH")
-                                                BenillaOptionsSliderRow_Setup(this, 0.25, 3, 0.25)
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>

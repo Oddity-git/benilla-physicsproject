@@ -11,6 +11,8 @@ ScrollTemplates.xml
 KeyBindingsPage.xml
 # `BenillaOptionsFrame`; its rows read the option globals the stock options windows set.
 OptionsFrame.xml
+# Fork: the Physics page, the ragdoll fork's settings, joined to the options window above.
+PhysicsOptions.xml
 # The ESC menu's era look on the stock `GameMenuFrame`, whose Options rung opens ours.
 GameMenuAdapters.xml
 # `OpenBackpack` and `CloseBackpack` over every equipped bag, for the vendor and the mailbox.

@@ -1,0 +1,168 @@
+<Ui>
+    <!--
+        Fork: the options window's Physics page, the ragdoll fork's settings. It lives in its own
+        file, loaded after OptionsFrame.xml, so the fork never edits upstream's options window: at
+        load it adds a Physics row under the System group's last row (Audio), a page body, a search
+        head, and its rows to BENILLA_OPTIONS_CATEGORY_KEYS and BENILLA_OPTIONS_PAGE_ROWS, which
+        every page loop reads.
+    -->
+
+    <Script><![CDATA[
+        -- 1.12 has no setting for any of these: violenceLevel was fixed by region.
+        BENILLA_TOOLTIP_BLOOD =
+            "How much blood combat shows: the spurt on a hit, the spray of droplets, and the "
+            .. "splats and pools left on the ground.\n\n"
+            .. "Green turns red blood green, as the game did in regions that censored it. Off "
+            .. "shows none."
+
+        BENILLA_TOOLTIP_GORE_AMOUNT =
+            "How much blood each hit throws: the droplets, the splats they leave, and the size "
+            .. "of the pools under the dead."
+
+        BENILLA_TOOLTIP_DISMEMBERMENT =
+            "Lets heavy killing blows tear limbs off a ragdolled body: one limb when the blow "
+            .. "takes a fifth of its health, two when it takes half."
+
+        BENILLA_TOOLTIP_DISMEMBER_AMOUNT =
+            "How easily limbs come off. Higher lets lighter killing blows sever limbs."
+
+        BENILLA_TOOLTIP_HITSTOP =
+            "Holds the attacker's and the target's animations for a moment when a melee hit "
+            .. "lands, longer on a crit or a heavy hit, so blows feel weightier."
+
+        BENILLA_TOOLTIP_HITSTOP_STRENGTH =
+            "How long the hitstop holds."
+
+        BENILLA_TOOLTIP_DEATH_LIFT =
+            "How much a body pops up as it dies, before it falls. A heavier killing blow lifts "
+            .. "it more."
+
+        BENILLA_TOOLTIP_SPELL_PUSH =
+            "How much harder a spell's killing blow throws the body than a melee one."
+
+        -- Joins the options window's page loops; run from the page's OnLoad, after its rows.
+        function BenillaPhysicsOptions_Register()
+            table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
+            BENILLA_OPTIONS_PAGE_ROWS.Physics = {
+                "RowBlood", "RowGoreAmount", "RowDismemberment", "RowDismemberAmount",
+                "RowHitstop", "RowHitstopStrength", "RowDeathLift", "RowSpellPush",
+            }
+        end
+    ]]></Script>
+
+    <!-- The category row, under the System group's last row. -->
+    <Button name="BenillaOptionsFrameCategoryListRowPhysics" parent="BenillaOptionsFrameCategoryList" inherits="BenillaOptionsCategoryRowTemplate">
+        <Anchors><Anchor point="TOPLEFT" relativeTo="BenillaOptionsFrameCategoryListRowAudio" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-2"/></Offset></Anchor></Anchors>
+        <Scripts><OnLoad>BenillaOptionsCategoryRow_OnLoad(this, "Physics", "Physics")</OnLoad></Scripts>
+    </Button>
+
+    <!-- The search results' group head. -->
+    <Button name="BenillaOptionsFrameContainerBodySearchHeadPhysics" parent="BenillaOptionsFrameContainerBody" inherits="BenillaOptionsSearchHeadTemplate">
+        <Scripts><OnLoad>
+            this.categoryKey = "Physics"
+            getglobal(this:GetName() .. "Label"):SetText("Physics")
+        </OnLoad></Scripts>
+    </Button>
+
+    <!-- The page, laid out as the other pages are: the first row at (10,-12), each next 9 below. -->
+    <Frame name="BenillaOptionsFrameContainerBodyPhysics" parent="BenillaOptionsFrameContainerBody" hidden="true">
+        <Anchors>
+            <Anchor point="TOPLEFT"/>
+            <Anchor point="BOTTOMRIGHT"/>
+        </Anchors>
+        <Frames>
+            <Frame name="$parentRowBlood" inherits="BenillaOptionsDropdownRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT"><Offset><AbsDimension x="10" y="-12"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT"><Offset><AbsDimension x="-20" y="-12"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "violenceLevel", "Blood", "BENILLA_TOOLTIP_BLOOD")
+                    BenillaOptionsDropdownRow_Setup(this, {
+                        { text = "Red", value = "2" },
+                        { text = "Green", value = "1" },
+                        { text = "Off", value = "0" },
+                    })
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowGoreAmount" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowBlood" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowBlood" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "goreAmount", "Gore Amount",
+                        "BENILLA_TOOLTIP_GORE_AMOUNT")
+                    BenillaOptionsSliderRow_Setup(this, 0.25, 3, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowDismemberment" inherits="BenillaOptionsCheckboxRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowGoreAmount" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowGoreAmount" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "dismemberment", "Dismemberment",
+                        "BENILLA_TOOLTIP_DISMEMBERMENT")
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowDismemberAmount" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowDismemberment" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowDismemberment" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "dismemberAmount", "Dismemberment Amount",
+                        "BENILLA_TOOLTIP_DISMEMBER_AMOUNT")
+                    BenillaOptionsSliderRow_Setup(this, 0.5, 3, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowHitstop" inherits="BenillaOptionsCheckboxRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowDismemberAmount" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowDismemberAmount" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "hitstop", "Hitstop", "BENILLA_TOOLTIP_HITSTOP")
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowHitstopStrength" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowHitstop" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowHitstop" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "hitstopStrength", "Hitstop Strength",
+                        "BENILLA_TOOLTIP_HITSTOP_STRENGTH")
+                    BenillaOptionsSliderRow_Setup(this, 0.25, 3, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowDeathLift" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowHitstopStrength" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowHitstopStrength" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "ragdollLift", "Death Lift",
+                        "BENILLA_TOOLTIP_DEATH_LIFT")
+                    BenillaOptionsSliderRow_Setup(this, 0, 3, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowSpellPush" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowDeathLift" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowDeathLift" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "ragdollSpellPush", "Spell Push",
+                        "BENILLA_TOOLTIP_SPELL_PUSH")
+                    BenillaOptionsSliderRow_Setup(this, 0.5, 4, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+        </Frames>
+        <Scripts>
+            <!-- The loader fires OnLoad bottom-up, so the rows already exist. -->
+            <OnLoad>BenillaPhysicsOptions_Register()</OnLoad>
+        </Scripts>
+    </Frame>
+</Ui>

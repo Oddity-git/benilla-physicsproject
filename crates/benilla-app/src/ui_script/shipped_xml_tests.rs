@@ -1933,6 +1933,8 @@ fn the_layer_does_not_grow() {
         "ScrollTemplates.xml",
         "KeyBindingsPage.xml",
         "OptionsFrame.xml",
+        // Fork: the ragdoll fork's Physics options page.
+        "PhysicsOptions.xml",
         "GameMenuAdapters.xml",
         "ContainerFrameAdapters.xml",
         "SpellBookAdapters.xml",

@@ -41,5 +41,6 @@ impl Plugin for RagdollPlugin {
         life::plugin(app);
         lootbag::plugin(app);
         pusher::plugin(app);
+        crate::blob_shadow::ragdoll_shadows(app);
     }
 }

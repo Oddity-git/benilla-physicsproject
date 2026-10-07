@@ -47,7 +47,12 @@ const BLOW_PUSH: f32 = 14.0;
 const MAX_PUSH: f32 = 12.0;
 /// A hit older than this when the unit reads dead was not the killing blow (s).
 const BLOW_WINDOW: f32 = 2.0;
-const DEATH_LIFT: f32 = 0.5;
+/// The lift at death (yd/s), every body alike, so the corpse pops up a little before it folds;
+/// plus this much per whole health bar the killing blow took, and never more than the cap. All of
+/// it is times `ragdollLift`.
+const DEATH_LIFT: f32 = 2.0;
+const BLOW_LIFT: f32 = 2.0;
+const MAX_LIFT: f32 = 4.0;
 /// The frost school: a frost killing blow freezes the body stiff, its joints locked this tight at
 /// the pose it died in, damped this hard, and tipped over by this push (yd/s) instead of thrown.
 const FROST_SCHOOL: u32 = 4;
@@ -328,6 +333,11 @@ fn start_ragdolls(
         } else {
             1.0
         };
+        let lift_scale = cvars
+            .as_deref()
+            .and_then(|c| c.num("ragdollLift"))
+            .unwrap_or(1.0)
+            .clamp(0.0, 3.0);
         let (away, strength, lift) = match knock {
             Some(k) => (
                 k.away.with_y(0.0).normalize_or_zero(),
@@ -339,7 +349,7 @@ fn start_ragdolls(
             None => (
                 away,
                 (DEATH_PUSH + BLOW_PUSH * blow_share).min(MAX_PUSH) * spell_push,
-                DEATH_LIFT,
+                (DEATH_LIFT + BLOW_LIFT * blow_share).min(MAX_LIFT) * lift_scale,
             ),
         };
         // A heavy killing blow takes limbs off, when the option allows.
