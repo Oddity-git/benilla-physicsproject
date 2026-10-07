@@ -395,6 +395,9 @@ fn start_ragdolls(
             layout.join(" ")
         );
         bodies.0.insert(unit, spawned);
+        commands
+            .entity(unit)
+            .insert(crate::blob_shadow::NoBlobShadow);
         commands.entity(unit).insert(Ragdoll {
             profile,
             born: time.elapsed_secs(),
@@ -543,7 +546,9 @@ fn cleanup(
 ) {
     for (unit, store) in &rags {
         if !store.0.unit_is_dead() {
-            commands.entity(unit).remove::<Ragdoll>();
+            commands
+                .entity(unit)
+                .remove::<(Ragdoll, crate::blob_shadow::NoBlobShadow)>();
             if let Some(ids) = bodies.0.remove(&unit) {
                 despawn_bodies(&mut commands, &ids, &joints);
             }

@@ -25,12 +25,15 @@ const SACK_MODELS: &[&str] = &[
     "World\\Generic\\Human\\Passive Doodads\\Sacks\\Sack01.m2",
     "World\\Generic\\Human\\Passive Doodads\\Sacks\\SackOfGrain01.m2",
 ];
-/// A unit this tall (yd, its model's height times its scale) or shorter gets the default sack;
-/// a taller one scales the sack up with it, never down.
-const DEFAULT_HEIGHT: f32 = 2.2;
-/// The click sphere, in sack units: its radius and how high its centre sits.
-const PICK_RADIUS: f32 = 0.5;
-const PICK_CENTRE: f32 = 0.35;
+/// The sack's size, a share of the model as authored: a person's corpse gets the default, and a
+/// unit more than [`BIG_HEIGHT`] tall (yd, its model's height times its scale) twice it.
+const DEFAULT_SCALE: f32 = 0.25;
+const BIG_SCALE: f32 = 0.5;
+const BIG_HEIGHT: f32 = 3.3;
+/// The default sack's click sphere (yd): its radius and how high its centre sits; a big unit's is
+/// twice it, as its sack is.
+const PICK_RADIUS: f32 = 0.6;
+const PICK_CENTRE: f32 = 0.45;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<SackArt>()
@@ -50,7 +53,10 @@ struct Bags(EntityHashMap<Entity>);
 /// A sack on the spot a unit died, its size in sack units, and whether its meshes are built.
 #[derive(Component)]
 struct LootBag {
+    /// The model's scale.
     scale: f32,
+    /// The click sphere's size against the default sack's: 1 or 2.
+    size: f32,
     built: bool,
 }
 
@@ -112,14 +118,20 @@ fn sync_bags(mut commands: Commands, units: Query<BagUnit, With<Ragdoll>>, mut b
         if !store.0.unit_lootable() || bags.0.contains_key(&unit) {
             continue;
         }
-        let height = bound.map_or(DEFAULT_HEIGHT, |b| 2.0 * b.0.half_extents.y) * net.scale;
-        let scale = (height / DEFAULT_HEIGHT).max(1.0);
+        let height = bound.map_or(0.0, |b| 2.0 * b.0.half_extents.y) * net.scale;
+        let big = height > BIG_HEIGHT;
+        let (scale, size) = if big {
+            (BIG_SCALE, 2.0)
+        } else {
+            (DEFAULT_SCALE, 1.0)
+        };
         let (_, rot, at) = tf.to_scale_rotation_translation();
         let root = commands
             .spawn((
                 Name::new("ragdoll loot bag"),
                 LootBag {
                     scale,
+                    size,
                     built: false,
                 },
                 Transform::from_translation(at)
@@ -193,7 +205,7 @@ fn build_bags(
                 let (mesh, material) = plain_art
                     .get_or_insert_with(|| {
                         (
-                            mesh_assets.add(Sphere::new(PICK_RADIUS * 0.8)),
+                            mesh_assets.add(Sphere::new(1.0)),
                             plain.add(StandardMaterial {
                                 base_color: Color::srgb(0.45, 0.32, 0.18),
                                 unlit: true,
@@ -202,12 +214,14 @@ fn build_bags(
                         )
                     })
                     .clone();
+                // Sized in yards inside the sack's scaled root, filling the click sphere.
+                let r = 0.8 * PICK_RADIUS * bag.size / bag.scale;
                 let child = commands
                     .spawn((
                         Mesh3d(mesh),
                         MeshMaterial3d(material),
-                        Transform::from_translation(Vec3::Y * PICK_CENTRE)
-                            .with_scale(Vec3::new(1.0, 0.8, 1.0)),
+                        Transform::from_translation(Vec3::Y * PICK_CENTRE * bag.size / bag.scale)
+                            .with_scale(Vec3::new(r, 0.8 * r, r)),
                     ))
                     .id();
                 commands.entity(root).add_child(child);
@@ -249,8 +263,8 @@ fn pick_bags(
         let Ok((bag, tf)) = sacks.get(root) else {
             continue;
         };
-        let centre = tf.translation() + Vec3::Y * PICK_CENTRE * bag.scale;
-        let Some(t) = ray_sphere(origin, dir, centre, PICK_RADIUS * bag.scale) else {
+        let centre = tf.translation() + Vec3::Y * PICK_CENTRE * bag.size;
+        let Some(t) = ray_sphere(origin, dir, centre, PICK_RADIUS * bag.size) else {
             continue;
         };
         if t < occlusion.distance && best.is_none_or(|(_, b)| t < b) {

@@ -10,8 +10,12 @@ const MIN_SEGMENT: f32 = 0.08;
 /// Most bodies a rig gets, keeping the hub and the longest segments: room for a spider's legs.
 const MAX_BODIES: usize = 32;
 /// Walking down from the root, the hub is the first bone no single child of which holds this share
-/// of its descendants: the pelvis, where the spine and the legs part.
+/// of the limb length below it: the pelvis, where the spine and the legs part.
 const HUB_SHARE: f32 = 0.75;
+/// A child of the hub this close to it (a share of the height), with a segment this short, is part
+/// of the hub, not a body of its own: a waist bone between the hub and the legs would wobble.
+const HUB_MERGE_NEAR: f32 = 0.05;
+const HUB_MERGE_SHORT: f32 = 0.1;
 /// Capsule radius as a fraction of its segment, clamped to a band of the skeleton's height.
 const RADIUS_OF_SEGMENT: f32 = 0.3;
 const RADIUS_MIN: f32 = 0.03;
@@ -106,7 +110,23 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
         }
     }
 
-    let hub = find_hub(&subtree, &parent_of, n);
+    // Each bone's limb length, its segment's when that is long enough for a body, and the sum over
+    // its subtree: what the hub search weighs, so a hand's dozen finger bones count for nothing.
+    let limb: Vec<f32> = (0..n)
+        .map(|i| {
+            main_child[i]
+                .map(|c| (pivots[c] - pivots[i]).length())
+                .filter(|&l| l >= MIN_SEGMENT * height)
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let mut limb_below = limb.clone();
+    for i in (0..n).rev() {
+        if let Some(p) = parent_of(i) {
+            limb_below[p] += limb_below[i];
+        }
+    }
+    let hub = find_hub(&limb, &limb_below, &parent_of, n);
     // The hub's ancestors ride it rigidly (the origin root, a bone above the pelvis): a body there
     // would hang off the hub upside down.
     let mut above_hub = vec![false; n];
@@ -119,6 +139,12 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
         .filter(|&i| i != hub && !above_hub[i])
         .filter_map(|i| {
             let seg = pivots[main_child[i]?] - pivots[i];
+            let merged = parent_of(i) == Some(hub)
+                && (pivots[i] - pivots[hub]).length() < HUB_MERGE_NEAR * height
+                && seg.length() < HUB_MERGE_SHORT * height;
+            if merged {
+                return None;
+            }
             // A root bone at the model origin spans origin to pelvis: no limb.
             let root_like = parent_of(i).is_none() && pivots[i].length() < 0.05 * height;
             (seg.length() >= MIN_SEGMENT * height && !root_like).then_some((i, seg))
@@ -169,20 +195,25 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
     Some(Profile { bodies, body_of })
 }
 
-/// The hub: from the root with the largest subtree, step into the child that holds at least
-/// [`HUB_SHARE`] of the bone's descendants, until no child does. That is where the body branches
-/// (a pelvis, a spider's thorax), whatever its index or its own segment's length.
-fn find_hub(subtree: &[usize], parent_of: &impl Fn(usize) -> Option<usize>, n: usize) -> usize {
+/// The hub: from the root with the most limb length, step into the child that holds at least
+/// [`HUB_SHARE`] of the limb length below the bone, until no child does. That is where the body
+/// branches (a pelvis, a spider's thorax), whatever its index or its own segment's length.
+fn find_hub(
+    limb: &[f32],
+    limb_below: &[f32],
+    parent_of: &impl Fn(usize) -> Option<usize>,
+    n: usize,
+) -> usize {
     let mut at = (0..n)
         .filter(|&i| parent_of(i).is_none())
-        .max_by_key(|&i| subtree[i])
+        .max_by(|&a, &b| limb_below[a].total_cmp(&limb_below[b]))
         .unwrap_or(0);
     loop {
-        let below = subtree[at].saturating_sub(1).max(1) as f32;
+        let below = (limb_below[at] - limb[at]).max(f32::EPSILON);
         let next = (at + 1..n)
             .filter(|&c| parent_of(c) == Some(at))
-            .max_by_key(|&c| subtree[c])
-            .filter(|&c| subtree[c] as f32 >= HUB_SHARE * below);
+            .max_by(|&a, &b| limb_below[a].total_cmp(&limb_below[b]))
+            .filter(|&c| limb_below[c] >= HUB_SHARE * below);
         match next {
             Some(c) => at = c,
             None => return at,
