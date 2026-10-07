@@ -41,8 +41,7 @@ Everything here is **client side only**. The server, other players and their cli
   it flies, lies there a moment and gets up. This happens only on your screen; the server still
   has it standing, so a creature you are fighting keeps fighting.
 - **Dismemberment.** With the option on, a killing blow that takes a fifth of the target's health
-  severs a limb (the head included), and one that takes half severs two. The limb flies off and
-  the stump spurts blood.
+  severs a limb (the head included), and one that takes half severs two. The limb flies off.
 - **Options.** Settings → Graphics has a **Blood** choice (Red, Green or Off, the game's own
   `violenceLevel`) and a **Dismemberment** checkbox (off by default).
 

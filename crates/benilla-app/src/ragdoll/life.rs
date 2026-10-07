@@ -249,7 +249,6 @@ fn start_ragdolls(
     mut active: Query<(Entity, &mut Ragdoll)>,
     mut bodies: ResMut<RagdollBodies>,
     cvars: Option<Res<crate::cvars::Cvars>>,
-    mut severs: MessageWriter<super::dismember::Severed>,
 ) {
     if ragdolls_off() {
         return;
@@ -489,12 +488,6 @@ fn start_ragdolls(
                 .iter()
                 .map(|&k| profile.bodies[k].bone as usize)
                 .collect();
-            for &bone in &roots {
-                let at = rig.model.get(bone).map_or(unit_tf.translation(), |m| {
-                    world.transform_point3(m.translation.into())
-                });
-                severs.write(super::dismember::Severed { unit, at, away });
-            }
             info!("ragdoll: unit {unit} loses bones {roots:?}");
             commands
                 .entity(unit)
