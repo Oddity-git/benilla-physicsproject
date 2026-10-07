@@ -14,9 +14,9 @@ use super::spell_visual::FxSlot;
 use super::spell_visual::SpellVisuals;
 use super::{SpellKitFx, SwingImpact, SwingMessage};
 
-/// The spurt plays at this many times its authored size. Fork: once 2, which blew its yellow
-/// impact flash up too; back to the authored size, the droplets carrying the gore.
-const SPURT_SCALE: f32 = 1.0;
+/// The spurt plays at this many times its authored size. Fork: half size, which shrinks its yellow
+/// impact flash (the stock spurt's own blood shrinks with it; the ragdoll droplets carry the gore).
+const SPURT_SCALE: f32 = 0.5;
 
 /// The gore level, the client's `violenceLevel` (0 none, 1 green, 2 true colors). The reference
 /// defaults it to its region's maximum (`0x6c5aa0`, from the table at `0x86c3f8`, which the setter
