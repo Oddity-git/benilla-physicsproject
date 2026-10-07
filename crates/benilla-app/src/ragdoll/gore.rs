@@ -106,9 +106,11 @@ pub(super) fn plugin(app: &mut App) {
 struct Gore {
     /// The procedural splat drawn while a stock one loads, or when it fails to.
     fallback: Handle<Image>,
-    droplet_mesh: Handle<Mesh>,
-    /// Droplet materials by quantized colour.
-    materials: HashMap<[u8; 3], Handle<StandardMaterial>>,
+    /// A droplet's soft round dot.
+    dot: Handle<Image>,
+    /// The droplets in flight. Drawn on the effect lane, never as mesh entities: thousands of
+    /// short-lived mesh entities race Bevy's material specialization and panic it.
+    drops: Vec<Droplet>,
     /// The stock splat textures by `UnitBlood` path.
     textures: HashMap<String, Handle<Image>>,
     /// What each loaded splat texture holds ([`TexLook`]).
@@ -168,8 +170,8 @@ struct Blood {
 }
 
 /// A droplet in flight.
-#[derive(Component)]
 struct Droplet {
+    at: Vec3,
     velocity: Vec3,
     ground: f32,
     born: f32,
@@ -204,13 +206,9 @@ struct PoolDue {
     at: f32,
 }
 
-fn setup_gore(
-    mut gore: ResMut<Gore>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-) {
+fn setup_gore(mut gore: ResMut<Gore>, mut images: ResMut<Assets<Image>>) {
     gore.fallback = images.add(fallback_splat());
-    gore.droplet_mesh = meshes.add(Sphere::new(1.0));
+    gore.dot = images.add(droplet_dot());
     gore.rng = 0x9e37_79b9;
 }
 
@@ -231,6 +229,33 @@ fn fallback_splat() -> Image {
                 + 0.04 * (17.0 * a).sin();
             let alpha = ((edge - r) / 0.06).clamp(0.0, 1.0);
             data.extend_from_slice(&[255, 255, 255, (alpha * 230.0) as u8]);
+        }
+    }
+    Image::new(
+        Extent3d {
+            width: N,
+            height: N,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::all(),
+    )
+}
+
+/// A white disc with a soft edge, for the droplets.
+fn droplet_dot() -> Image {
+    const N: u32 = 16;
+    let mut data = Vec::with_capacity((N * N * 4) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            let (u, v) = (
+                (x as f32 + 0.5) / N as f32 * 2.0 - 1.0,
+                (y as f32 + 0.5) / N as f32 * 2.0 - 1.0,
+            );
+            let alpha = ((1.0 - u.hypot(v)) / 0.3).clamp(0.0, 1.0);
+            data.extend_from_slice(&[255, 255, 255, (alpha * 255.0) as u8]);
         }
     }
     Image::new(
@@ -354,7 +379,6 @@ fn spray_hits(
     decals: WorldDecal,
     time: Res<Time>,
     mut gore: ResMut<Gore>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let violence = violence_level(cvars.as_deref());
     let Some(blood) = blood.filter(|_| violence > 0) else {
@@ -412,16 +436,7 @@ fn spray_hits(
             let dir = Quat::from_rotation_y(yaw) * away;
             let v = (dir * climb.cos() + Vec3::Y * climb.sin()) * speed * gore.range((0.45, 1.2));
             let start = chest + Vec3::new(gore.range((-0.1, 0.1)), 0.0, gore.range((-0.1, 0.1)));
-            throw_droplet(
-                &mut commands,
-                &mut gore,
-                &mut materials,
-                b,
-                start,
-                v,
-                feet.y,
-                now,
-            );
+            throw_droplet(&mut gore, b, start, v, feet.y, now);
         }
         // The splat under the victim.
         if let Some(texture) = gore.pick_texture(&server, &splats) {
@@ -434,42 +449,21 @@ fn spray_hits(
 }
 
 /// Launch one droplet of `blood` from `start` at `velocity`, to splat at height `ground`.
-#[allow(clippy::too_many_arguments)] // the droplet's whole state
 fn throw_droplet(
-    commands: &mut Commands,
     gore: &mut Gore,
-    materials: &mut Assets<StandardMaterial>,
     blood: Blood,
     start: Vec3,
     velocity: Vec3,
     ground: f32,
     now: f32,
 ) {
-    let colour = droplet_colour(gore, &blood);
-    let key = colour.map(|c| (c * 255.0) as u8);
-    let material = gore
-        .materials
-        .entry(key)
-        .or_insert_with(|| {
-            materials.add(StandardMaterial {
-                base_color: Color::srgb(colour[0], colour[1], colour[2]),
-                unlit: true,
-                ..default()
-            })
-        })
-        .clone();
-    commands.spawn((
-        Name::new("blood droplet"),
-        Mesh3d(gore.droplet_mesh.clone()),
-        MeshMaterial3d(material),
-        Transform::from_translation(start).with_scale(Vec3::splat(DROP_RADIUS)),
-        Droplet {
-            velocity,
-            ground,
-            born: now,
-            blood,
-        },
-    ));
+    gore.drops.push(Droplet {
+        at: start,
+        velocity,
+        ground,
+        born: now,
+        blood,
+    });
 }
 
 /// A stump spurting: pulses of droplets from where a limb came off, for a while.
@@ -497,7 +491,6 @@ fn gush_stumps(
     server: Res<AssetServer>,
     time: Res<Time>,
     mut gore: ResMut<Gore>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let now = time.elapsed_secs();
     let violence = violence_level(cvars.as_deref());
@@ -525,15 +518,7 @@ fn gush_stumps(
             splats,
             violence,
         };
-        spurt(
-            &mut commands,
-            &mut gore,
-            &mut materials,
-            &server,
-            &gusher,
-            CUT_DROPS,
-            now,
-        );
+        spurt(&mut gore, &server, &gusher, CUT_DROPS, now);
         commands.spawn((Name::new("blood gusher"), gusher));
     }
     for (e, mut gusher) in &mut gushers {
@@ -545,28 +530,12 @@ fn gush_stumps(
             continue;
         }
         gusher.next = now + GUSH_PULSE;
-        spurt(
-            &mut commands,
-            &mut gore,
-            &mut materials,
-            &server,
-            &gusher,
-            PULSE_DROPS,
-            now,
-        );
+        spurt(&mut gore, &server, &gusher, PULSE_DROPS, now);
     }
 }
 
 /// One spurt of `count` droplets from a gusher, up and out along the throw.
-fn spurt(
-    commands: &mut Commands,
-    gore: &mut Gore,
-    materials: &mut Assets<StandardMaterial>,
-    server: &AssetServer,
-    gusher: &Gusher,
-    count: usize,
-    now: f32,
-) {
+fn spurt(gore: &mut Gore, server: &AssetServer, gusher: &Gusher, count: usize, now: f32) {
     for _ in 0..count {
         let Some(texture) = gore.pick_texture(server, &gusher.splats) else {
             return;
@@ -582,16 +551,7 @@ fn spurt(
         );
         let v = (gusher.away * 0.6 + Vec3::Y * 1.2 + jitter * 0.6).normalize_or_zero()
             * gore.range(GUSH_SPEED);
-        throw_droplet(
-            commands,
-            gore,
-            materials,
-            blood,
-            gusher.at,
-            v,
-            gusher.ground,
-            now,
-        );
+        throw_droplet(gore, blood, gusher.at, v, gusher.ground, now);
     }
 }
 
@@ -656,39 +616,35 @@ fn project(
 /// Fly the droplets under gravity; one that reaches its victim's ground level splats there.
 fn fly_droplets(
     mut commands: Commands,
-    mut drops: Query<(Entity, &mut Droplet, &mut Transform)>,
     decals: WorldDecal,
     time: Res<Time>,
     mut gore: ResMut<Gore>,
 ) {
     let (now, dt) = (time.elapsed_secs(), time.delta_secs());
-    for (e, mut drop, mut tf) in &mut drops {
+    let mut drops = std::mem::take(&mut gore.drops);
+    drops.retain_mut(|drop| {
         drop.velocity.y -= GRAVITY * dt;
         drop.velocity *= 1.0 - (DROP_DRAG * dt).min(1.0);
-        tf.translation += drop.velocity * dt;
-        let speed = drop.velocity.length();
-        if speed > 1e-3 {
-            tf.rotation = Quat::from_rotation_arc(Vec3::Y, drop.velocity / speed);
+        drop.at += drop.velocity * dt;
+        let landed = drop.at.y <= drop.ground;
+        if landed {
+            let half = gore.range(DROP_SPLAT);
+            let at = drop.at.with_y(drop.ground);
+            lay_splat(
+                &mut commands,
+                &mut gore,
+                &decals,
+                at,
+                half,
+                drop.blood.clone(),
+                now,
+            );
         }
-        tf.scale = Vec3::new(1.0, 1.0 + speed * DROP_STRETCH, 1.0) * DROP_RADIUS;
-        let landed = tf.translation.y <= drop.ground;
-        if landed || now - drop.born > DROP_LIFE {
-            if landed {
-                let half = gore.range(DROP_SPLAT);
-                let at = tf.translation.with_y(drop.ground);
-                lay_splat(
-                    &mut commands,
-                    &mut gore,
-                    &decals,
-                    at,
-                    half,
-                    drop.blood.clone(),
-                    now,
-                );
-            }
-            commands.entity(e).despawn();
-        }
-    }
+        !landed && now - drop.born <= DROP_LIFE
+    });
+    // Anything thrown while these flew (none: this runs alone) stays.
+    drops.append(&mut gore.drops);
+    gore.drops = drops;
 }
 
 /// A dead ragdoll bleeds once its body has fallen; a knocked-down one does not. A unit risen again
@@ -832,8 +788,9 @@ fn age_splats(
 
 /// Draw every splat and pool: alpha-blended on the footprint rung, so they paint over the blob
 /// shadows and under everything standing.
+#[allow(clippy::too_many_arguments)] // one Bevy system's resources
 fn push_decals(
-    cam: Query<Entity, With<WorldCamera>>,
+    cam: Query<(Entity, &GlobalTransform), With<WorldCamera>>,
     mut draw: WorldEffectDraw,
     splats: Query<(Entity, &Splat)>,
     pools: Query<(Entity, &Pool)>,
@@ -841,8 +798,11 @@ fn push_decals(
     time: Res<Time>,
     mut gore: ResMut<Gore>,
 ) {
-    let Ok(cam) = cam.single() else { return };
+    let Ok((cam, cam_tf)) = cam.single() else {
+        return;
+    };
     let now = time.elapsed_secs();
+    push_droplets(&mut draw, cam, cam_tf, &gore);
     let draws = splats
         .iter()
         .map(|(e, s)| (e, &s.verts, &s.blood, s.anchor, SPLAT_LIFE - (now - s.born)))
@@ -870,4 +830,53 @@ fn push_decals(
         }));
         batch.tris();
     }
+}
+
+/// Draw the droplets as small dots facing the camera, stretched along their flight.
+fn push_droplets(draw: &mut WorldEffectDraw, cam: Entity, cam_tf: &GlobalTransform, gore: &Gore) {
+    if gore.drops.is_empty() {
+        return;
+    }
+    let eye = cam_tf.translation();
+    let mut verts = Vec::with_capacity(gore.drops.len() * 6);
+    for drop in &gore.drops {
+        let view = (drop.at - eye).normalize_or(Vec3::NEG_Z);
+        let speed = drop.velocity.length();
+        // Long along the flight as seen from the eye, round when still or flying at it.
+        let along = (drop.velocity - view * drop.velocity.dot(view))
+            .try_normalize()
+            .unwrap_or_else(|| *cam_tf.up());
+        let across = view.cross(along).normalize_or(*cam_tf.right());
+        let a = along * DROP_RADIUS * (1.0 + speed * DROP_STRETCH);
+        let b = across * DROP_RADIUS;
+        let colour = droplet_colour(gore, &drop.blood);
+        let color = [colour[0], colour[1], colour[2], 1.0];
+        let corner = |p: Vec3, uv: [f32; 2]| EffectVertex {
+            pos: p.to_array(),
+            uv,
+            color,
+        };
+        let (p00, p10, p11, p01) = (
+            drop.at - a - b,
+            drop.at - a + b,
+            drop.at + a + b,
+            drop.at + a - b,
+        );
+        verts.extend([
+            corner(p00, [0.0, 0.0]),
+            corner(p10, [1.0, 0.0]),
+            corner(p11, [1.0, 1.0]),
+            corner(p00, [0.0, 0.0]),
+            corner(p11, [1.0, 1.0]),
+            corner(p01, [0.0, 1.0]),
+        ]);
+    }
+    let anchor = gore.drops.iter().map(|d| d.at).sum::<Vec3>() / gore.drops.len() as f32;
+    let mut batch = draw
+        .batch(cam, gore.dot.id())
+        .alpha()
+        .anchored(anchor)
+        .owner(cam);
+    batch.extend(verts);
+    batch.tris();
 }
