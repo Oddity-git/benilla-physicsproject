@@ -45,7 +45,7 @@ Everything here is **client side only**. The server, other players and their cli
   has it standing, so a creature you are fighting keeps fighting.
 - **Dismemberment.** With the option on, a killing blow that takes a fifth of the target's health
   severs a limb (the head included), and one that takes half severs two. The limb flies off.
-- **Hitstop.** When a melee hit lands, the attacker's and the target's animations hold for a
+- **Hitstop.** When a melee hit lands, the attacker's and the target's drawn poses hold for a
   moment (longer on a crit or a heavy hit), so blows feel weightier. Only the animation stops.
 - **Options.** Settings → Graphics has a **Blood** choice (Red, Green or Off, the game's own
   `violenceLevel`), a **Gore Amount** slider, a **Dismemberment** checkbox (off by default) with a

@@ -1,11 +1,15 @@
 //! Fork: hitstop. When a melee swing lands, at its impact key (the frame the stock spurt and its
 //! flash fire), the attacker's and the victim's animations hold for a moment, which sells the
 //! weight of the hit. Longer on a crit and on a hit that takes a big share of the victim's health.
-//! Only the animation clocks stop: movement and the server's timing run on.
+//! Only the drawn pose holds: the clips, the animation driver and the swing sounds keyed to them
+//! run on untouched (pausing the clips themselves left the driver out of step: units walked in
+//! place and swing sounds drifted), so the model catches up when the hold ends.
 
 use bevy::prelude::*;
 
-use crate::aura_visual::AnimRateFreeze;
+use benilla_world::rig_anim::{PosePost, RigPose};
+
+use super::life::Ragdoll;
 use crate::creature_anim::SwingImpact;
 use crate::net::ObjectStore;
 
@@ -22,18 +26,15 @@ const HITINFO_CRITICAL: u32 = 0x80;
 const HITINFO_NORMALSWING: u32 = 0x2;
 
 pub(super) fn plugin(app: &mut App) {
-    app.add_systems(
-        Update,
-        (start_stops, hold_stops)
-            .chain()
-            .after(crate::aura_visual::apply_aura_anim_rate),
-    );
+    app.add_systems(Update, start_stops)
+        .add_systems(PostUpdate, hold_stops.in_set(PosePost));
 }
 
-/// This unit's animations hold until `until`.
+/// This unit's drawn pose holds until `until`: the pose it had on the first held frame.
 #[derive(Component)]
 struct HitStop {
     until: f32,
+    pose: Option<Vec<Transform>>,
 }
 
 /// Each landed swing stops both sides, if the option is on.
@@ -82,32 +83,46 @@ fn start_stops(
         };
         let hold = ((base + SHARE_STOP * share) * strength).min(MAX_STOP);
         for unit in [swing.attacker, victim] {
+            // A stop already running keeps its pose and runs to the later end.
             let until = stops.get(unit).map_or(0.0, |s| s.until).max(now + hold);
-            commands.entity(unit).try_insert(HitStop { until });
+            match stops.get(unit) {
+                Ok(_) => {
+                    commands.entity(unit).queue(move |mut e: EntityWorldMut| {
+                        if let Some(mut stop) = e.get_mut::<HitStop>() {
+                            stop.until = until;
+                        }
+                    });
+                }
+                Err(_) => {
+                    commands
+                        .entity(unit)
+                        .try_insert(HitStop { until, pose: None });
+                }
+            }
         }
     }
 }
 
-/// Holds every stopped unit's clips, reasserted each frame so a clip armed mid-stop holds too, and
-/// lets them go when the stop ends. A unit a freeze aura holds is left to the aura.
+/// Holds every stopped unit's drawn pose: the first held frame keeps the pose the clips gave it,
+/// and every frame after shows that pose again until the stop ends. A ragdoll is left alone.
 fn hold_stops(
     mut commands: Commands,
-    mut units: Query<(Entity, &HitStop, &mut AnimationPlayer, Has<AnimRateFreeze>)>,
+    mut units: Query<(Entity, &mut HitStop, &mut RigPose), Without<Ragdoll>>,
     time: Res<Time>,
 ) {
     let now = time.elapsed_secs();
-    for (unit, stop, mut player, frozen) in &mut units {
+    for (unit, mut stop, mut rig) in &mut units {
         if now >= stop.until {
-            if !frozen {
-                for (_, anim) in player.playing_animations_mut() {
-                    anim.resume();
-                }
-            }
             commands.entity(unit).remove::<HitStop>();
             continue;
         }
-        for (_, anim) in player.playing_animations_mut() {
-            anim.pause();
+        match &stop.pose {
+            None => stop.pose = Some(rig.locals.clone()),
+            Some(pose) => {
+                let n = rig.locals.len().min(pose.len());
+                rig.locals[..n].copy_from_slice(&pose[..n]);
+                rig.pose_dirty = true;
+            }
         }
     }
 }

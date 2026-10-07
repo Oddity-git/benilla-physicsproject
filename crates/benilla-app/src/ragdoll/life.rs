@@ -112,6 +112,9 @@ pub(super) struct Ragdoll {
     pub(super) frozen: Option<Vec<Transform>>,
     /// A knockdown, not a death: when it gets up, and the bone locals it fell from.
     getting_up: Option<(f32, Vec<Transform>)>,
+    /// The bone locals it fell from, put back when it lives again (a resurrection, a ghost): the
+    /// clips rewrite only the bones they key, so the rest would keep the corpse's pose.
+    rest: Vec<Transform>,
 }
 
 /// A request to knock a living unit down: it falls as a ragdoll pushed `away` (yd/s, weighted
@@ -541,17 +544,16 @@ fn start_ragdolls(
         if frozen {
             commands.entity(unit).insert(super::frost::Frozen);
         }
+        // Knocked down again mid-rise, it still returns to the pose it first fell from.
+        let rest = rising.map_or_else(|| rig.locals.clone(), |r| r.rest.clone());
         commands.entity(unit).insert(Ragdoll {
             profile,
             born: now,
             awake_since: now,
             anchors,
             frozen: None,
-            // Knocked down again mid-rise, it still returns to the pose it first fell from.
-            getting_up: knock.map(|k| {
-                let rest = rising.map_or_else(|| rig.locals.clone(), |r| r.rest.clone());
-                (now + k.hold, rest)
-            }),
+            getting_up: knock.map(|k| (now + k.hold, rest.clone())),
+            rest,
         });
     }
 
@@ -688,12 +690,18 @@ fn freeze_settled(
 fn cleanup(
     mut commands: Commands,
     units: Query<&ObjectStore>,
-    rags: Query<(Entity, &ObjectStore, &Ragdoll)>,
+    mut rags: Query<(Entity, &ObjectStore, &Ragdoll, Option<&mut RigPose>)>,
     joints: Query<(Entity, &SphericalJoint)>,
     mut bodies: ResMut<RagdollBodies>,
 ) {
-    for (unit, store, rag) in &rags {
+    for (unit, store, rag, rig) in &mut rags {
         if !store.0.unit_is_dead() && rag.getting_up.is_none() {
+            // Back to the pose it fell from; the clips take it on from there.
+            if let Some(mut rig) = rig {
+                let n = rig.locals.len().min(rag.rest.len());
+                rig.locals[..n].copy_from_slice(&rag.rest[..n]);
+                rig.pose_dirty = true;
+            }
             commands.entity(unit).remove::<(
                 Ragdoll,
                 crate::blob_shadow::NoBlobShadow,
