@@ -13,6 +13,7 @@ use bevy::prelude::*;
 
 mod blow;
 mod bounds;
+mod cloak;
 mod dismember;
 mod frost;
 mod gore;
@@ -31,6 +32,7 @@ impl Plugin for RagdollPlugin {
         testbox::plugin(app);
         blow::plugin(app);
         bounds::plugin(app);
+        cloak::plugin(app);
         dismember::plugin(app);
         frost::plugin(app);
         gore::plugin(app);
