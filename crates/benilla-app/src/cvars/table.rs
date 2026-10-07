@@ -732,6 +732,27 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0",
         "benilla's own — 1.12 ragdolls nothing, so it has nothing to dismember",
     ),
+    // benilla's own: the Graphics page's gore sliders and the hitstop box (`ragdoll`).
+    ours(
+        "goreAmount",
+        "1",
+        "benilla's own — 1.12's gore has no amount",
+    ),
+    ours(
+        "dismemberAmount",
+        "1",
+        "benilla's own — 1.12 ragdolls nothing, so it has nothing to dismember",
+    ),
+    ours(
+        "hitstop",
+        "1",
+        "benilla's own — 1.12 never holds an animation on a hit",
+    ),
+    ours(
+        "hitstopStrength",
+        "1",
+        "benilla's own — 1.12 never holds an animation on a hit",
+    ),
     // benilla's own: a spell's killing blow throws its ragdoll this many times harder.
     ours(
         "ragdollSpellPush",

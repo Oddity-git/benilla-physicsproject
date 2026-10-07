@@ -45,8 +45,12 @@ Everything here is **client side only**. The server, other players and their cli
   has it standing, so a creature you are fighting keeps fighting.
 - **Dismemberment.** With the option on, a killing blow that takes a fifth of the target's health
   severs a limb (the head included), and one that takes half severs two. The limb flies off.
+- **Hitstop.** When a melee hit lands, the attacker's and the target's animations hold for a
+  moment (longer on a crit or a heavy hit), so blows feel weightier. Only the animation stops.
 - **Options.** Settings → Graphics has a **Blood** choice (Red, Green or Off, the game's own
-  `violenceLevel`) and a **Dismemberment** checkbox (off by default).
+  `violenceLevel`), a **Gore Amount** slider, a **Dismemberment** checkbox (off by default) with a
+  **Dismemberment Amount** slider for how easily limbs come off, and a **Hitstop** checkbox (on by
+  default) with a **Hitstop Strength** slider.
 
 ### Planned
 
@@ -62,7 +66,7 @@ Everything here is **client side only**. The server, other players and their cli
 | MPQ patches | Mostly | benilla reads your install's patch chain as the stock client does. Blood patch mods are not needed and may draw oddly (a flat splat in the air); use the Blood option instead. |
 | Upstream benilla | Yes | The fork tracks upstream. The fork's code sits in its own module behind a `ragdoll` feature, so upstream changes merge in cleanly. It is never sent back upstream as a pull request. |
 | Other benilla forks | Not merged | Another fork (a skatecraft client, for example) can be built as its own second client next to this one. |
-| `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds three settings, `violenceLevel`, `dismemberment` and `ragdollSpellPush`, which upstream ignores. |
+| `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds its own settings (`violenceLevel`, `goreAmount`, `dismemberment`, `dismemberAmount`, `hitstop`, `hitstopStrength`, `ragdollSpellPush`), which upstream ignores. |
 | Warden (anticheat) | No | As with upstream, use a server with Warden off. |
 
 ## Running it
@@ -123,6 +127,7 @@ The fork's code is kept in a few places so it stays easy to merge with upstream:
   - `pusher.rs`: the player capsules
   - `bounds.rs`: keeps a flung ragdoll from being culled
   - `frost.rs`: the frozen body's ice tint
+  - `hitstop.rs`: the hold on a landed hit
   - `testbox.rs`: the test box
 - `crates/benilla-world/src/collision.rs` and `world_plugins.rs` add the ragdoll collision layers
   and turn on avian's solver (the `dynamics` feature).

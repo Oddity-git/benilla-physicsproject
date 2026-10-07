@@ -341,9 +341,14 @@ fn start_ragdolls(
         };
         // A heavy killing blow takes limbs off, when the option allows.
         let severed = if dismember && knock.is_none() && !frozen {
+            // The Dismemberment Amount slider makes a lighter blow count as a heavier one.
+            let ease = cvars
+                .as_deref()
+                .and_then(|c| c.num("dismemberAmount"))
+                .map_or(1.0, |v| v.clamp(0.25, 4.0));
             super::dismember::choose_limbs(
                 &profile,
-                blow_share,
+                blow_share * ease,
                 unit.to_bits() ^ now.to_bits() as u64,
             )
         } else {

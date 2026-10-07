@@ -16,6 +16,7 @@ mod bounds;
 mod dismember;
 mod frost;
 mod gore;
+mod hitstop;
 mod knock;
 mod life;
 mod lootbag;
@@ -33,6 +34,7 @@ impl Plugin for RagdollPlugin {
         dismember::plugin(app);
         frost::plugin(app);
         gore::plugin(app);
+        hitstop::plugin(app);
         knock::plugin(app);
         life::plugin(app);
         lootbag::plugin(app);

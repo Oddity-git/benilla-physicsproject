@@ -382,6 +382,7 @@ fn spray_hits(
     mut gore: ResMut<Gore>,
 ) {
     let violence = violence_level(cvars.as_deref());
+    let amount = gore_amount(cvars.as_deref());
     let Some(blood) = blood.filter(|_| violence > 0) else {
         hits.clear();
         return;
@@ -415,6 +416,7 @@ fn spray_hits(
         } else {
             ((BASE_DROPS + DROPS_PER_BAR * share) as usize).min(MAX_DROPS)
         };
+        let count = (count as f32 * amount).round() as usize;
         let speed = BASE_SPEED + SPEED_PER_BAR * share;
         let feet = tf.translation;
         let chest = feet + Vec3::Y * height_of(net, bound) * CHEST;
@@ -447,6 +449,13 @@ fn spray_hits(
             lay_splat(&mut commands, &mut gore, &decals, at, half, b, now);
         }
     }
+}
+
+/// The Gore Amount slider (`goreAmount`): how many droplets and splats, and how big the pools.
+fn gore_amount(cvars: Option<&crate::cvars::Cvars>) -> f32 {
+    cvars
+        .and_then(|c| c.num("goreAmount"))
+        .map_or(1.0, |v| v.clamp(0.0, 4.0))
 }
 
 /// Launch one droplet of `blood` from `start` at `velocity`, to splat at height `ground`.
@@ -482,6 +491,7 @@ fn bleed_cuts(
     mut gore: ResMut<Gore>,
 ) {
     let violence = violence_level(cvars.as_deref());
+    let amount = gore_amount(cvars.as_deref());
     let Some(blood) = blood.filter(|_| violence > 0) else {
         cuts.clear();
         return;
@@ -496,7 +506,7 @@ fn bleed_cuts(
         };
         let splats = blood.0.splats(id, violence);
         let ground = tf.translation.y;
-        for _ in 0..CUT_DROPS {
+        for _ in 0..(CUT_DROPS as f32 * amount).round() as usize {
             let Some(texture) = gore.pick_texture(&server, splats) else {
                 break; // bloodless
             };
@@ -510,7 +520,7 @@ fn bleed_cuts(
             let b = Blood { texture, violence };
             throw_droplet(&mut gore, b, cut.at, v, ground, now);
         }
-        let count = gore.range(CUT_SPLATS).round() as usize;
+        let count = (gore.range(CUT_SPLATS) * amount).round() as usize;
         for _ in 0..count {
             let Some(texture) = gore.pick_texture(&server, splats) else {
                 break;
@@ -703,7 +713,9 @@ fn grow_pools(
         let (lo, hi) = POOL_SIZE;
         // Every lost limb bleeds the pool bigger.
         let more = 1.0 + POOL_PER_LIMB * cut.map_or(0, |c| c.count()) as f32;
-        let size = (height_of(net, bound) * POOL_SHARE).clamp(lo, hi) * more;
+        let size = (height_of(net, bound) * POOL_SHARE).clamp(lo, hi)
+            * more
+            * gore_amount(cvars.as_deref()).sqrt();
         let yaw = gore.range((0.0, std::f32::consts::TAU));
         commands.spawn((
             Name::new("blood pool"),
