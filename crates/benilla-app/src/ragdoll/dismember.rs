@@ -38,7 +38,16 @@ const MIN_LIMB_LENGTH: f32 = 0.12;
 const TINY: f32 = 1e-4;
 
 pub(super) fn plugin(app: &mut App) {
-    app.add_systems(Update, (build_limb_copies, heal_limbs));
+    app.add_message::<Severed>()
+        .add_systems(Update, (build_limb_copies, heal_limbs));
+}
+
+/// A limb came off: where its joint was, and the way the body was thrown.
+#[derive(Message, Clone, Copy)]
+pub(super) struct Severed {
+    pub(super) unit: Entity,
+    pub(super) at: Vec3,
+    pub(super) away: Vec3,
 }
 
 /// The unit's severed limbs.
@@ -57,6 +66,11 @@ struct Limb {
 }
 
 impl Dismembered {
+    /// How many limbs the unit lost.
+    pub(super) fn count(&self) -> usize {
+        self.limbs.len()
+    }
+
     /// The limbs rooted at `roots`, each taking every bone below it.
     pub(super) fn new(parents: &[i16], roots: &[usize]) -> Self {
         let limbs = roots

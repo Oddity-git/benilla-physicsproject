@@ -73,6 +73,14 @@ const BELOW: f32 = 1.5;
 const ABOVE: f32 = 0.8;
 /// Unlit decals are dimmed this much so a night-time splat does not glow.
 const DIM: f32 = 0.7;
+/// A severed limb bursts this many droplets from its cut at once, in this speed range (yd/s), and
+/// lays this many large splats (of this half-size range) around where it came off.
+const CUT_DROPS: usize = 25;
+const CUT_SPEED: (f32, f32) = (1.5, 4.5);
+const CUT_SPLATS: (f32, f32) = (3.0, 5.0);
+const CUT_SPLAT: (f32, f32) = (0.35, 0.6);
+/// Each lost limb grows the body's pool by this share.
+const POOL_PER_LIMB: f32 = 0.5;
 /// The height a unit with no model bound counts as (yd).
 const DEFAULT_HEIGHT: f32 = 1.8;
 
@@ -83,6 +91,7 @@ pub(super) fn plugin(app: &mut App) {
             Update,
             (
                 spray_hits,
+                bleed_cuts,
                 fly_droplets,
                 start_pools,
                 grow_pools,
@@ -458,6 +467,63 @@ fn throw_droplet(
     });
 }
 
+/// A severed limb bursts blood from its cut, once, and splashes the ground around it.
+#[allow(clippy::too_many_arguments)] // one Bevy system's resources
+fn bleed_cuts(
+    mut commands: Commands,
+    mut cuts: MessageReader<super::dismember::Severed>,
+    units: Query<(&Transform, &NetEntity)>,
+    creatures: Option<Res<Creatures>>,
+    blood: Option<Res<BloodTables>>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+    server: Res<AssetServer>,
+    decals: WorldDecal,
+    time: Res<Time>,
+    mut gore: ResMut<Gore>,
+) {
+    let violence = violence_level(cvars.as_deref());
+    let Some(blood) = blood.filter(|_| violence > 0) else {
+        cuts.clear();
+        return;
+    };
+    let now = time.elapsed_secs();
+    for cut in cuts.read() {
+        let Ok((tf, net)) = units.get(cut.unit) else {
+            continue;
+        };
+        let Some(id) = unit_blood_id(creatures.as_deref(), &blood, net.display_id) else {
+            continue;
+        };
+        let splats = blood.0.splats(id, violence);
+        let ground = tf.translation.y;
+        for _ in 0..CUT_DROPS {
+            let Some(texture) = gore.pick_texture(&server, splats) else {
+                break; // bloodless
+            };
+            let jitter = Vec3::new(
+                gore.range((-1.0, 1.0)),
+                gore.range((0.0, 1.0)),
+                gore.range((-1.0, 1.0)),
+            );
+            let v = (cut.away * 0.6 + Vec3::Y * 1.2 + jitter * 0.8).normalize_or_zero()
+                * gore.range(CUT_SPEED);
+            let b = Blood { texture, violence };
+            throw_droplet(&mut gore, b, cut.at, v, ground, now);
+        }
+        let count = gore.range(CUT_SPLATS).round() as usize;
+        for _ in 0..count {
+            let Some(texture) = gore.pick_texture(&server, splats) else {
+                break;
+            };
+            let half = gore.range(CUT_SPLAT);
+            let at = cut.at.with_y(ground)
+                + Vec3::new(gore.range((-0.6, 0.6)), 0.0, gore.range((-0.6, 0.6)));
+            let b = Blood { texture, violence };
+            lay_splat(&mut commands, &mut gore, &decals, at, half, b, now);
+        }
+    }
+}
+
 /// Project one splat and keep it, retiring the oldest past [`MAX_SPLATS`].
 fn lay_splat(
     commands: &mut Commands,
@@ -585,6 +651,7 @@ type Bleeder = (
     &'static Transform,
     &'static NetEntity,
     Option<&'static ModelBound>,
+    Option<&'static super::dismember::Dismembered>,
 );
 
 /// Open the due pools under their bodies, spread them, and drop them with their unit.
@@ -606,7 +673,7 @@ fn grow_pools(
 ) {
     let now = time.elapsed_secs();
     let violence = violence_level(cvars.as_deref());
-    for (unit, pool_due, tf, net, bound) in &due {
+    for (unit, pool_due, tf, net, bound, cut) in &due {
         if now < pool_due.at {
             continue;
         }
@@ -634,7 +701,9 @@ fn grow_pools(
             parts.iter().sum::<Vec3>() / parts.len() as f32
         };
         let (lo, hi) = POOL_SIZE;
-        let size = (height_of(net, bound) * POOL_SHARE).clamp(lo, hi);
+        // Every lost limb bleeds the pool bigger.
+        let more = 1.0 + POOL_PER_LIMB * cut.map_or(0, |c| c.count()) as f32;
+        let size = (height_of(net, bound) * POOL_SHARE).clamp(lo, hi) * more;
         let yaw = gore.range((0.0, std::f32::consts::TAU));
         commands.spawn((
             Name::new("blood pool"),
