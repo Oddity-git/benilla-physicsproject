@@ -267,6 +267,7 @@ fn start_ragdolls(
             Option<&KnockDown>,
             Option<&GettingUp>,
             Has<AwaitingBlow>,
+            Option<&super::shock::ShockDebuff>,
         ),
         (
             With<SeenAlive>,
@@ -281,6 +282,7 @@ fn start_ragdolls(
     mut bodies: ResMut<RagdollBodies>,
     cvars: Option<Res<crate::cvars::Cvars>>,
     mut severs: MessageWriter<super::dismember::Severed>,
+    spells: Option<Res<crate::ui_action::Spells>>,
 ) {
     if ragdolls_off() {
         return;
@@ -291,7 +293,7 @@ fn start_ragdolls(
         .as_deref()
         .and_then(|c| c.flag("dismemberment"))
         .unwrap_or(false);
-    for (unit, store, net, rig, unit_tf, spot, blow, knock, rising, awaiting) in &dying {
+    for (unit, store, net, rig, unit_tf, spot, blow, knock, rising, awaiting, debuff) in &dying {
         // Creatures and players alike, our own character included; a ghost reads alive again and
         // `cleanup` hands it back to its animation.
         let living_kind = matches!(net.kind, EntityKind::Unit | EntityKind::Player);
@@ -355,6 +357,15 @@ fn start_ragdolls(
             .map_or(0.0, |b| (b.damage as f32 / max_health).min(1.0));
         let killing = blow.filter(|b| time.elapsed_secs() - b.at <= BLOW_WINDOW && knock.is_none());
         let frozen = killing.is_some_and(|b| b.school == Some(FROST_SCHOOL));
+        // A lightning or thunder killing blow (by the spell's name, so Thunder Clap counts), or a
+        // death under such a debuff, shakes the body in a seizure instead.
+        let shocked = !frozen
+            && knock.is_none()
+            && (killing
+                .and_then(|b| b.spell)
+                .and_then(|id| spells.as_deref()?.catalog.get(id))
+                .is_some_and(|s| super::shock::is_shock(&s.name))
+                || debuff.is_some_and(|d| now - d.0 <= super::shock::DEBUFF_MEMORY));
         // A spell's killing blow throws harder, as the setting asks.
         let spell_push = if killing.is_some_and(|b| b.school.is_some()) {
             cvars
@@ -591,6 +602,11 @@ fn start_ragdolls(
         if frozen {
             commands.entity(unit).insert(super::frost::Frozen);
         }
+        if shocked {
+            commands
+                .entity(unit)
+                .insert(super::shock::Shocked::new(now));
+        }
         // Knocked down again mid-rise, it still returns to the pose it first fell from.
         let rest = rising.map_or_else(|| rig.locals.clone(), |r| r.rest.clone());
         commands.entity(unit).insert(Ragdoll {
@@ -754,6 +770,7 @@ fn cleanup(
                 crate::blob_shadow::NoBlobShadow,
                 crate::creature_anim::LootSparkleOn,
                 super::frost::Frozen,
+                super::shock::Shocked,
             )>();
             super::dismember::heal(&mut commands, unit);
             if let Some(ids) = bodies.0.remove(&unit) {

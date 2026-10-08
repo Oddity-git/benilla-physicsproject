@@ -1,5 +1,5 @@
 //! Fork: soft body sway on female units, behind the Physics page's Body Physics slider
-//! (`bodyPhysics`, 0 off).
+//! (`bodyPhysics`, 0 off), sized by the Chest Size slider (`bodySize`).
 //!
 //! The chest has no bone of its own, so each near female unit's skinned parts that carry it are
 //! drawn as copies on a second palette slot with two bones more than the unit's: every row the
@@ -60,6 +60,9 @@ const STEP: f32 = 1.0 / 120.0;
 const MAX_STEPS: u32 = 8;
 const MAX_OFFSET: f32 = 0.35;
 const MAX_AMOUNT: f32 = 3.0;
+/// The Chest Size slider's range (`bodySize`), a scale about each side's centre.
+const MIN_SIZE: f32 = 0.5;
+const MAX_SIZE: f32 = 2.5;
 /// A jump of the anchor past this (yd) in one frame is a teleport: the spring starts over.
 const TELEPORT: f32 = 2.0;
 
@@ -80,9 +83,11 @@ pub(super) fn plugin(app: &mut App) {
 #[derive(Resource, Default)]
 struct Sways {
     live: EntityHashMap<Sway>,
-    /// Rigs whose chest could not be found; never retried.
-    failed: HashSet<Entity>,
-    /// Which materials are capes, by id: the cloth cloaks draw those.
+    /// Rigs whose chest could not be found, with the parts it was looked for on; retried once
+    /// those change (a re-dress).
+    failed: EntityHashMap<Vec<(Entity, AssetId<Mesh>)>>,
+    /// Which materials are capes or hair, by id: the cloth cloaks draw the capes, and hair hanging
+    /// over the chest would otherwise be taken for it.
     capes: HashMap<AssetId<WowModelMaterial>, bool>,
     /// Identity bindposes, by bone count.
     ibps: HashMap<u32, Handle<SkinnedMeshInverseBindposes>>,
@@ -91,7 +96,8 @@ struct Sways {
 /// One swaying unit: its candidate parts (to notice a re-dress), the copies, and the springs.
 struct Sway {
     holder: Entity,
-    parts: Vec<Entity>,
+    /// The candidate parts and their meshes: a re-dress swaps either, and the copies are rebuilt.
+    parts: Vec<(Entity, AssetId<Mesh>)>,
     copies: Vec<(Entity, Entity, Handle<Mesh>)>,
     bones: usize,
     sides: [Side; 2],
@@ -110,6 +116,9 @@ struct Side {
 /// On a sway copy, so the stock and copy queries stay apart.
 #[derive(Component)]
 struct SwayCopy;
+
+/// A rig's candidate parts with their meshes, by part.
+type PartMeshes = Vec<(Entity, AssetId<Mesh>)>;
 
 /// What [`manage_sways`] reads of a candidate part.
 type BodyPart = (
@@ -144,6 +153,7 @@ fn manage_sways(
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     materials: Res<Assets<WowModelMaterial>>,
     mut material_events: MessageReader<AssetEvent<WowModelMaterial>>,
+    mut mesh_events: MessageReader<AssetEvent<Mesh>>,
     server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut ibps: ResMut<Assets<SkinnedMeshInverseBindposes>>,
@@ -157,6 +167,15 @@ fn manage_sways(
             sways.capes.remove(id);
         }
     }
+    sways.failed.retain(|rig, _| rigs.contains(*rig));
+    // A stock mesh rewritten in place (a re-dress) rebuilds the sways drawing it.
+    let rewritten: HashSet<AssetId<Mesh>> = mesh_events
+        .read()
+        .filter_map(|ev| match ev {
+            AssetEvent::Modified { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
     let on = cvars
         .as_deref()
         .and_then(|c| c.num("bodyPhysics"))
@@ -164,18 +183,18 @@ fn manage_sways(
         > 0.0;
     let eye = camera.single().ok().map(|g| g.translation());
     // Each near female rig's body parts (not its cloak), when on.
-    let mut by_rig: EntityHashMap<(f32, Vec<Entity>)> = EntityHashMap::default();
+    let mut by_rig: EntityHashMap<(f32, PartMeshes)> = EntityHashMap::default();
     if let (true, Some(eye)) = (on, eye) {
-        for (part, rig_part, material, _, _, tag, _) in &parts {
+        for (part, rig_part, material, mesh, parked, tag, _) in &parts {
             let Ok((skin, _, at, store, _)) = rigs.get(rig_part.0) else {
                 continue;
             };
-            if rig_of(tag.0) != skin.slot
-                || sways.failed.contains(&rig_part.0)
-                || store.0.unit_gender() != Some(FEMALE)
-            {
+            if rig_of(tag.0) != skin.slot || store.0.unit_gender() != Some(FEMALE) {
                 continue;
             }
+            let Some(mesh_id) = mesh.map(|m| m.0.id()).or(parked.map(|p| p.0.id())) else {
+                continue;
+            };
             let cape = match sways.capes.get(&material.id()) {
                 Some(&cape) => cape,
                 None => {
@@ -188,9 +207,8 @@ fn manage_sways(
                         .as_ref()
                         .and_then(|t| server.get_path(t.id()))
                         .is_some_and(|p| {
-                            p.to_string()
-                                .to_ascii_lowercase()
-                                .contains("objectcomponents/cape")
+                            let p = p.to_string().to_ascii_lowercase();
+                            p.contains("objectcomponents/cape") || p.contains("hair")
                         });
                     sways.capes.insert(material.id(), cape);
                     cape
@@ -202,16 +220,17 @@ fn manage_sways(
                     .entry(rig_part.0)
                     .or_insert((d, Vec::new()))
                     .1
-                    .push(part);
+                    .push((part, mesh_id));
             }
         }
     }
-    let mut wanted: Vec<(f32, Entity, Vec<Entity>)> = by_rig
+    let mut wanted: Vec<(f32, Entity, PartMeshes)> = by_rig
         .into_iter()
         .map(|(rig, (d, mut parts))| {
-            parts.sort();
+            parts.sort_by_key(|p| p.0);
             (d, rig, parts)
         })
+        .filter(|(_, rig, parts)| sways.failed.get(rig) != Some(parts))
         .collect();
     wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
     wanted.truncate(MAX_UNITS);
@@ -224,6 +243,7 @@ fn manage_sways(
             !wanted
                 .iter()
                 .any(|(_, r, parts)| r == *rig && *parts == s.parts)
+                || s.parts.iter().any(|(_, m)| rewritten.contains(m))
         })
         .map(|(rig, _)| *rig)
         .collect();
@@ -251,7 +271,7 @@ fn manage_sways(
         };
         // Every part's mesh, put down or not, must be in.
         let mut stocks: Vec<(Entity, Handle<Mesh>)> = Vec::new();
-        for &part in &part_ids {
+        for &(part, _) in &part_ids {
             let Ok((_, _, _, mesh, parked, _, _)) = parts.get(part) else {
                 continue;
             };
@@ -281,8 +301,8 @@ fn manage_sways(
         let chest = match chest {
             Ok(chest) => chest,
             Err(why) => {
-                info!("body physics: {name} left as is: {why}");
-                sways.failed.insert(rig);
+                warn!("body physics: {name} left as is: {why}");
+                sways.failed.insert(rig, part_ids.clone());
                 continue;
             }
         };
@@ -301,8 +321,8 @@ fn manage_sways(
             }
         }
         if built.is_empty() {
-            info!("body physics: {name} left as is: no vertices near the chest");
-            sways.failed.insert(rig);
+            warn!("body physics: {name} left as is: no vertices near the chest");
+            sways.failed.insert(rig, part_ids.clone());
             continue;
         }
         let carrier = |side: &HashMap<u16, f32>| {
@@ -564,6 +584,11 @@ fn pose_sways(
         .and_then(|c| c.num("bodyPhysics"))
         .unwrap_or(1.0)
         .clamp(0.0, MAX_AMOUNT);
+    let size = cvars
+        .as_deref()
+        .and_then(|c| c.num("bodySize"))
+        .unwrap_or(1.0)
+        .clamp(MIN_SIZE, MAX_SIZE);
     let dt = time.delta_secs();
     let stiffness = (std::f32::consts::TAU * FREQUENCY).powi(2);
     let damping = 2.0 * DAMPING * stiffness.sqrt();
@@ -619,7 +644,11 @@ fn pose_sways(
             let forward = carrier.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
             let into = side.offset.dot(forward).min(0.0);
             let shown = side.offset - forward * into;
-            let bone = Affine3A::from_translation(shown) * Affine3A::from_mat4(carrier);
+            // Sized about the centre at bind, then carried and swayed.
+            let sized = Affine3A::from_translation(side.centre)
+                * Affine3A::from_scale(Vec3::splat(size))
+                * Affine3A::from_translation(-side.centre);
+            let bone = Affine3A::from_translation(shown) * Affine3A::from_mat4(carrier) * sized;
             worlds.push(GlobalTransform::from(bone));
         }
         let ibp = vec![Mat4::IDENTITY; worlds.len()];

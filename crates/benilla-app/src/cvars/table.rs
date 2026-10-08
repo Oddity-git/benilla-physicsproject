@@ -789,6 +789,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — 1.12 has no soft body motion",
     ),
+    // benilla's own: the Physics page's Chest Size slider, a scale.
+    ours(
+        "bodySize",
+        "1",
+        "benilla's own — 1.12 has no soft body motion",
+    ),
     // benilla's own: the Physics page's Loose Cloak When Armed box.
     ours(
         "cloakLooseDrawn",

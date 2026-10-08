@@ -63,6 +63,9 @@
             "How long (seconds) a body killed by a melee swing waits before it falls, so the "
             .. "swing lands first. Spells are not delayed."
 
+        BENILLA_TOOLTIP_BODY_SIZE =
+            "The size of the chest that Body Physics moves, on female characters."
+
         -- Joins the options window's page loops; run from the page's OnLoad, after its rows.
         function BenillaPhysicsOptions_Register()
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
@@ -70,7 +73,7 @@
                 "RowBlood", "RowGoreAmount", "RowDismemberment", "RowDismemberAmount",
                 "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay",
                 "RowCloakPhysics", "RowCloakMotion",
-                "RowCloakLooseDrawn", "RowBodyPhysics",
+                "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize",
             }
         end
     ]]></Script>
@@ -246,6 +249,17 @@
                     BenillaOptionsRow_OnLoad(this, "bodyPhysics", "Body Physics",
                         "BENILLA_TOOLTIP_BODY_PHYSICS")
                     BenillaOptionsSliderRow_Setup(this, 0, 3, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowBodySize" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowBodyPhysics" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowBodyPhysics" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "bodySize", "Chest Size",
+                        "BENILLA_TOOLTIP_BODY_SIZE")
+                    BenillaOptionsSliderRow_Setup(this, 0.5, 2.5, 0.1)
                 </OnLoad></Scripts>
             </Frame>
         </Frames>

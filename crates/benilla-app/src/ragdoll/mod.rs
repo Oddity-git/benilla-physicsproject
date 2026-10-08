@@ -7,7 +7,8 @@
 //! (`lootbag`), and the killing blow (`blow`) scales its push. Hits spray blood and ragdolls
 //! bleed onto the ground (`gore`), as the Blood option allows. A heavy killing blow can sever a
 //! limb (`dismember`), as the Dismemberment option allows. A knockdown, the game's own or our kick,
-//! ragdolls a living unit and stands it back up (`knock`). The dev chord + `B` drops a test box (`testbox`).
+//! ragdolls a living unit and stands it back up (`knock`). A lightning kill shakes the body in a
+//! seizure (`shock`), and bleed ticks squirt blood (`gore`). The dev chord + `B` drops a test box (`testbox`).
 
 use bevy::prelude::*;
 
@@ -23,6 +24,7 @@ mod life;
 mod lootbag;
 mod pusher;
 mod rig;
+mod shock;
 mod sway;
 mod testbox;
 
@@ -42,6 +44,7 @@ impl Plugin for RagdollPlugin {
         life::plugin(app);
         lootbag::plugin(app);
         pusher::plugin(app);
+        shock::plugin(app);
         sway::plugin(app);
         crate::blob_shadow::ragdoll_shadows(app);
     }

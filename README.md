@@ -35,7 +35,9 @@ Everything here is **client side only**. The server, other players and their cli
 
 - A spell's killing blow throws the body harder (the **Spell Push** slider,
   twice as hard by default). A frost spell's kill freezes it instead: the body stays stiff in the pose it died
-  in, topples over like a statue, and turns icy blue.
+  in, topples over like a statue, and turns icy blue. A lightning or thunder kill (any spell with
+  lightning, thunder, shock, storm or static in its name, Thunder Clap included), or a death under
+  such a debuff, shakes the body in a seizure for a few seconds while it flickers blue.
 - **Pushable corpses.** Living players carry an invisible capsule that shoves ragdolls aside as
   you walk through them.
 - **Loot bags.** Because a ragdoll no longer lies where the server thinks the corpse is, a lootable
@@ -43,7 +45,8 @@ Everything here is **client side only**. The server, other players and their cli
   the loot sparkle sits on the sack instead of the body.
 - **Blood.** Hits spray droplets away from the attacker, which leave splats where they land. More
   damage means more spray, and killing blows spray the most. Ragdolls bleed a pool that spreads
-  under them. The stock melee blood spurt, and the yellow hit flash in it, play at half size. The colours and art come from
+  under them, where the body ends up. A bleed (Rend, Rupture, Rip, Garrote, Deep Wounds) squirts
+  from a wound in pulses for as long as it ticks. The stock melee blood spurt, and the yellow hit flash in it, play at half size. The colours and art come from
   the game's own blood tables, so each creature bleeds its own kind of blood, and bloodless ones
   (elementals, for example) leave nothing.
 - **Knockdowns.** When the game knocks a unit down (Warrior Charge's stun, Lash and others that
@@ -152,6 +155,7 @@ The fork's code is kept in a few places so it stays easy to merge with upstream:
   - `bounds.rs`: keeps a flung ragdoll from being culled
   - `frost.rs`: the frozen body's ice tint
   - `hitstop.rs`: the hold on a landed hit
+  - `shock.rs`: the lightning seizure
   - `cloak.rs`: the cloth cloaks
   - `testbox.rs`: the test crate
 - `crates/benilla-app/assets/ui/PhysicsOptions.xml`: the Physics options page, which adds itself

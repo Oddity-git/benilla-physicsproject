@@ -3,7 +3,8 @@
 //!
 //! - A damaging hit throws a burst of droplets away from the attacker, more the bigger the hit's
 //!   share of the victim's health and the most on a killing blow; each leaves a splat where it lands.
-//! - A ragdoll bleeds a pool that spreads under its body.
+//! - A ragdoll bleeds a pool that spreads under its body, where the body ends up.
+//! - A bleed's ticks keep its victim squirting blood from one wound, in heartbeat pulses.
 //!
 //! The splat art is `UnitBlood`'s ground-splat column, which 1.12.1 ships but never draws
 //! (`benilla_formats::blood`): through the same censored row as the spurt, so green blood at
@@ -71,6 +72,8 @@ const POOL_SPREAD: f32 = 10.0;
 const POOL_SHARE: f32 = 0.4;
 const POOL_SIZE: (f32, f32) = (0.45, 2.2);
 const POOL_REPROJECT: f32 = 0.1;
+/// The pool moves to the body once the body's middle has drifted this far from it (yd).
+const POOL_FOLLOW: f32 = 0.15;
 /// A pool outlasts the corpse by nothing: it goes with the unit, else after this long.
 const POOL_LIFE: f32 = 180.0;
 /// The decal box's reach below and above the ground estimate (yd).
@@ -97,6 +100,7 @@ pub(super) fn plugin(app: &mut App) {
             (
                 spray_hits,
                 bleed_cuts,
+                squirt_bleeds,
                 fly_droplets,
                 start_pools,
                 grow_pools,
@@ -105,6 +109,52 @@ pub(super) fn plugin(app: &mut App) {
                 .chain(),
         )
         .add_systems(PostUpdate, push_decals.after(begin_effect_frame));
+}
+
+/// A bleed lasts this long past its tick (s), a little over the 3 s between ticks, so a running
+/// bleed squirts without a gap.
+const BLEED_HOLD: f32 = 3.5;
+/// A squirt pulses with this period (s), spurting for this share of it, one droplet (times Gore
+/// Amount) every [`SQUIRT_EVERY`] while it spurts, at this speed range (yd/s).
+const PULSE: f32 = 0.7;
+const SPURT: f32 = 0.35;
+const SQUIRT_EVERY: f32 = 0.035;
+const SQUIRT_SPEED: (f32, f32) = (1.6, 3.2);
+/// Where on the body the wound opens: this share of the height up, this far round from the middle
+/// as a share of the height.
+const WOUND_HEIGHT: (f32, f32) = (0.35, 0.75);
+const WOUND_OUT: f32 = 0.15;
+
+/// A unit a bleed is ticking on: when its squirt stops, and the wound it squirts from (the share
+/// of the height up, and the direction out, in the unit's own frame).
+#[derive(Component)]
+pub(super) struct Bleeding {
+    until: f32,
+    start: f32,
+    next: f32,
+    up: f32,
+    out: Vec3,
+}
+
+/// A bleed ticked on `victim`: it squirts until the next tick is due, from the wound it has, or a
+/// new one.
+pub(super) fn bleed(commands: &mut Commands, victim: Entity, now: f32) {
+    if let Ok(mut e) = commands.get_entity(victim) {
+        // A wound picked off the clock, which differs enough between bleeds.
+        let seed = now.to_bits().wrapping_mul(0x9e37_79b9) ^ victim.to_bits() as u32;
+        let turn = (seed & 0xffff) as f32 / 65535.0 * std::f32::consts::TAU;
+        let up =
+            WOUND_HEIGHT.0 + (WOUND_HEIGHT.1 - WOUND_HEIGHT.0) * ((seed >> 16) as f32 / 65535.0);
+        e.entry::<Bleeding>()
+            .and_modify(move |mut b| b.until = now + BLEED_HOLD)
+            .or_insert(Bleeding {
+                until: now + BLEED_HOLD,
+                start: now,
+                next: now,
+                up,
+                out: Vec3::new(turn.cos(), 0.0, turn.sin()),
+            });
+    }
 }
 
 /// The gore's shared state.
@@ -492,6 +542,74 @@ fn throw_droplet(
     });
 }
 
+/// What [`squirt_bleeds`] reads of a bleeding unit.
+type BleedingUnit = (
+    Entity,
+    &'static Transform,
+    &'static NetEntity,
+    &'static ObjectStore,
+    Option<&'static ModelBound>,
+    &'static mut Bleeding,
+);
+
+/// Each bleeding unit squirts from its wound in pulses, until its bleed stops or it dies (its pool
+/// takes over).
+#[allow(clippy::too_many_arguments)] // one Bevy system's resources
+fn squirt_bleeds(
+    mut commands: Commands,
+    mut units: Query<BleedingUnit>,
+    creatures: Option<Res<Creatures>>,
+    blood: Option<Res<BloodTables>>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+    server: Res<AssetServer>,
+    time: Res<Time>,
+    mut gore: ResMut<Gore>,
+) {
+    let now = time.elapsed_secs();
+    let violence = violence_level(cvars.as_deref());
+    let amount = gore_amount(cvars.as_deref());
+    for (unit, tf, net, store, bound, mut bleeding) in &mut units {
+        if now > bleeding.until || store.0.unit_is_dead() {
+            commands.entity(unit).remove::<Bleeding>();
+            continue;
+        }
+        let Some(blood) = blood.as_deref().filter(|_| violence > 0) else {
+            continue;
+        };
+        if ((now - bleeding.start) % PULSE) / PULSE > SPURT || now < bleeding.next {
+            continue;
+        }
+        bleeding.next = now + SQUIRT_EVERY;
+        let Some(id) = unit_blood_id(creatures.as_deref(), blood, net.display_id) else {
+            continue;
+        };
+        let splats = blood.0.splats(id, violence);
+        let height = height_of(net, bound);
+        let out = tf.rotation * bleeding.out;
+        let wound = tf.translation + Vec3::Y * (height * bleeding.up) + out * (height * WOUND_OUT);
+        for _ in 0..(amount.round() as usize).max(1) {
+            let Some(texture) = gore.pick_texture(&server, splats) else {
+                break; // bloodless
+            };
+            let jitter = Vec3::new(
+                gore.range((-0.15, 0.15)),
+                gore.range((-0.1, 0.2)),
+                gore.range((-0.15, 0.15)),
+            );
+            let fast = if gore.range((0.0, 1.0)) < FAST_SHARE {
+                1.0 + FAST_PER_AMOUNT * amount
+            } else {
+                1.0
+            };
+            let v = (out * 0.8 + Vec3::Y * 0.5 + jitter).normalize_or_zero()
+                * gore.range(SQUIRT_SPEED)
+                * fast;
+            let b = Blood { texture, violence };
+            throw_droplet(&mut gore, b, wound, v, tf.translation.y, now);
+        }
+    }
+}
+
 /// A severed limb bursts blood from its cut, once, and splashes the ground around it.
 #[allow(clippy::too_many_arguments)] // one Bevy system's resources
 fn bleed_cuts(
@@ -731,7 +849,8 @@ fn grow_pools(
         let middle = if parts.is_empty() {
             tf.translation
         } else {
-            parts.iter().sum::<Vec3>() / parts.len() as f32
+            let low = parts.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+            (parts.iter().sum::<Vec3>() / parts.len() as f32).with_y(low)
         };
         let (lo, hi) = POOL_SIZE;
         // Every lost limb bleeds the pool bigger.
@@ -744,7 +863,7 @@ fn grow_pools(
             Name::new("blood pool"),
             Pool {
                 unit,
-                centre: middle.with_y(tf.translation.y),
+                centre: middle,
                 yaw,
                 size,
                 born: now,
@@ -758,6 +877,24 @@ fn grow_pools(
         if !rags.contains(pool.unit) || now - pool.born > POOL_LIFE {
             commands.entity(e).despawn();
             continue;
+        }
+        // The pool follows the body until it settles (a frozen body has no bodies left, so it
+        // keeps the last spot), so it lies where the corpse ends up, not where the server has it.
+        let parts: Vec<Vec3> = bodies
+            .0
+            .get(&pool.unit)
+            .into_iter()
+            .flatten()
+            .filter_map(|b| body_tf.get(*b).ok().map(|t| t.translation))
+            .collect();
+        if !parts.is_empty() {
+            let middle = parts.iter().sum::<Vec3>() / parts.len() as f32;
+            let low = parts.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+            let centre = middle.with_y(low);
+            if centre.distance(pool.centre) > POOL_FOLLOW {
+                pool.centre = centre;
+                pool.projected_at = f32::MIN;
+            }
         }
         let grown = ((now - pool.born) / POOL_SPREAD).min(1.0);
         if grown >= 1.0 && !pool.verts.is_empty() && pool.projected_at > pool.born + POOL_SPREAD {
