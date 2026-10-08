@@ -59,6 +59,9 @@ const TELEPORT: f32 = 5.0;
 /// bones further than this share of the cloak's length from it get none.
 const CAPSULE_FIT: f32 = 0.85;
 const CAPSULE_REACH: f32 = 0.5;
+/// The Cloak Motion slider's range (`cloakMotion`): 0 holds the cloak to the animation, 1 is the
+/// tuned swing, more trails and swings further.
+const MAX_MOTION: f32 = 3.0;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<Cloths>()
@@ -589,9 +592,18 @@ fn simulate_cloths(
     ibps: Res<Assets<SkinnedMeshInverseBindposes>>,
     mut palettes: ResMut<RigPalettes>,
     time: Res<Time>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs().min(STEP * MAX_STEPS as f32);
+    let motion = cvars
+        .as_deref()
+        .and_then(|c| c.num("cloakMotion"))
+        .unwrap_or(1.0)
+        .clamp(0.0, MAX_MOTION);
+    // More motion: more of the body's movement trails, and a weaker pull back to the animation.
+    let inertia = (INERTIA * motion).min(0.9);
+    let follow_scale = 1.0 / motion.max(0.05);
     let Some(ibp) = cloths
         .ibp
         .as_ref()
@@ -640,7 +652,7 @@ fn simulate_cloths(
         } else {
             // The cloth takes most of the body's own motion at once, so only the rest trails.
             for i in 0..cloth.pos.len() {
-                let carry = (target[i] - cloth.last_target[i]) * (1.0 - INERTIA);
+                let carry = (target[i] - cloth.last_target[i]) * (1.0 - inertia);
                 cloth.pos[i] += carry;
                 cloth.prev[i] += carry;
             }
@@ -682,7 +694,7 @@ fn simulate_cloths(
                         continue;
                     }
                     let mut p = cloth.pos[i];
-                    p += (target[i] - p) * (cloth.follow[i] * h / STEP).min(1.0);
+                    p += (target[i] - p) * (cloth.follow[i] * follow_scale * h / STEP).min(1.0);
                     for &(b, c, r) in &cloth.capsules {
                         let (Some(&a), Some(&e)) = (joint_at.get(b), joint_at.get(c)) else {
                             continue;

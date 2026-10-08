@@ -71,7 +71,7 @@ Everything here is **client side only**. The server, other players and their cli
   **Dismemberment** checkbox (off by default) with a **Dismemberment Amount** slider for how easily
   limbs come off, a **Hitstop** checkbox (on by default) with a **Hitstop Strength** slider, a
   **Death Push** slider for how hard a dying body is thrown, a **Death Lift** slider for how much
-  it pops up, the **Spell Push** slider, and a **Cloak Physics** checkbox (on by default). The
+  it pops up, the **Spell Push** slider, a **Cloak Physics** checkbox (on by default), and a **Cloak Motion** slider for how much cloaks swing. The
   push and lift sliders go up to 10x.
 
 ## Compatibility
@@ -83,7 +83,7 @@ Everything here is **client side only**. The server, other players and their cli
 | 1.12 addons | Yes | Same addon support as benilla. |
 | MPQ patches | Mostly | benilla reads your install's patch chain as the stock client does. Blood patch mods are not needed and may draw oddly (a flat splat in the air); use the Blood option instead. |
 | Upstream benilla | Yes | The fork tracks upstream. The fork's code sits in its own module behind a `ragdoll` feature, so upstream changes merge in cleanly. It is never sent back upstream as a pull request. |
-| `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds its own settings (`violenceLevel`, `goreAmount`, `dismemberment`, `dismemberAmount`, `hitstop`, `hitstopStrength`, `ragdollPush`, `ragdollLift`, `ragdollSpellPush`, `cloakPhysics`), which upstream ignores. |
+| `benilla-config/` | Yes | Shares upstream's settings folder. This fork adds its own settings (`violenceLevel`, `goreAmount`, `dismemberment`, `dismemberAmount`, `hitstop`, `hitstopStrength`, `ragdollPush`, `ragdollLift`, `ragdollSpellPush`, `cloakPhysics`, `cloakMotion`), which upstream ignores. |
 | Warden (anticheat) | No | As with upstream, use a server with Warden off. |
 
 ## Running it

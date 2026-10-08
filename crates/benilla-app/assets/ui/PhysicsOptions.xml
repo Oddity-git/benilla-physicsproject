@@ -49,13 +49,16 @@
             "Lets cloaks hang and swing as cloth, trailing behind as you move. Applies to the "
             .. "ten nearest cloaks."
 
+        BENILLA_TOOLTIP_CLOAK_MOTION =
+            "How much the cloth cloaks swing and trail behind. Lowest holds them to the body."
+
         -- Joins the options window's page loops; run from the page's OnLoad, after its rows.
         function BenillaPhysicsOptions_Register()
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
             BENILLA_OPTIONS_PAGE_ROWS.Physics = {
                 "RowBlood", "RowGoreAmount", "RowDismemberment", "RowDismemberAmount",
                 "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush",
-                "RowCloakPhysics",
+                "RowCloakPhysics", "RowCloakMotion",
             }
         end
     ]]></Script>
@@ -188,6 +191,17 @@
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "cloakPhysics", "Cloak Physics",
                         "BENILLA_TOOLTIP_CLOAK_PHYSICS")
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowCloakMotion" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowCloakPhysics" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowCloakPhysics" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "cloakMotion", "Cloak Motion",
+                        "BENILLA_TOOLTIP_CLOAK_MOTION")
+                    BenillaOptionsSliderRow_Setup(this, 0, 3, 0.25)
                 </OnLoad></Scripts>
             </Frame>
         </Frames>
