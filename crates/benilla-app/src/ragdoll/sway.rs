@@ -51,8 +51,11 @@ const CENTRE_DEPTH: f32 = 0.4;
 const REACH: f32 = 1.4;
 /// The spring: its frequency (Hz) and damping ratio, its step (s), and the furthest it strays as
 /// a share of the radius at Body Physics 1.
-const FREQUENCY: f32 = 6.0;
-const DAMPING: f32 = 0.25;
+const FREQUENCY: f32 = 5.0;
+const DAMPING: f32 = 0.15;
+/// The share of the body's sideways and forward motion the spring lags behind: a little, so the
+/// sway is mostly an up-and-down bounce.
+const HORIZONTAL: f32 = 0.2;
 const STEP: f32 = 1.0 / 120.0;
 const MAX_STEPS: u32 = 8;
 const MAX_OFFSET: f32 = 0.35;
@@ -592,6 +595,7 @@ fn pose_sways(
             match moved {
                 Some(moved) if moved.length() < TELEPORT && dt > 0.0 => {
                     // The soft part stays where it was while the body moves under it.
+                    let moved = Vec3::new(moved.x * HORIZONTAL, moved.y, moved.z * HORIZONTAL);
                     side.offset -= moved * amount;
                     let steps = ((dt / STEP).ceil() as u32).clamp(1, MAX_STEPS);
                     let h = dt / steps as f32;
@@ -610,7 +614,12 @@ fn pose_sways(
                     side.velocity = Vec3::ZERO;
                 }
             }
-            let bone = Affine3A::from_translation(side.offset) * Affine3A::from_mat4(carrier);
+            // Never into the body: the part of the lag pressing back against the chest is dropped,
+            // so moving forward does not flatten it.
+            let forward = carrier.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
+            let into = side.offset.dot(forward).min(0.0);
+            let shown = side.offset - forward * into;
+            let bone = Affine3A::from_translation(shown) * Affine3A::from_mat4(carrier);
             worlds.push(GlobalTransform::from(bone));
         }
         let ibp = vec![Mat4::IDENTITY; worlds.len()];
