@@ -98,7 +98,9 @@ fn start_stops(
     for swing in swings.read() {
         if landed(swing) && swing.victim.is_some() {
             // A newer swing replaces an older one still waiting, as the client's one slot does.
-            waiting.pending.insert(swing.attacker, (now + FALLBACK, *swing));
+            waiting
+                .pending
+                .insert(swing.attacker, (now + FALLBACK, *swing));
         }
     }
     for ev in impacts.read() {

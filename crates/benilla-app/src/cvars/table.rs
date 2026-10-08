@@ -771,6 +771,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — 1.12 ragdolls nothing, so it lifts nothing",
     ),
+    // benilla's own: the Physics page's Cloak Physics box, cloth cloaks.
+    ours(
+        "cloakPhysics",
+        "1",
+        "benilla's own — 1.12 draws a cloak stiff on the body's bones",
+    ),
     // `lastCharacterIndex` (`0x402d93`, "0" `0x82e570`, category 4, handle `[0x882674]`), help
     // "Last character selected": a 0-based row (the selection cell `[0x83856c]` under `"%d"`), so
     // "0" is the first character. It mirrors [`crate::char_select::Roster::pending_index`].

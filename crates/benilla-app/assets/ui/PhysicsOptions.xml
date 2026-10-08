@@ -45,12 +45,17 @@
             "How much harder a spell's killing blow throws the body than a melee one, on top "
             .. "of Death Push."
 
+        BENILLA_TOOLTIP_CLOAK_PHYSICS =
+            "Lets cloaks hang and swing as cloth, trailing behind as you move. Applies to the "
+            .. "ten nearest cloaks."
+
         -- Joins the options window's page loops; run from the page's OnLoad, after its rows.
         function BenillaPhysicsOptions_Register()
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
             BENILLA_OPTIONS_PAGE_ROWS.Physics = {
                 "RowBlood", "RowGoreAmount", "RowDismemberment", "RowDismemberAmount",
                 "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush",
+                "RowCloakPhysics",
             }
         end
     ]]></Script>
@@ -173,6 +178,16 @@
                     BenillaOptionsRow_OnLoad(this, "ragdollSpellPush", "Spell Push",
                         "BENILLA_TOOLTIP_SPELL_PUSH")
                     BenillaOptionsSliderRow_Setup(this, 0.5, 10, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowCloakPhysics" inherits="BenillaOptionsCheckboxRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowSpellPush" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowSpellPush" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "cloakPhysics", "Cloak Physics",
+                        "BENILLA_TOOLTIP_CLOAK_PHYSICS")
                 </OnLoad></Scripts>
             </Frame>
         </Frames>
