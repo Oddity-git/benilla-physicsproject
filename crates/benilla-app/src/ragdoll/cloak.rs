@@ -62,6 +62,11 @@ const CAPSULE_REACH: f32 = 0.5;
 /// The Cloak Motion slider's range (`cloakMotion`): 0 holds the cloak to the animation, 1 is the
 /// tuned swing, more trails and swings further.
 const MAX_MOTION: f32 = 3.0;
+/// With a weapon drawn (`cloakLooseDrawn`), the cloak below the pinned rows hangs from the
+/// shoulders alone, not from the hips and legs, eased in over this share of its height and over
+/// this long (s), so a drawn weapon swings clear of it.
+const LOOSE_RAMP: f32 = 0.3;
+const LOOSE_EASE: f32 = 0.4;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<Cloths>()
@@ -117,6 +122,11 @@ struct Cloth {
     last_target: Vec<Vec3>,
     follow: Vec<f32>,
     pinned: Vec<bool>,
+    /// How far each particle hangs from the shoulders alone with a weapon drawn (0..1), the bone
+    /// it then hangs from (the one the pinned rows ride most), and how drawn the weapon is now.
+    loose: Vec<f32>,
+    carrier: usize,
+    drawn: f32,
     /// The triangles' edges, and the bends: the far corners of each two triangles sharing one.
     edges: Vec<(u32, u32)>,
     bends: Vec<(u32, u32)>,
@@ -467,6 +477,20 @@ fn build_cloth(stocks: &[&Mesh]) -> Result<(Cloth, Vec<Mesh>), &'static str> {
             FOLLOW_TOP + (FOLLOW_HEM - FOLLOW_TOP) * t
         })
         .collect();
+    let loose: Vec<f32> = depth
+        .iter()
+        .map(|&d| ((d - PINNED) / LOOSE_RAMP).clamp(0.0, 1.0))
+        .collect();
+    let mut carried: HashMap<u16, f32> = HashMap::new();
+    for i in (0..bind.len()).filter(|&i| pinned[i]) {
+        for k in 0..4 {
+            *carried.entry(skin_joints[i][k]).or_default() += skin_weights[i][k];
+        }
+    }
+    let carrier = carried
+        .into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or(0, |(bone, _)| bone as usize);
     let count = bind.len();
     Ok((
         Cloth {
@@ -481,6 +505,9 @@ fn build_cloth(stocks: &[&Mesh]) -> Result<(Cloth, Vec<Mesh>), &'static str> {
             last_target: vec![Vec3::ZERO; count],
             follow,
             pinned,
+            loose,
+            carrier,
+            drawn: 0.0,
             edges: edges.into_iter().collect(),
             bends: bends.into_iter().collect(),
             capsules: Vec::new(),
@@ -492,7 +519,8 @@ fn build_cloth(stocks: &[&Mesh]) -> Result<(Cloth, Vec<Mesh>), &'static str> {
     ))
 }
 
-/// Where the animation skins each particle this frame, in the world.
+/// Where the animation skins each particle this frame, in the world; with a weapon drawn, the
+/// cloak below the shoulders as its carrier bone alone would carry it.
 fn targets(cloth: &Cloth, palette: &[Mat4]) -> Vec<Vec3> {
     (0..cloth.bind.len())
         .map(|i| {
@@ -507,10 +535,15 @@ fn targets(cloth: &Cloth, palette: &[Mat4]) -> Vec<Vec3> {
                     }
                 }
             }
-            if total > 0.0 {
+            let skinned = if total > 0.0 {
                 p / total
             } else {
                 cloth.bind[i]
+            };
+            let loose = cloth.drawn * cloth.loose[i];
+            match palette.get(cloth.carrier) {
+                Some(m) if loose > 0.0 => skinned.lerp(m.transform_point3(cloth.bind[i]), loose),
+                _ => skinned,
             }
         })
         .collect()
@@ -583,7 +616,12 @@ fn constrain(pos: &mut [Vec3], pinned: &[bool], a: usize, b: usize, rest: f32, s
 #[allow(clippy::needless_range_loop)]
 fn simulate_cloths(
     mut cloths: ResMut<Cloths>,
-    rigs: Query<(&RigSkin, &RigPose)>,
+    rigs: Query<(
+        &RigSkin,
+        &RigPose,
+        Option<&crate::creature_anim::AnimDriver>,
+        Option<&crate::net::ObjectStore>,
+    )>,
     skins: Query<&RigSkin>,
     globals: Query<&GlobalTransform>,
     stock: Query<(&MeshMaterial3d<WowModelMaterial>, &MeshTag), Without<ClothCopy>>,
@@ -604,6 +642,10 @@ fn simulate_cloths(
     // More motion: more of the body's movement trails, and a weaker pull back to the animation.
     let inertia = (INERTIA * motion).min(0.9);
     let follow_scale = 1.0 / motion.max(0.05);
+    let loose_drawn = cvars
+        .as_deref()
+        .and_then(|c| c.flag("cloakLooseDrawn"))
+        .unwrap_or(true);
     let Some(ibp) = cloths
         .ibp
         .as_ref()
@@ -613,9 +655,20 @@ fn simulate_cloths(
         return;
     };
     for (rig_entity, cloth) in cloths.live.iter_mut() {
-        let Ok((skin, rig)) = rigs.get(*rig_entity) else {
+        let Ok((skin, rig, driver, store)) = rigs.get(*rig_entity) else {
             continue;
         };
+        // 0 is sheathed; 1 melee and 2 ranged are drawn.
+        let sheath = driver
+            .and_then(|d| d.sheath_state())
+            .or_else(|| store.and_then(|s| s.0.unit_sheath_state()));
+        let want = if loose_drawn && sheath.is_some_and(|s| s != 0) {
+            1.0
+        } else {
+            0.0
+        };
+        let ease = time.delta_secs() / LOOSE_EASE;
+        cloth.drawn += (want - cloth.drawn).clamp(-ease, ease);
         let Some(palette) = palettes.world_palette(skin.slot, skin.bones() as usize) else {
             continue;
         };
