@@ -14,7 +14,7 @@ use benilla_world::rig_anim::RigPose;
 
 use super::blow::LastHit;
 use super::rig::{build_profile, Profile};
-use crate::creature_anim::AnimDriver;
+use crate::creature_anim::{AnimDriver, AnimSoundEvent};
 use crate::entities::mount::MountBody;
 use crate::net::{GuidIndex, NetEntity, ObjectStore};
 
@@ -67,12 +67,19 @@ const SPELL_PUSH: f32 = 2.0;
 /// A severed limb leaves its body this much faster (yd/s), away and up.
 const SEVER_FLING: f32 = 4.0;
 const SEVER_LIFT: f32 = 3.0;
+/// A melee killing blow lands at the killer's swing's impact key, not when its packet comes, so
+/// the body waits for that key, at most this long after the packet (s).
+const MELEE_WAIT: f32 = 0.6;
 /// A knocked-down unit blends from where its ragdoll lies back into its animation over this long.
 const GET_UP_SECS: f32 = 0.6;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<RagdollBodies>()
-        .add_systems(Update, (track_unit_motion, start_ragdolls).chain())
+        .init_resource::<SwingKeys>()
+        .add_systems(
+            Update,
+            (note_swing_keys, track_unit_motion, start_ragdolls).chain(),
+        )
         .add_systems(FixedUpdate, release_parted_pairs)
         // The getting-up rigs restart from their pre-fall pose, so a bone the clips never key
         // returns too; the evaluator then writes the animated ones.
@@ -99,6 +106,29 @@ pub(super) fn plugin(app: &mut App) {
 /// The unit was seen alive, so its death is witnessed and ragdolls.
 #[derive(Component)]
 pub(super) struct SeenAlive;
+
+/// When each unit's swing last crossed its impact key, for [`MELEE_WAIT`].
+#[derive(Resource, Default)]
+struct SwingKeys(EntityHashMap<f32>);
+
+/// A dead unit holding its fall until the killing swing lands.
+#[derive(Component)]
+struct AwaitingBlow;
+
+/// Notes the swings' impact keys (`$AH0`-`$AH3`, `$CAH`).
+fn note_swing_keys(
+    mut events: MessageReader<AnimSoundEvent>,
+    mut keys: ResMut<SwingKeys>,
+    time: Res<Time>,
+) {
+    let now = time.elapsed_secs();
+    for ev in events.read() {
+        if ev.ident.starts_with(b"$AH") || &ev.ident == b"$CAH" {
+            keys.0.insert(ev.entity, now);
+        }
+    }
+    keys.0.retain(|_, at| now - *at < 5.0);
+}
 
 /// Where the unit was last frame, for the velocity its bodies inherit.
 #[derive(Component, Default)]
@@ -218,12 +248,15 @@ fn track_unit_motion(
             &ObjectStore,
             Option<&mut LastSpot>,
             Has<SeenAlive>,
+            Has<AwaitingBlow>,
         ),
         (With<AnimDriver>, Without<Ragdoll>),
     >,
 ) {
-    for (e, tf, store, spot, seen) in &mut units {
-        if store.0.unit_is_dead() {
+    for (e, tf, store, spot, seen, awaiting) in &mut units {
+        let dead = store.0.unit_is_dead();
+        // A dead unit waiting on its killing swing keeps its spot fresh, for a still start.
+        if dead && !awaiting {
             continue;
         }
         match spot {
@@ -232,7 +265,7 @@ fn track_unit_motion(
                 commands.entity(e).insert(LastSpot(tf.translation()));
             }
         }
-        if !seen {
+        if !seen && !dead {
             commands.entity(e).insert(SeenAlive);
         }
     }
@@ -255,6 +288,7 @@ fn start_ragdolls(
             Option<&LastHit>,
             Option<&KnockDown>,
             Option<&GettingUp>,
+            Has<AwaitingBlow>,
         ),
         (
             With<SeenAlive>,
@@ -269,6 +303,7 @@ fn start_ragdolls(
     mut bodies: ResMut<RagdollBodies>,
     cvars: Option<Res<crate::cvars::Cvars>>,
     mut severs: MessageWriter<super::dismember::Severed>,
+    keys: Res<SwingKeys>,
 ) {
     if ragdolls_off() {
         return;
@@ -279,7 +314,7 @@ fn start_ragdolls(
         .as_deref()
         .and_then(|c| c.flag("dismemberment"))
         .unwrap_or(false);
-    for (unit, store, net, rig, unit_tf, spot, blow, knock, rising) in &dying {
+    for (unit, store, net, rig, unit_tf, spot, blow, knock, rising, awaiting) in &dying {
         // Creatures and players alike, our own character included; a ghost reads alive again and
         // `cleanup` hands it back to its animation.
         let living_kind = matches!(net.kind, EntityKind::Unit | EntityKind::Player);
@@ -289,6 +324,26 @@ fn start_ragdolls(
                 commands.entity(unit).remove::<KnockDown>();
             }
             continue;
+        }
+        // A melee killing blow: hold the fall until the killer's swing reaches its impact key.
+        if dead {
+            let swing = blow.filter(|b| b.school.is_none() && now - b.at <= MELEE_WAIT);
+            if let Some(b) = swing {
+                let landed = index
+                    .0
+                    .get(&b.attacker)
+                    .and_then(|a| keys.0.get(a))
+                    .is_some_and(|&at| at >= b.at);
+                if !landed {
+                    if !awaiting {
+                        commands.entity(unit).insert(AwaitingBlow);
+                    }
+                    continue;
+                }
+            }
+            if awaiting {
+                commands.entity(unit).remove::<AwaitingBlow>();
+            }
         }
         // A knockdown is spent whether or not it falls; death wins over it.
         let knock = knock.copied().filter(|_| !dead);
