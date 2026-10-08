@@ -101,7 +101,8 @@ impl Dismembered {
 struct LimbHolder(Entity);
 
 /// The bodies a killing blow taking `share` of the unit's health severs: none below
-/// [`SEVER_SHARE`], else one limb, or two apart from each other past [`SECOND_LIMB_SHARE`].
+/// [`SEVER_SHARE`], else one limb, two apart from each other past [`SECOND_LIMB_SHARE`], and one
+/// more for each further [`SECOND_LIMB_SHARE`] (a high Dismemberment Amount gets there).
 pub(super) fn choose_limbs(profile: &Profile, share: f32, seed: u64) -> Vec<usize> {
     if share < SEVER_SHARE {
         return Vec::new();
@@ -136,7 +137,7 @@ pub(super) fn choose_limbs(profile: &Profile, share: f32, seed: u64) -> Vec<usiz
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     };
-    let wanted = if share >= SECOND_LIMB_SHARE { 2 } else { 1 };
+    let wanted = 1 + (share / SECOND_LIMB_SHARE).floor() as usize;
     let mut chosen: Vec<usize> = Vec::new();
     let mut pool = candidates;
     while chosen.len() < wanted && !pool.is_empty() {

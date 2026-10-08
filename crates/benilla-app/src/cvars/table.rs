@@ -777,6 +777,18 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — 1.12 draws a cloak stiff on the body's bones",
     ),
+    // benilla's own: how long a melee kill's ragdoll waits for the swing to land (s).
+    ours(
+        "ragdollMeleeDelay",
+        "0.3",
+        "benilla's own — 1.12 ragdolls nothing, so it delays nothing",
+    ),
+    // benilla's own: the Physics page's Body Physics slider, 0 off.
+    ours(
+        "bodyPhysics",
+        "1",
+        "benilla's own — 1.12 has no soft body motion",
+    ),
     // benilla's own: the Physics page's Loose Cloak When Armed box.
     ours(
         "cloakLooseDrawn",

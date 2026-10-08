@@ -455,7 +455,7 @@ fn spray_hits(
 fn gore_amount(cvars: Option<&crate::cvars::Cvars>) -> f32 {
     cvars
         .and_then(|c| c.num("goreAmount"))
-        .map_or(1.0, |v| v.clamp(0.0, 4.0))
+        .map_or(1.0, |v| v.clamp(0.0, 10.0))
 }
 
 /// Launch one droplet of `blood` from `start` at `velocity`, to splat at height `ground`.

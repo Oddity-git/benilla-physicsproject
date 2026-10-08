@@ -23,6 +23,7 @@ mod life;
 mod lootbag;
 mod pusher;
 mod rig;
+mod sway;
 mod testbox;
 
 pub(crate) struct RagdollPlugin;
@@ -41,6 +42,7 @@ impl Plugin for RagdollPlugin {
         life::plugin(app);
         lootbag::plugin(app);
         pusher::plugin(app);
+        sway::plugin(app);
         crate::blob_shadow::ragdoll_shadows(app);
     }
 }

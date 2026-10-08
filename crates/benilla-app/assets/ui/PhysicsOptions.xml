@@ -56,14 +56,21 @@
             "With a weapon drawn, cloth cloaks hang from the shoulders only, not the hips and "
             .. "legs, so the weapon swings clear of them."
 
+        BENILLA_TOOLTIP_BODY_PHYSICS =
+            "How much female characters' bodies sway as they move. Lowest turns it off."
+
+        BENILLA_TOOLTIP_MELEE_DELAY =
+            "How long (seconds) a body killed by a melee swing waits before it falls, so the "
+            .. "swing lands first. Spells are not delayed."
+
         -- Joins the options window's page loops; run from the page's OnLoad, after its rows.
         function BenillaPhysicsOptions_Register()
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
             BENILLA_OPTIONS_PAGE_ROWS.Physics = {
                 "RowBlood", "RowGoreAmount", "RowDismemberment", "RowDismemberAmount",
-                "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush",
+                "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay",
                 "RowCloakPhysics", "RowCloakMotion",
-                "RowCloakLooseDrawn",
+                "RowCloakLooseDrawn", "RowBodyPhysics",
             }
         end
     ]]></Script>
@@ -111,7 +118,7 @@
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "goreAmount", "Gore Amount",
                         "BENILLA_TOOLTIP_GORE_AMOUNT")
-                    BenillaOptionsSliderRow_Setup(this, 0.25, 3, 0.25)
+                    BenillaOptionsSliderRow_Setup(this, 0, 10, 0.25)
                 </OnLoad></Scripts>
             </Frame>
             <Frame name="$parentRowDismemberment" inherits="BenillaOptionsCheckboxRowTemplate">
@@ -132,7 +139,7 @@
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "dismemberAmount", "Dismemberment Amount",
                         "BENILLA_TOOLTIP_DISMEMBER_AMOUNT")
-                    BenillaOptionsSliderRow_Setup(this, 0.5, 3, 0.25)
+                    BenillaOptionsSliderRow_Setup(this, 0.25, 10, 0.25)
                 </OnLoad></Scripts>
             </Frame>
             <Frame name="$parentRowHitstop" inherits="BenillaOptionsCheckboxRowTemplate">
@@ -188,10 +195,21 @@
                     BenillaOptionsSliderRow_Setup(this, 0.5, 10, 0.25)
                 </OnLoad></Scripts>
             </Frame>
-            <Frame name="$parentRowCloakPhysics" inherits="BenillaOptionsCheckboxRowTemplate">
+            <Frame name="$parentRowMeleeDelay" inherits="BenillaOptionsSliderRowTemplate">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="$parentRowSpellPush" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                     <Anchor point="TOPRIGHT" relativeTo="$parentRowSpellPush" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "ragdollMeleeDelay", "Melee Death Delay",
+                        "BENILLA_TOOLTIP_MELEE_DELAY")
+                    BenillaOptionsSliderRow_Setup(this, 0, 1, 0.05)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowCloakPhysics" inherits="BenillaOptionsCheckboxRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowMeleeDelay" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowMeleeDelay" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                 </Anchors>
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "cloakPhysics", "Cloak Physics",
@@ -217,6 +235,17 @@
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "cloakLooseDrawn", "Loose Cloak When Armed",
                         "BENILLA_TOOLTIP_CLOAK_LOOSE_DRAWN")
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowBodyPhysics" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowCloakLooseDrawn" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowCloakLooseDrawn" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "bodyPhysics", "Body Physics",
+                        "BENILLA_TOOLTIP_BODY_PHYSICS")
+                    BenillaOptionsSliderRow_Setup(this, 0, 3, 0.25)
                 </OnLoad></Scripts>
             </Frame>
         </Frames>

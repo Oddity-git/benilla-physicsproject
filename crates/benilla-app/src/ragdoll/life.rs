@@ -14,7 +14,7 @@ use benilla_world::rig_anim::RigPose;
 
 use super::blow::LastHit;
 use super::rig::{build_profile, Profile};
-use crate::creature_anim::{AnimDriver, AnimSoundEvent};
+use crate::creature_anim::AnimDriver;
 use crate::entities::mount::MountBody;
 use crate::net::{GuidIndex, NetEntity, ObjectStore};
 
@@ -67,19 +67,16 @@ const SPELL_PUSH: f32 = 2.0;
 /// A severed limb leaves its body this much faster (yd/s), away and up.
 const SEVER_FLING: f32 = 4.0;
 const SEVER_LIFT: f32 = 3.0;
-/// A melee killing blow lands at the killer's swing's impact key, not when its packet comes, so
-/// the body waits for that key, at most this long after the packet (s).
-const MELEE_WAIT: f32 = 0.6;
+/// A melee killing blow's packet comes before the swing lands, so the body falls this long after
+/// it (s) unless `ragdollMeleeDelay` says otherwise, at most the slider's top.
+const MELEE_DELAY: f32 = 0.3;
+const MAX_MELEE_DELAY: f32 = 1.0;
 /// A knocked-down unit blends from where its ragdoll lies back into its animation over this long.
 const GET_UP_SECS: f32 = 0.6;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<RagdollBodies>()
-        .init_resource::<SwingKeys>()
-        .add_systems(
-            Update,
-            (note_swing_keys, track_unit_motion, start_ragdolls).chain(),
-        )
+        .add_systems(Update, (track_unit_motion, start_ragdolls).chain())
         .add_systems(FixedUpdate, release_parted_pairs)
         // The getting-up rigs restart from their pre-fall pose, so a bone the clips never key
         // returns too; the evaluator then writes the animated ones.
@@ -107,28 +104,9 @@ pub(super) fn plugin(app: &mut App) {
 #[derive(Component)]
 pub(super) struct SeenAlive;
 
-/// When each unit's swing last crossed its impact key, for [`MELEE_WAIT`].
-#[derive(Resource, Default)]
-struct SwingKeys(EntityHashMap<f32>);
-
-/// A dead unit holding its fall until the killing swing lands.
+/// A dead unit holding its fall for the melee delay.
 #[derive(Component)]
 struct AwaitingBlow;
-
-/// Notes the swings' impact keys (`$AH0`-`$AH3`, `$CAH`).
-fn note_swing_keys(
-    mut events: MessageReader<AnimSoundEvent>,
-    mut keys: ResMut<SwingKeys>,
-    time: Res<Time>,
-) {
-    let now = time.elapsed_secs();
-    for ev in events.read() {
-        if ev.ident.starts_with(b"$AH") || &ev.ident == b"$CAH" {
-            keys.0.insert(ev.entity, now);
-        }
-    }
-    keys.0.retain(|_, at| now - *at < 5.0);
-}
 
 /// Where the unit was last frame, for the velocity its bodies inherit.
 #[derive(Component, Default)]
@@ -303,7 +281,6 @@ fn start_ragdolls(
     mut bodies: ResMut<RagdollBodies>,
     cvars: Option<Res<crate::cvars::Cvars>>,
     mut severs: MessageWriter<super::dismember::Severed>,
-    keys: Res<SwingKeys>,
 ) {
     if ragdolls_off() {
         return;
@@ -325,21 +302,18 @@ fn start_ragdolls(
             }
             continue;
         }
-        // A melee killing blow: hold the fall until the killer's swing reaches its impact key.
+        // A melee killing blow: hold the fall for the delay, so the swing lands first.
         if dead {
-            let swing = blow.filter(|b| b.school.is_none() && now - b.at <= MELEE_WAIT);
-            if let Some(b) = swing {
-                let landed = index
-                    .0
-                    .get(&b.attacker)
-                    .and_then(|a| keys.0.get(a))
-                    .is_some_and(|&at| at >= b.at);
-                if !landed {
-                    if !awaiting {
-                        commands.entity(unit).insert(AwaitingBlow);
-                    }
-                    continue;
+            let delay = cvars
+                .as_deref()
+                .and_then(|c| c.num("ragdollMeleeDelay"))
+                .unwrap_or(MELEE_DELAY)
+                .clamp(0.0, MAX_MELEE_DELAY);
+            if blow.is_some_and(|b| b.school.is_none() && now - b.at < delay) {
+                if !awaiting {
+                    commands.entity(unit).insert(AwaitingBlow);
                 }
+                continue;
             }
             if awaiting {
                 commands.entity(unit).remove::<AwaitingBlow>();
@@ -421,7 +395,7 @@ fn start_ragdolls(
             let ease = cvars
                 .as_deref()
                 .and_then(|c| c.num("dismemberAmount"))
-                .map_or(1.0, |v| v.clamp(0.25, 4.0));
+                .map_or(1.0, |v| v.clamp(0.25, MAX_SLIDER));
             super::dismember::choose_limbs(
                 &profile,
                 blow_share * ease,
