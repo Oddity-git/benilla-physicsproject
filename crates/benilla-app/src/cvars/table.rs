@@ -759,6 +759,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "2",
         "benilla's own — 1.12 ragdolls nothing, so it throws nothing",
     ),
+    // benilla's own: how hard a dying ragdoll is thrown, times the fork's own push.
+    ours(
+        "ragdollPush",
+        "1",
+        "benilla's own — 1.12 ragdolls nothing, so it throws nothing",
+    ),
     // benilla's own: how much a dying ragdoll pops up, times the fork's own lift.
     ours(
         "ragdollLift",

@@ -4,13 +4,19 @@
 //! Only the drawn pose holds: the clips, the animation driver and the swing sounds keyed to them
 //! run on untouched (pausing the clips themselves left the driver out of step: units walked in
 //! place and swing sounds drifted), so the model catches up when the hold ends.
+//!
+//! Some swing clips (blunt weapons' among them) carry no impact key, so their hits never reach that
+//! frame: no flash, and before this no hitstop. A landed swing whose impact has not come
+//! [`FALLBACK`] after the combat message arrived stops anyway, then.
 
+use bevy::ecs::entity::EntityHashMap;
 use bevy::prelude::*;
+use std::collections::VecDeque;
 
 use benilla_world::rig_anim::{PosePost, RigPose};
 
 use super::life::Ragdoll;
-use crate::creature_anim::SwingImpact;
+use crate::creature_anim::{SwingImpact, SwingMessage};
 use crate::net::ObjectStore;
 
 /// The hold on a plain hit and on a crit (s), plus up to this much more for a hit that takes the
@@ -20,6 +26,10 @@ const CRIT_STOP: f32 = 0.12;
 const SHARE_STOP: f32 = 0.08;
 /// The longest hold, whatever the strength.
 const MAX_STOP: f32 = 0.3;
+/// A landed swing with no impact key this long after its combat message stops anyway (s).
+const FALLBACK: f32 = 0.3;
+/// How long a fallback stop remembers its swing, so a late impact key does not stop it twice (s).
+const FIRED_MEMORY: f32 = 5.0;
 /// `hitInfo`'s crit bit.
 const HITINFO_CRITICAL: u32 = 0x80;
 /// The hit landed (`0x2`).
@@ -37,14 +47,32 @@ struct HitStop {
     pose: Option<Vec<Transform>>,
 }
 
-/// Each landed swing stops both sides, if the option is on.
+/// Swings waiting for their impact key, by attacker, with when the fallback fires; and the swings
+/// the fallback already stopped, by `seq`, with when.
+#[derive(Default)]
+struct Waiting {
+    pending: EntityHashMap<(f32, SwingMessage)>,
+    fired: VecDeque<(u64, f32)>,
+}
+
+/// A hit or a block that dealt damage; a miss, dodge or parry never touched.
+fn landed(swing: &SwingMessage) -> bool {
+    swing.hit_info & HITINFO_NORMALSWING != 0
+        && swing.damage > 0
+        && matches!(swing.victim_state, 1 | 5)
+}
+
+/// Each landed swing stops both sides, if the option is on: at its impact key, or [`FALLBACK`]
+/// after its combat message when the clip has none.
 fn start_stops(
     mut commands: Commands,
+    mut swings: MessageReader<SwingMessage>,
     mut impacts: MessageReader<SwingImpact>,
     stores: Query<&ObjectStore>,
     stops: Query<&HitStop>,
     cvars: Option<Res<crate::cvars::Cvars>>,
     time: Res<Time>,
+    mut waiting: Local<Waiting>,
 ) {
     let cvars = cvars.as_deref();
     let on = cvars.and_then(|c| c.flag("hitstop")).unwrap_or(true);
@@ -52,20 +80,54 @@ fn start_stops(
         .and_then(|c| c.num("hitstopStrength"))
         .map_or(1.0, |v| v.clamp(0.0, 3.0));
     if !on || strength <= 0.0 {
+        swings.clear();
         impacts.clear();
+        waiting.pending.clear();
         return;
     }
     let now = time.elapsed_secs();
+    let waiting = &mut *waiting;
+    while waiting
+        .fired
+        .front()
+        .is_some_and(|&(_, at)| now - at > FIRED_MEMORY)
+    {
+        waiting.fired.pop_front();
+    }
+    let mut due = Vec::new();
+    for swing in swings.read() {
+        if landed(swing) && swing.victim.is_some() {
+            // A newer swing replaces an older one still waiting, as the client's one slot does.
+            waiting.pending.insert(swing.attacker, (now + FALLBACK, *swing));
+        }
+    }
     for ev in impacts.read() {
-        let swing = &ev.swing;
-        // A hit or a block that dealt damage; a miss, dodge or parry never touched.
-        if ev.text_only
-            || swing.hit_info & HITINFO_NORMALSWING == 0
-            || swing.damage == 0
-            || !matches!(swing.victim_state, 1 | 5)
-        {
+        if ev.text_only || !landed(&ev.swing) {
             continue;
         }
+        let swing = ev.swing;
+        if waiting
+            .pending
+            .get(&swing.attacker)
+            .is_some_and(|(_, w)| w.seq == swing.seq)
+        {
+            waiting.pending.remove(&swing.attacker);
+        }
+        if waiting.fired.iter().any(|&(seq, _)| seq == swing.seq) {
+            continue; // the fallback already stopped this one
+        }
+        due.push(swing);
+    }
+    waiting.pending.retain(|_, (at, swing)| {
+        if now >= *at {
+            due.push(*swing);
+            waiting.fired.push_back((swing.seq, now));
+            false
+        } else {
+            true
+        }
+    });
+    for swing in due {
         let Some(victim) = swing.victim else {
             continue;
         };

@@ -33,19 +33,24 @@
         BENILLA_TOOLTIP_HITSTOP_STRENGTH =
             "How long the hitstop holds."
 
+        BENILLA_TOOLTIP_DEATH_PUSH =
+            "How hard a killing blow throws the body away from the killer. A heavier blow "
+            .. "throws it further. High settings get silly."
+
         BENILLA_TOOLTIP_DEATH_LIFT =
             "How much a body pops up as it dies, before it falls. A heavier killing blow lifts "
-            .. "it more."
+            .. "it more. High settings launch it."
 
         BENILLA_TOOLTIP_SPELL_PUSH =
-            "How much harder a spell's killing blow throws the body than a melee one."
+            "How much harder a spell's killing blow throws the body than a melee one, on top "
+            .. "of Death Push."
 
         -- Joins the options window's page loops; run from the page's OnLoad, after its rows.
         function BenillaPhysicsOptions_Register()
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
             BENILLA_OPTIONS_PAGE_ROWS.Physics = {
                 "RowBlood", "RowGoreAmount", "RowDismemberment", "RowDismemberAmount",
-                "RowHitstop", "RowHitstopStrength", "RowDeathLift", "RowSpellPush",
+                "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush",
             }
         end
     ]]></Script>
@@ -137,15 +142,26 @@
                     BenillaOptionsSliderRow_Setup(this, 0.25, 3, 0.25)
                 </OnLoad></Scripts>
             </Frame>
-            <Frame name="$parentRowDeathLift" inherits="BenillaOptionsSliderRowTemplate">
+            <Frame name="$parentRowDeathPush" inherits="BenillaOptionsSliderRowTemplate">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="$parentRowHitstopStrength" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                     <Anchor point="TOPRIGHT" relativeTo="$parentRowHitstopStrength" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                 </Anchors>
                 <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "ragdollPush", "Death Push",
+                        "BENILLA_TOOLTIP_DEATH_PUSH")
+                    BenillaOptionsSliderRow_Setup(this, 0, 10, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowDeathLift" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowDeathPush" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowDeathPush" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "ragdollLift", "Death Lift",
                         "BENILLA_TOOLTIP_DEATH_LIFT")
-                    BenillaOptionsSliderRow_Setup(this, 0, 3, 0.25)
+                    BenillaOptionsSliderRow_Setup(this, 0, 10, 0.25)
                 </OnLoad></Scripts>
             </Frame>
             <Frame name="$parentRowSpellPush" inherits="BenillaOptionsSliderRowTemplate">
@@ -156,7 +172,7 @@
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "ragdollSpellPush", "Spell Push",
                         "BENILLA_TOOLTIP_SPELL_PUSH")
-                    BenillaOptionsSliderRow_Setup(this, 0.5, 4, 0.25)
+                    BenillaOptionsSliderRow_Setup(this, 0.5, 10, 0.25)
                 </OnLoad></Scripts>
             </Frame>
         </Frames>

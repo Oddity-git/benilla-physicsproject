@@ -27,8 +27,11 @@ const JOINT_DAMPING: f32 = 4.0;
 const BODY_ANGULAR_DAMPING: f32 = 0.8;
 const BODY_LINEAR_DAMPING: f32 = 0.1;
 /// The fastest a body may move (yd/s) and spin (rad/s): a solver kick on a tangled rig (a spider's
-/// eight legs) can otherwise fling it off into the sky.
+/// eight legs) can otherwise fling it off into the sky. The speed cap grows with the push and lift
+/// sliders past 1, so a wild setting really throws.
 const MAX_BODY_SPEED: f32 = 25.0;
+/// The push, spell push and lift sliders' top (the Physics page's ranges).
+const MAX_SLIDER: f32 = 10.0;
 const MAX_BODY_SPIN: f32 = 20.0;
 /// A body's mass is its segment's share of the skeleton's height, floored so a hand is never so
 /// light the chain whips it, and the hub (the pelvis) weighs this many times its share.
@@ -329,15 +332,20 @@ fn start_ragdolls(
                 .as_deref()
                 .and_then(|c| c.num("ragdollSpellPush"))
                 .unwrap_or(SPELL_PUSH)
-                .max(0.0)
+                .clamp(0.0, MAX_SLIDER)
         } else {
             1.0
         };
-        let lift_scale = cvars
-            .as_deref()
-            .and_then(|c| c.num("ragdollLift"))
-            .unwrap_or(1.0)
-            .clamp(0.0, 3.0);
+        let slider = |name: &str| {
+            cvars
+                .as_deref()
+                .and_then(|c| c.num(name))
+                .unwrap_or(1.0)
+                .clamp(0.0, MAX_SLIDER)
+        };
+        let push_scale = slider("ragdollPush") * spell_push;
+        let lift_scale = slider("ragdollLift");
+        let max_speed = MAX_BODY_SPEED * push_scale.max(lift_scale).max(1.0);
         let (away, strength, lift) = match knock {
             Some(k) => (
                 k.away.with_y(0.0).normalize_or_zero(),
@@ -348,7 +356,7 @@ fn start_ragdolls(
             None if frozen => (away, FROZEN_TIP, 0.0),
             None => (
                 away,
-                (DEATH_PUSH + BLOW_PUSH * blow_share).min(MAX_PUSH) * spell_push,
+                (DEATH_PUSH + BLOW_PUSH * blow_share).min(MAX_PUSH) * push_scale,
                 (DEATH_LIFT + BLOW_LIFT * blow_share).min(MAX_LIFT) * lift_scale,
             ),
         };
@@ -420,7 +428,7 @@ fn start_ragdolls(
                     Mass(mass),
                     LinearDamping(BODY_LINEAR_DAMPING),
                     AngularDamping(BODY_ANGULAR_DAMPING),
-                    MaxLinearSpeed(MAX_BODY_SPEED),
+                    MaxLinearSpeed(max_speed),
                     MaxAngularSpeed(MAX_BODY_SPIN),
                     LinearVelocity(unit_velocity + push),
                     TransformInterpolation,
