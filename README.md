@@ -77,7 +77,8 @@ Everything here is **client side only**. The server, other players and their cli
   wait), a **Cloak Physics** checkbox (on by default), a **Cloak Motion** slider for how much
   cloaks swing, and a **Loose Cloak When Armed** checkbox (on by default). The gore,
   dismemberment, push and lift sliders go up to 10x, and a high Dismemberment Amount takes off more
-  than two limbs.
+  than two limbs. A higher Gore Amount also keeps more blood on the ground at once and throws some
+  of the spray faster.
 
 ## Compatibility
 

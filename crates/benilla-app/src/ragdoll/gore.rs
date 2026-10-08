@@ -56,8 +56,13 @@ const HIT_SPLAT: (f32, f32) = (0.25, 0.4);
 /// A splat stays this long, the last [`FADE`] of it fading.
 const SPLAT_LIFE: f32 = 45.0;
 const FADE: f32 = 6.0;
-/// Most splats on the ground at once; past it the oldest goes.
+/// Most splats on the ground at once at Gore Amount 1, past which the oldest goes; a higher
+/// amount raises it in proportion, to at most [`MAX_SPLATS_EVER`].
 const MAX_SPLATS: usize = 400;
+const MAX_SPLATS_EVER: usize = 4000;
+/// This share of each spray's droplets fly faster, by this much per point of Gore Amount.
+const FAST_SHARE: f32 = 0.3;
+const FAST_PER_AMOUNT: f32 = 0.5;
 /// A ragdoll's pool starts after its body has fallen, then spreads to its full size (a share of the
 /// unit's height, clamped) over [`POOL_SPREAD`]; it is re-projected at most this often while it
 /// grows.
@@ -118,6 +123,8 @@ struct Gore {
     looks: HashMap<AssetId<Image>, TexLook>,
     /// The ground splats, oldest first.
     splats: VecDeque<Entity>,
+    /// The Gore Amount the last spray read, which scales [`MAX_SPLATS`].
+    amount: f32,
     rng: u32,
 }
 
@@ -387,6 +394,7 @@ fn spray_hits(
         hits.clear();
         return;
     };
+    gore.amount = amount;
     let now = time.elapsed_secs();
     for hit in hits.read() {
         let Ok((tf, net, store, bound)) = victims.get(hit.victim) else {
@@ -437,7 +445,15 @@ fn spray_hits(
             let yaw = gore.range((-SPREAD, SPREAD));
             let climb = gore.range((MIN_CLIMB, MAX_CLIMB));
             let dir = Quat::from_rotation_y(yaw) * away;
-            let v = (dir * climb.cos() + Vec3::Y * climb.sin()) * speed * gore.range((0.45, 1.2));
+            let fast = if gore.range((0.0, 1.0)) < FAST_SHARE {
+                1.0 + FAST_PER_AMOUNT * amount
+            } else {
+                1.0
+            };
+            let v = (dir * climb.cos() + Vec3::Y * climb.sin())
+                * speed
+                * fast
+                * gore.range((0.45, 1.2));
             let start = chest + Vec3::new(gore.range((-0.1, 0.1)), 0.0, gore.range((-0.1, 0.1)));
             throw_droplet(&mut gore, b, start, v, feet.y, now);
         }
@@ -515,8 +531,14 @@ fn bleed_cuts(
                 gore.range((0.0, 1.0)),
                 gore.range((-1.0, 1.0)),
             );
+            let fast = if gore.range((0.0, 1.0)) < FAST_SHARE {
+                1.0 + FAST_PER_AMOUNT * amount
+            } else {
+                1.0
+            };
             let v = (cut.away * 0.6 + Vec3::Y * 1.2 + jitter * 0.8).normalize_or_zero()
-                * gore.range(CUT_SPEED);
+                * gore.range(CUT_SPEED)
+                * fast;
             let b = Blood { texture, violence };
             throw_droplet(&mut gore, b, cut.at, v, ground, now);
         }
@@ -534,7 +556,7 @@ fn bleed_cuts(
     }
 }
 
-/// Project one splat and keep it, retiring the oldest past [`MAX_SPLATS`].
+/// Project one splat and keep it, retiring the oldest past the cap ([`MAX_SPLATS`] by Gore Amount).
 fn lay_splat(
     commands: &mut Commands,
     gore: &mut Gore,
@@ -561,7 +583,8 @@ fn lay_splat(
         ))
         .id();
     gore.splats.push_back(id);
-    while gore.splats.len() > MAX_SPLATS {
+    let cap = ((MAX_SPLATS as f32 * gore.amount.max(1.0)) as usize).min(MAX_SPLATS_EVER);
+    while gore.splats.len() > cap {
         if let Some(old) = gore.splats.pop_front() {
             if let Ok(mut e) = commands.get_entity(old) {
                 e.despawn();
