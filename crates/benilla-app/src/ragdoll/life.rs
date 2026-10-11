@@ -109,6 +109,13 @@ pub(super) fn plugin(app: &mut App) {
 #[derive(Component)]
 pub(super) struct SeenAlive;
 
+impl Ragdoll {
+    /// A knockdown that will stand back up, not a death.
+    pub(super) fn knocked(&self) -> bool {
+        self.getting_up.is_some()
+    }
+}
+
 /// A dead unit holding its fall for the melee delay.
 #[derive(Component)]
 struct AwaitingBlow;

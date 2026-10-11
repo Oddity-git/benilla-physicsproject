@@ -789,6 +789,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0.3",
         "benilla's own — 1.12 ragdolls nothing, so it delays nothing",
     ),
+    // benilla's own: the Physics page's Death Effects box: blood, fire or ice by the killing blow.
+    ours(
+        "deathEffects",
+        "1",
+        "benilla's own — 1.12 leaves nothing on a corpse",
+    ),
     // benilla's own: the Physics page's Ragdoll Stiffness slider, 0 floppy to 1 near rigid.
     ours(
         "ragdollStiffness",

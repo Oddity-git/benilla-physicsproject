@@ -1,14 +1,15 @@
 //! The loot bag: a ragdoll can be shoved or thrown far from where its unit died, but the server
 //! keeps the corpse there, so a lootable ragdoll drops a sack on that spot, and pointing at the
 //! sack points at the corpse. The sack is a model from the install, found once by name; a plain
-//! brown blob stands in when the install has none.
+//! brown blob stands in when the install has none. The sack fades in a little above the spot,
+//! drops onto it and bounces twice, a drawn fall rather than a simulated one.
 
 use bevy::ecs::entity::EntityHashMap;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use benilla_assets::{m2_url, M2Model, WorldAssets};
-use benilla_world::mesh_tag::spawn_tag;
+use benilla_world::mesh_tag::{spawn_tag, with_alpha};
 use benilla_world::view::WorldCamera;
 use bevy::mesh::MeshTag;
 
@@ -34,11 +35,23 @@ const BIG_HEIGHT: f32 = 3.3;
 /// twice it, as its sack is.
 const PICK_RADIUS: f32 = 0.6;
 const PICK_CENTRE: f32 = 0.45;
+/// The drop: the height it fades in at (yd, times the sack's size), how long it falls (s) and
+/// fades in (s), then each bounce's height (yd, times the size) and length (s).
+const DROP_HEIGHT: f32 = 1.2;
+const FALL: f32 = 0.35;
+const FADE_IN: f32 = 0.25;
+const BOUNCES: [(f32, f32); 2] = [(0.15, 0.22), (0.04, 0.12)];
+/// How flat the sack squashes as it lands (a share off its height), easing back over this long (s).
+const SQUASH: f32 = 0.2;
+const SQUASH_TIME: f32 = 0.15;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<SackArt>()
         .init_resource::<Bags>()
-        .add_systems(Update, (find_sack_model, sync_bags, build_bags).chain())
+        .add_systems(
+            Update,
+            (find_sack_model, sync_bags, build_bags, drop_bags).chain(),
+        )
         .add_systems(Update, pick_bags.in_set(crate::target::UnitPickOverride));
 }
 
@@ -58,6 +71,9 @@ struct LootBag {
     /// The click sphere's size against the default sack's: 1 or 2.
     size: f32,
     built: bool,
+    /// Where it lands, and when it started to fall.
+    spot: Vec3,
+    born: Option<f32>,
 }
 
 /// Searches the patch chain for a sack model, once, on the first lootable ragdoll.
@@ -133,8 +149,10 @@ fn sync_bags(mut commands: Commands, units: Query<BagUnit, With<Ragdoll>>, mut b
                     scale,
                     size,
                     built: false,
+                    spot: at,
+                    born: None,
                 },
-                Transform::from_translation(at)
+                Transform::from_translation(at + Vec3::Y * DROP_HEIGHT * size)
                     .with_rotation(rot)
                     .with_scale(Vec3::splat(scale)),
                 Visibility::default(),
@@ -210,7 +228,7 @@ fn build_bags(
                         .spawn((
                             Mesh3d(mesh),
                             MeshMaterial3d(material),
-                            MeshTag(spawn_tag(0, 1.0)),
+                            MeshTag(spawn_tag(0, 0.0)),
                             Transform::IDENTITY,
                         ))
                         .id();
@@ -244,6 +262,52 @@ fn build_bags(
             }
         }
         bag.built = true;
+    }
+}
+
+/// How high above its spot the sack is `t` seconds into its drop (in sack sizes), and how far it
+/// is squashed; `None` once it has settled.
+fn drop_at(t: f32) -> Option<(f32, f32)> {
+    if t < FALL {
+        let f = t / FALL;
+        return Some((DROP_HEIGHT * (1.0 - f * f), 0.0));
+    }
+    let squash = SQUASH * (1.0 - (t - FALL) / SQUASH_TIME).max(0.0);
+    let mut start = FALL;
+    for (height, length) in BOUNCES {
+        if t < start + length {
+            let f = (t - start) / length;
+            return Some((height * 4.0 * f * (1.0 - f), squash));
+        }
+        start += length;
+    }
+    (squash > 0.0).then_some((0.0, squash))
+}
+
+/// Drops each built sack onto its spot, fading its meshes in as it falls.
+fn drop_bags(
+    time: Res<Time>,
+    mut roots: Query<(&mut LootBag, &mut Transform, &Children)>,
+    mut tags: Query<&mut MeshTag>,
+) {
+    let now = time.elapsed_secs();
+    for (mut bag, mut tf, children) in &mut roots {
+        if !bag.built {
+            continue;
+        }
+        let born = *bag.born.get_or_insert(now);
+        let t = now - born;
+        let Some((height, squash)) = drop_at(t) else {
+            continue;
+        };
+        tf.translation = bag.spot + Vec3::Y * height * bag.size;
+        tf.scale = Vec3::new(1.0 + squash * 0.5, 1.0 - squash, 1.0 + squash * 0.5) * bag.scale;
+        let alpha = (t / FADE_IN).min(1.0);
+        for child in children.iter() {
+            if let Ok(mut tag) = tags.get_mut(child) {
+                tag.0 = with_alpha(tag.0, alpha);
+            }
+        }
     }
 }
 

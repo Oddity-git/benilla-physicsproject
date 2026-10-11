@@ -62,6 +62,9 @@
         BENILLA_TOOLTIP_MELEE_DELAY =
             "How long (seconds) a body killed by a melee swing waits before it falls, so the "
             .. "swing lands first. Spells are not delayed."
+        BENILLA_TOOLTIP_DEATH_EFFECTS =
+            "What the killing blow leaves on the body: melee kills gush blood upward, fire kills "
+            .. "burn and then smoke, frost kills burst into ice."
         BENILLA_TOOLTIP_RAGDOLL_STIFFNESS =
             "How stiffly a body's joints hold as it falls. Low lets limbs flop and swing; high keeps "
             .. "the pose it died in, short of a frozen body's."
@@ -96,7 +99,7 @@
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
             BENILLA_OPTIONS_PAGE_ROWS.Physics = {
                 "RowBlood", "RowGoreAmount", "RowBloodStains", "RowDismemberment", "RowDismemberAmount",
-                "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay", "RowStiffness",
+                "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay", "RowStiffness", "RowDeathEffects",
                 "RowCloakPhysics", "RowCloakMotion",
                 "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize", "RowBodyRearSize",
                 "RowWeaponMotion", "RowFootPlanting", "RowOmniMovement",
@@ -257,10 +260,20 @@
                     BenillaOptionsSliderRow_Setup(this, 0, 1, 0.1)
                 </OnLoad></Scripts>
             </Frame>
-            <Frame name="$parentRowCloakPhysics" inherits="BenillaOptionsCheckboxRowTemplate">
+            <Frame name="$parentRowDeathEffects" inherits="BenillaOptionsCheckboxRowTemplate">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="$parentRowStiffness" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                     <Anchor point="TOPRIGHT" relativeTo="$parentRowStiffness" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "deathEffects", "Death Effects",
+                        "BENILLA_TOOLTIP_DEATH_EFFECTS")
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowCloakPhysics" inherits="BenillaOptionsCheckboxRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowDeathEffects" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowDeathEffects" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                 </Anchors>
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "cloakPhysics", "Cloak Physics",

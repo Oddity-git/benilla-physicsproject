@@ -9,7 +9,8 @@
 //! (`stain`). A heavy killing blow can sever a
 //! limb (`dismember`), as the Dismemberment option allows. A knockdown, the game's own or our kick,
 //! ragdolls a living unit and stands it back up (`knock`). A lightning kill shakes the body in a
-//! seizure (`shock`), and bleed ticks squirt blood (`gore`). Stowed weapons jostle as their wearer
+//! seizure (`shock`), and bleed ticks squirt blood (`gore`); a melee, fire or frost kill leaves a
+//! gush, a burn and smoke, or ice on the body (`deathfx`). Stowed weapons jostle as their wearer
 //! moves (`jostle`), feet stand on the ground under each of them (`feet`), and the movement keys can steer from the
 //! camera (`omni`). The dev chord + `B` drops a test box (`testbox`).
 
@@ -18,6 +19,7 @@ use bevy::prelude::*;
 mod blow;
 mod bounds;
 mod cloak;
+mod deathfx;
 mod dismember;
 mod feet;
 mod frost;
@@ -43,6 +45,7 @@ impl Plugin for RagdollPlugin {
         blow::plugin(app);
         bounds::plugin(app);
         cloak::plugin(app);
+        deathfx::plugin(app);
         dismember::plugin(app);
         frost::plugin(app);
         gore::plugin(app);

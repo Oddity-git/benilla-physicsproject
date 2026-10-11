@@ -5,6 +5,8 @@
 //!   share of the victim's health and the most on a killing blow; each leaves a splat where it lands.
 //! - A ragdoll bleeds a pool that spreads under its body, where the body ends up.
 //! - A bleed's ticks keep its victim squirting blood from one wound, in heartbeat pulses.
+//! - A melee kill's corpse gushes blood upward from its middle for a moment as it falls
+//!   (`deathfx` starts it).
 //! - A severed limb wears a splat on each face of its cut, the stump's and the piece's, turned to
 //!   the eye and riding them.
 //!
@@ -121,6 +123,7 @@ pub(super) fn plugin(app: &mut App) {
                 spray_hits,
                 bleed_cuts,
                 squirt_bleeds,
+                gush_corpses,
                 fly_droplets,
                 start_pools,
                 grow_pools,
@@ -595,6 +598,92 @@ fn throw_droplet(
         born: now,
         blood,
     });
+}
+
+/// A melee kill's gush: how long it lasts (s), its pulse (s, spurting the first share of each),
+/// how often a spurt throws, how fast (yd/s), and how far it leans off straight up.
+const GUSH: f32 = 1.2;
+const GUSH_PULSE: f32 = 0.3;
+const GUSH_SPURT: f32 = 0.5;
+const GUSH_EVERY: f32 = 0.03;
+const GUSH_SPEED: (f32, f32) = (2.5, 4.5);
+const GUSH_LEAN: f32 = 0.35;
+
+/// A corpse gushing blood upward, from when.
+#[derive(Component)]
+pub(super) struct Gushing {
+    start: f32,
+    next: f32,
+}
+
+/// `unit`'s corpse gushes for [`GUSH`] seconds.
+pub(super) fn gush(commands: &mut Commands, unit: Entity, now: f32) {
+    if let Ok(mut e) = commands.get_entity(unit) {
+        e.insert(Gushing {
+            start: now,
+            next: now,
+        });
+    }
+}
+
+/// Each gushing corpse spurts upward from its hub body in quick pulses, until its time is up.
+#[allow(clippy::too_many_arguments)] // one Bevy system's resources
+fn gush_corpses(
+    mut commands: Commands,
+    mut units: Query<(Entity, &Transform, &NetEntity, &mut Gushing)>,
+    bodies: Res<RagdollBodies>,
+    body_tfs: Query<&GlobalTransform>,
+    creatures: Option<Res<Creatures>>,
+    blood: Option<Res<BloodTables>>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+    server: Res<AssetServer>,
+    time: Res<Time>,
+    mut gore: ResMut<Gore>,
+) {
+    let now = time.elapsed_secs();
+    let violence = violence_level(cvars.as_deref());
+    let amount = gore_amount(cvars.as_deref());
+    for (unit, tf, net, mut gushing) in &mut units {
+        if now - gushing.start > GUSH {
+            commands.entity(unit).remove::<Gushing>();
+            continue;
+        }
+        let Some(blood) = blood.as_deref().filter(|_| violence > 0) else {
+            continue;
+        };
+        if ((now - gushing.start) % GUSH_PULSE) / GUSH_PULSE > GUSH_SPURT || now < gushing.next {
+            continue;
+        }
+        gushing.next = now + GUSH_EVERY;
+        let Some(at) = bodies
+            .0
+            .get(&unit)
+            .and_then(|ids| ids.first())
+            .and_then(|&b| body_tfs.get(b).ok())
+            .map(|g| g.translation())
+        else {
+            continue;
+        };
+        let Some(id) = unit_blood_id(creatures.as_deref(), blood, net.display_id) else {
+            continue;
+        };
+        let splats = blood.0.splats(id, violence);
+        // Strongest at first, easing off as the heart gives out.
+        let left = 1.0 - (now - gushing.start) / GUSH;
+        for _ in 0..(amount.round() as usize).max(1) {
+            let Some(texture) = gore.pick_texture(&server, splats) else {
+                break; // bloodless
+            };
+            let lean = Vec3::new(
+                gore.range((-GUSH_LEAN, GUSH_LEAN)),
+                1.0,
+                gore.range((-GUSH_LEAN, GUSH_LEAN)),
+            );
+            let v = lean.normalize() * gore.range(GUSH_SPEED) * (0.5 + 0.5 * left);
+            let b = Blood { texture, violence };
+            throw_droplet(&mut gore, b, at, v, tf.translation.y, now);
+        }
+    }
 }
 
 /// What [`squirt_bleeds`] reads of a bleeding unit.

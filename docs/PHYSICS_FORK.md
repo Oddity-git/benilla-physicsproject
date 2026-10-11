@@ -22,6 +22,7 @@ fidelity to the 1.12.1 reference client. This fork deliberately adds features 1.
 | Death push and lift scaled by the killing blow | `blow`, `life` | `ragdollPush`, `ragdollLift`, `ragdollSpellPush` |
 | Melee kills wait for the swing to land | `life` | `ragdollMeleeDelay` |
 | How stiffly ragdoll joints hold | `life` | `ragdollStiffness` |
+| Death effects: melee gush, fire burn and smoke, frost shards | `deathfx`, `gore` | `deathEffects` |
 | Players shove corpses | `pusher` | always |
 | Loot sack where the server's corpse is | `lootbag` | always |
 | Flung ragdolls stay drawn | `bounds` | always |
@@ -137,6 +138,8 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
   `drop_ragdoll_shadows`. A ragdoll leaves no blob shadow behind. It is appended rather than
   woven in so other forks' merges stay clean.
 - `creature_anim.rs`: re-exports `LootSparkleOn`, `FxEffectScale` and blood helpers for `gore`.
+- `creature_anim/spell_visual.rs`: `kit_effects(spells, visuals, spell, impact)`, a spell's impact or
+  state kit models, for `deathfx` (behind `cfg(feature = "ragdoll")`).
 - `creature_anim/twist.rs`: `BodyTwist::head_bone`, the head key bone, for `rig::add_head`.
 - `creature_anim/blood.rs`: exposes `violence_level` and `unit_blood_id`, and sets
   `SPURT_SCALE 0.5`, which plays the stock melee spurt at half size.
@@ -284,6 +287,7 @@ The page's rows, in order:
 | Spell Push | `ragdollSpellPush` | 0.5–10 | 2 |
 | Melee Death Delay | `ragdollMeleeDelay` | 0–1 s, step 0.05 | 0.3 |
 | Ragdoll Stiffness | `ragdollStiffness` | 0–1, step 0.1 | 0.5 |
+| Death Effects | `deathEffects` | box | 1 |
 | Cloak Physics | `cloakPhysics` | box | 1 |
 | Cloak Motion | `cloakMotion` | 0–3 | 1 |
 | Loose Cloak When Armed | `cloakLooseDrawn` | box | 1 |
@@ -386,6 +390,10 @@ The server keeps the corpse where the unit died, which the ragdoll may have left
 ragdoll drops a sack model (found by name in the install, with a brown blob as fallback) on that
 spot. `pick_bags` runs in `crate::target::UnitPickOverride`, so pointing at the sack targets the
 corpse. The stock loot sparkle is moved to the sack.
+The sack fades in `DROP_HEIGHT 1.2` yd (× its size) above the spot over `FADE_IN 0.25` s, falls
+for `FALL 0.35` s, squashes `SQUASH 0.2` and bounces twice (`BOUNCES`: 0.15 yd for 0.22 s, 0.04 yd
+for 0.12 s) in `drop_bags`, drawn, not simulated; the fade is the meshes' `MeshTag` alpha
+(the plain fallback bag has none and just drops). Mathieu asked for it instead of popping in.
 
 ### `gore.rs`
 All blood colours and textures come from the stock `UnitBlood` tables. Violence 1 is green,
@@ -503,6 +511,22 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   unit's limb copied nothing and vanished. A parked cape (the cloth cloak draws it) is skipped.
 - `heal` undoes this when a unit revives.
 
+### `deathfx.rs` (death effects)
+- On `Added<Ragdoll>` (not a knockdown, `Ragdoll::knocked`) with a `LastHit` within
+  `BLOW_WINDOW 2` s, by its school:
+  - **Melee or physical** (`None`, `Some(0)`): `gore::gush` puts `Gushing` on the unit, and
+    `gore::gush_corpses` spurts droplets up from the hub body for `GUSH 1.2` s in `GUSH_PULSE 0.3`
+    pulses (`GUSH_SPEED 2.5–4.5`, leaning `GUSH_LEAN 0.35`), weakening as it goes. Blood gated.
+  - **Fire** (`Some(2)`): Immolate's (348) state kit as a persistent `SpellKitFx::Begin` under
+    our own key `BURN_KEY` (class `AuraState`), reaped after `BURN 4` s; embers rise meanwhile,
+    smoke starts halfway and goes on `SMOKE 5` s after, thinning.
+  - **Frost** (`Some(4)`): Frostbolt's (116) impact kit as a one-shot, `SHARDS 28` pale shards
+    flung off a body under gravity, and mist for `MIST 2.5` s.
+- Embers, smoke, shards and mist are `Puff`s in a resource, soft camera-facing quads on the
+  effect lane (`draw_puffs`, embers additive), from a random body's position (the unit's spot
+  once the bodies are dropped). At most `MAX_PUFFS 1200`.
+- A missing kit logs `death effects: no burning model …` and the puffs still run.
+
 ### `hitstop.rs`
 On a landed melee hit (`SwingMessage`), at the clip's impact key, it holds the **drawn pose** of
 the attacker and victim for `STOP 0.06` s (`CRIT_STOP 0.12` on a crit, more for a big share, at
@@ -522,8 +546,11 @@ with no impact key (some blunt weapons) stop after `FALLBACK 0.3` s instead.
 - **Shock.** `is_shock(name)` matches lightning, thunder, shock, storm, static or spark, so
   Thunder Clap counts. `note_shock_debuffs` stamps `ShockDebuff(now)` on living units that carry
   such an aura. The server clears auras on death, so `DEBUFF_MEMORY 1.0` s of memory is needed.
-  `jolt_shocked` removes `Sleeping` and adds random velocity to every body every 0.06 s for 2.5 s,
-  fading out. `tint_shocked` flickers a pale blue. The body never stiffens; it shakes and then
+  `jolt_shocked` removes `Sleeping` and kicks every body in spasms `JOLT_EVERY 0.12–0.32` s
+  apart for `SEIZURE 4.5` s, strength `1 − t³` (fading late): up to `JOLT_SPEED 5.5` yd/s and
+  `JOLT_SPIN 16` rad/s, `SHARED 0.6` of each kick the same for every body so the whole body
+  convulses, and the hub lifted `ARCH 1.5` yd/s. Mathieu found the old 0.06 s, 2.2 yd/s buzz
+  too rapid and small. `tint_shocked` flickers a pale blue. The body never stiffens; it shakes and then
   lies as normal.
 
 ### `cloak.rs` (cloth cloaks)

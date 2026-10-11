@@ -356,6 +356,21 @@ fn resolve_kit_effects(visuals: &SpellVisualCatalog, kit: &VisualKit) -> Vec<FxS
         .collect()
 }
 
+/// Fork: `spell_id`'s impact (`impact`) or state kit's effect models, for the physics fork's death
+/// effects on a corpse.
+#[cfg(feature = "ragdoll")]
+pub(crate) fn kit_effects(
+    spells: &crate::ui_action::Spells,
+    visuals: &SpellVisualCatalog,
+    spell_id: u32,
+    impact: bool,
+) -> Vec<FxSlot> {
+    let stage = |s: &VisualStages| if impact { s.impact } else { s.state };
+    resolve_kit(spells, visuals, spell_id, stage, || None)
+        .map(|kit| resolve_kit_effects(visuals, &kit))
+        .unwrap_or_default()
+}
+
 /// A server-pushed kit (`SMSG_PLAY_SPELL_VISUAL`), played at stage 0 with spell id 0: its effects
 /// end only on their own (`0x6e98d0` → `0x60edf0`).
 #[derive(Message, Clone, Copy)]
