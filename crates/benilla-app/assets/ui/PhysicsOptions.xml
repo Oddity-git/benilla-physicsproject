@@ -62,6 +62,9 @@
         BENILLA_TOOLTIP_MELEE_DELAY =
             "How long (seconds) a body killed by a melee swing waits before it falls, so the "
             .. "swing lands first. Spells are not delayed."
+        BENILLA_TOOLTIP_RAGDOLL_STIFFNESS =
+            "How stiffly a body's joints hold as it falls. Low lets limbs flop and swing; high keeps "
+            .. "the pose it died in, short of a frozen body's."
 
         BENILLA_TOOLTIP_BODY_SIZE =
             "The size of the chest that Body Physics moves, on female characters."
@@ -93,7 +96,7 @@
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
             BENILLA_OPTIONS_PAGE_ROWS.Physics = {
                 "RowBlood", "RowGoreAmount", "RowBloodStains", "RowDismemberment", "RowDismemberAmount",
-                "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay",
+                "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay", "RowStiffness",
                 "RowCloakPhysics", "RowCloakMotion",
                 "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize", "RowBodyRearSize",
                 "RowWeaponMotion", "RowFootPlanting", "RowOmniMovement",
@@ -243,10 +246,21 @@
                     BenillaOptionsSliderRow_Setup(this, 0, 1, 0.05)
                 </OnLoad></Scripts>
             </Frame>
-            <Frame name="$parentRowCloakPhysics" inherits="BenillaOptionsCheckboxRowTemplate">
+            <Frame name="$parentRowStiffness" inherits="BenillaOptionsSliderRowTemplate">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="$parentRowMeleeDelay" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                     <Anchor point="TOPRIGHT" relativeTo="$parentRowMeleeDelay" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "ragdollStiffness", "Ragdoll Stiffness",
+                        "BENILLA_TOOLTIP_RAGDOLL_STIFFNESS")
+                    BenillaOptionsSliderRow_Setup(this, 0, 1, 0.1)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowCloakPhysics" inherits="BenillaOptionsCheckboxRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowStiffness" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowStiffness" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                 </Anchors>
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "cloakPhysics", "Cloak Physics",

@@ -21,6 +21,7 @@ fidelity to the 1.12.1 reference client. This fork deliberately adds features 1.
 | Physics ragdolls on death | `life`, `rig` | always on (`WOW_NO_RAGDOLL=1` disables) |
 | Death push and lift scaled by the killing blow | `blow`, `life` | `ragdollPush`, `ragdollLift`, `ragdollSpellPush` |
 | Melee kills wait for the swing to land | `life` | `ragdollMeleeDelay` |
+| How stiffly ragdoll joints hold | `life` | `ragdollStiffness` |
 | Players shove corpses | `pusher` | always |
 | Loot sack where the server's corpse is | `lootbag` | always |
 | Flung ragdolls stay drawn | `bounds` | always |
@@ -282,6 +283,7 @@ The page's rows, in order:
 | Death Lift | `ragdollLift` | 0–10 | 1 |
 | Spell Push | `ragdollSpellPush` | 0.5–10 | 2 |
 | Melee Death Delay | `ragdollMeleeDelay` | 0–1 s, step 0.05 | 0.3 |
+| Ragdoll Stiffness | `ragdollStiffness` | 0–1, step 0.1 | 0.5 |
 | Cloak Physics | `cloakPhysics` | box | 1 |
 | Cloak Motion | `cloakMotion` | 0–3 | 1 |
 | Loose Cloak When Armed | `cloakLooseDrawn` | box | 1 |
@@ -339,8 +341,12 @@ added here.
 ### `life.rs` (ragdoll lifecycle)
 - `SeenAlive` marks units seen alive. Only those ragdoll. A unit that streams in already dead
   keeps its stock Death pose.
-- `start_ragdolls` (Update) creates bodies at the current pose, joints with `SWING_LIMIT 55°`
-  and `TWIST_LIMIT 20°`, and the death push and lift:
+- `start_ragdolls` (Update) creates bodies at the current pose, joints, and the death push and
+  lift. **Stiffness** (`ragdollStiffness`, s in 0–1, default 0.5) sets each joint: its rest is
+  the bind direction slerped by s toward the pose the unit died in, and the swing limit, twist
+  limit and angular damping lerp from `(55°, 20°, 4)` at 0 to `(8°, 3°, 30)` at 1. Mathieu found
+  the old fixed 55°/20° about the bind pose floppy, limbs bending wrong ways, and asked for
+  stiffer, short of frost. Death push and lift:
   - push = `DEATH_PUSH` plus `BLOW_PUSH` × the killing blow's share of health, capped by
     `MAX_PUSH`, × `ragdollPush`;
   - lift works the same way with `ragdollLift`;

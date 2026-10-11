@@ -789,6 +789,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0.3",
         "benilla's own — 1.12 ragdolls nothing, so it delays nothing",
     ),
+    // benilla's own: the Physics page's Ragdoll Stiffness slider, 0 floppy to 1 near rigid.
+    ours(
+        "ragdollStiffness",
+        "0.5",
+        "benilla's own — 1.12 ragdolls nothing",
+    ),
     // benilla's own: the Physics page's Body Physics slider, 0 off.
     ours(
         "bodyPhysics",

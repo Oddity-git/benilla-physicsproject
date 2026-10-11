@@ -18,11 +18,16 @@ use crate::creature_anim::AnimDriver;
 use crate::entities::mount::MountBody;
 use crate::net::{GuidIndex, NetEntity, ObjectStore};
 
-/// Joint limits about the bind pose: how far a limb may swing off its bind direction, and twist.
-const SWING_LIMIT: f32 = 55.0_f32.to_radians();
-const TWIST_LIMIT: f32 = 20.0_f32.to_radians();
-/// Damping of each joint's relative spin, so limbs stop swinging instead of sloshing.
-const JOINT_DAMPING: f32 = 4.0;
+/// Joint limits at Ragdoll Stiffness 0, and at 1: how far a limb may swing off its rest direction,
+/// and twist. Stiffness moves the rest from the bind pose toward the pose the unit died in, so a
+/// stiff body keeps its shape and no limb bends far against it.
+const SWING_LIMIT: (f32, f32) = (55.0_f32.to_radians(), 8.0_f32.to_radians());
+const TWIST_LIMIT: (f32, f32) = (20.0_f32.to_radians(), 3.0_f32.to_radians());
+/// Damping of each joint's relative spin at Stiffness 0 and 1, so limbs stop swinging instead of
+/// sloshing.
+const JOINT_DAMPING: (f32, f32) = (4.0, 30.0);
+/// Ragdoll Stiffness when the slider is unread.
+const STIFFNESS: f32 = 0.5;
 /// Each body's own damping: a little air drag on its spin and fall.
 const BODY_ANGULAR_DAMPING: f32 = 0.8;
 const BODY_LINEAR_DAMPING: f32 = 0.1;
@@ -407,6 +412,10 @@ fn start_ragdolls(
                 (DEATH_LIFT + BLOW_LIFT * blow_share).min(MAX_LIFT) * lift_scale,
             ),
         };
+        let stiffness = cvars
+            .as_deref()
+            .and_then(|c| c.num("ragdollStiffness"))
+            .map_or(STIFFNESS, |v| v.clamp(0.0, 1.0));
         // A heavy killing blow takes limbs off, when the option allows.
         let severed = if dismember && knock.is_none() && !frozen {
             // The Dismemberment Amount slider makes a lighter blow count as a heavier one.
@@ -504,12 +513,19 @@ fn start_ragdolls(
             let (parent_at, parent_rot) = isos[p];
             let anchor1 = parent_rot.inverse() * (isos[k].0 - parent_at);
             let basis = Quat::from_rotation_arc(Vec3::Y, body.segment / body.segment.length());
-            // Frozen, the joint's rest is the pose it died in, held all but rigid.
+            // Frozen, the joint's rest is the pose it died in, held all but rigid; else partway
+            // there by the stiffness.
+            let died = (parent_rot.inverse() * isos[k].1 * basis).normalize();
             let (basis1, swing, twist, damping) = if frozen {
-                let rest = (parent_rot.inverse() * isos[k].1 * basis).normalize();
-                (rest, FROZEN_LIMIT, FROZEN_LIMIT, FROZEN_DAMPING)
+                (died, FROZEN_LIMIT, FROZEN_LIMIT, FROZEN_DAMPING)
             } else {
-                (basis, SWING_LIMIT, TWIST_LIMIT, JOINT_DAMPING)
+                let lerp = |(lo, hi): (f32, f32)| lo + (hi - lo) * stiffness;
+                (
+                    basis.slerp(died, stiffness).normalize(),
+                    lerp(SWING_LIMIT),
+                    lerp(TWIST_LIMIT),
+                    lerp(JOINT_DAMPING),
+                )
             };
             commands.spawn((
                 Name::new("ragdoll joint"),
