@@ -82,11 +82,22 @@ const HIP_LOWEST: f32 = 0.35;
 const REAR_BELOW: f32 = 0.15;
 const REAR_ABOVE: f32 = 0.12;
 /// The rear's tips lie between these shares of the hip's distance from the centre, and its
-/// radius is at least this share of that distance: the most backward vertices can sit close
-/// together by the cleft, which would leave each side too small to see.
+/// radius is this share of the height: the tips' spread and the hip's width vary too much by
+/// race (a dwarf's wide hips, a night elf's narrow ones) to size it.
 const REAR_INNER: f32 = 0.5;
 const REAR_OUTER: f32 = 1.4;
-const REAR_MIN_RADIUS: f32 = 0.9;
+const REAR_RADIUS: f32 = 0.055;
+/// How far each part's weight reaches up and down against its reach outward: the chest's
+/// reaches further up so it slopes from the collar instead of standing as a ball, the rear's
+/// less so it stays off the waist and thighs.
+const CHEST_REACH_UP: f32 = 2.0;
+const REAR_REACH_VERTICAL: f32 = 0.7;
+/// The share of each size step taken across and up and down: a part grows mostly outward, so
+/// it neither balloons upward to the neck nor widens the waist.
+const CHEST_GROW_ACROSS: f32 = 0.7;
+const CHEST_GROW_VERTICAL: f32 = 0.5;
+const REAR_GROW_ACROSS: f32 = 0.35;
+const REAR_GROW_VERTICAL: f32 = 0.5;
 /// The rear's spring, against the chest's: its frequency (Hz) and damping ratio, the share of the
 /// body's motion it lags, the share of the chest's furthest stray, and the most of a vertex its
 /// bone takes, so the hips and thighs still bend it.
@@ -578,7 +589,7 @@ fn find_body(
                 true,
             )
             .map(|pair| Pair {
-                radius: pair.radius.max(REAR_MIN_RADIUS * hip_x),
+                radius: REAR_RADIUS * height,
                 ..pair
             })
         });
@@ -662,10 +673,17 @@ fn reweight(
         let near = lobes.iter().enumerate().filter_map(|(i, lobe)| {
             // Only its outer side: nothing deeper into the body than a fifth of the radius past
             // the centre.
-            if (p - lobe.centre).dot(lobe.out) < -0.2 * lobe.radius {
+            let deepest = if lobe.rear { 0.0 } else { -0.2 };
+            if (p - lobe.centre).dot(lobe.out) < deepest * lobe.radius {
                 return None;
             }
-            let t = 1.0 - p.distance(lobe.centre) / (REACH * lobe.radius);
+            let mut d = p - lobe.centre;
+            if lobe.rear {
+                d.y /= REAR_REACH_VERTICAL;
+            } else if d.y > 0.0 {
+                d.y /= CHEST_REACH_UP;
+            }
+            let t = 1.0 - d.length() / (REACH * lobe.radius);
             let most = if lobe.rear { REAR_WEIGHT } else { 1.0 };
             (t > 0.0).then_some((i, t * t * (3.0 - 2.0 * t) * most))
         });
@@ -710,6 +728,18 @@ fn reweight(
         VertexAttributeValues::Float32x4(weights),
     );
     Some(copy)
+}
+
+/// The scale for a size: the full step outward (along Z, front or back), less across and up and
+/// down.
+fn grow(size: f32, rear: bool) -> Vec3 {
+    let (across, vertical) = if rear {
+        (REAR_GROW_ACROSS, REAR_GROW_VERTICAL)
+    } else {
+        (CHEST_GROW_ACROSS, CHEST_GROW_VERTICAL)
+    };
+    let step = size - 1.0;
+    Vec3::new(1.0 + step * across, 1.0 + step * vertical, size)
 }
 
 /// Writes each sway's slot: the unit's rows, then the spring bones, and keeps the copies on
@@ -808,7 +838,7 @@ fn pose_sways(
             let shown = side.offset - out * into;
             // Sized about the centre at bind, then carried and swayed.
             let sized = Affine3A::from_translation(lobe.centre)
-                * Affine3A::from_scale(Vec3::splat(size))
+                * Affine3A::from_scale(grow(size, lobe.rear))
                 * Affine3A::from_translation(-lobe.centre);
             let bone = Affine3A::from_translation(shown) * Affine3A::from_mat4(carrier) * sized;
             worlds.push(GlobalTransform::from(bone));

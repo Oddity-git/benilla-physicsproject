@@ -455,16 +455,24 @@ Do not describe this one in the README (section 2).
      log says why with `warn!` and the model is left alone.
 - **Rear finding** (same function, `find_body`):
   1. The hip is the highest leg root: a bone with |x| > 0.02 × height, at least 2 descendants,
-     at least 0.35 H under the shoulder, whose chain reaches within 0.15 H of the ground.
+     at least 0.15 H under the shoulder, whose chain reaches within 0.15 H of the ground. A hip
+     under 0.35 H off the ground is refused (`HIP_LOWEST`). At 0.35 H under the shoulder the real
+     hip was skipped and the knee taken for it.
   2. Search the band from hip − 0.15 H to hip + 0.12 H.
-  3. A tip is the most backward vertex (max z) on each side with |x| between 0.1 and 1.2 of the
+  3. A tip is the most backward vertex (max z) on each side with |x| between 0.5 and 1.4 of the
      hip's x. The same checks as the chest apply (`find_pair`).
+  4. The radius is `REAR_RADIUS 0.055 × H`, not the tips' spread. Sizing it from the spread or
+     the hip's width left human and night elf rears too small and swelled a dwarf's waist.
   The chest and the rear are found independently, so a model can get one without the other. Each
   failure is logged as `body physics: <name>: no chest|rear: <why>`.
 - Each found pair gives two `Lobe`s (centre, outward direction, radius, rear flag). `reweight`
   moves each vertex near a lobe onto that lobe's extra bone (`bones + lobe index`), replacing the
   lightest joint slot and fading out toward `REACH × radius`. Rear lobes take at most
-  `REAR_WEIGHT 0.75` of a vertex, so the hips and thighs still bend it.
+  `REAR_WEIGHT 0.75` of a vertex, so the hips and thighs still bend it. The distance is
+  stretched per axis: the chest's reaches `CHEST_REACH_UP 2` further upward so it slopes from
+  the collar (Mathieu found the orc chest a harsh ball), and the rear's reaches only
+  `REAR_REACH_VERTICAL 0.7` up and down and takes nothing deeper than its centre, to stay off the
+  waist and thighs.
 - Carriers: a chest lobe rides its heaviest original bone. A rear lobe rides the root-most of
   its heavy bones (the pelvis rather than a thigh), so a stride does not swing it.
 - The copy slot has `bones + lobes` rows (2 or 4) with identity ibp. Its rows are the unit's own
@@ -476,8 +484,10 @@ Do not describe this one in the README (section 2).
   component pointing into the body (against the lobe's outward direction, −Z for the chest and +Z
   for the rear, carried by the bone) is dropped.** Without that the chest flattened when running
   forward.
-- Bone matrix: `T(shown) · carrier · T(c) · S(size) · T(−c)`, where size is `bodySize` for the
-  chest and `bodyRearSize` for the rear.
+- Bone matrix: `T(shown) · carrier · T(c) · S(grow) · T(−c)`, where size is `bodySize` for the
+  chest and `bodyRearSize` for the rear, and `grow` takes the full size step along Z (outward)
+  but only part of it across and vertically: chest 0.7 and 0.5, rear 0.35 and 0.5. A uniform scale
+  ballooned the chest toward the neck and widened the rear around the waist.
 - Rebuilds on re-dress (6.2). Removing a chest item on orcs and dwarves used to break it.
 - Logs `body physics: …`.
 
