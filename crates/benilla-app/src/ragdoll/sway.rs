@@ -1,14 +1,18 @@
 //! Fork: soft body sway on female units, behind the Physics page's Body Physics slider
-//! (`bodyPhysics`, 0 off), sized by the Chest Size slider (`bodySize`).
+//! (`bodyPhysics`, 0 off), sized by the Chest Size and Rear Size sliders (`bodySize`,
+//! `bodyRearSize`).
 //!
-//! The chest has no bone of its own, so each near female unit's skinned parts that carry it are
-//! drawn as copies on a second palette slot with two bones more than the unit's: every row the
-//! unit's own, plus one per side that is the bone carrying that side, moved by a damped spring
-//! that lags the body's motion. The copies' chest vertices are re-weighted onto those two bones,
-//! fading out toward the edge. The chest is found from the bind pose: the highest arm root (a
-//! bone off the centre with a long chain under it) sets the shoulder height, and the most forward
-//! vertex each side in the band under it is a tip. A model where that finds no matching pair is
-//! left alone, and the log says why.
+//! The chest and the rear have no bones of their own, so each near female unit's skinned parts
+//! that carry them are drawn as copies on a second palette slot with a bone more than the unit's
+//! per soft part: every row the unit's own, plus one per part that is the bone carrying it, moved
+//! by a damped spring that lags the body's motion. The copies' vertices near each part are
+//! re-weighted onto its bone, fading out toward the edge. The parts are found from the bind pose:
+//! the highest arm root (a bone off the centre with a long chain under it) sets the shoulder
+//! height, and the most forward vertex each side in the band under it is a chest tip; the highest
+//! leg root (a bone off the centre whose chain reaches the ground) sets the hip height, and the
+//! most backward vertex each side in the band about it is a rear tip. The rear's spring is
+//! stiffer and strays less, so it bounces less. A pair that is not found is left alone, and the
+//! log says why.
 
 use bevy::asset::AssetId;
 use bevy::camera::visibility::{NoFrustumCulling, VisibilitySystems};
@@ -65,6 +69,27 @@ const MIN_SIZE: f32 = 0.5;
 const MAX_SIZE: f32 = 2.5;
 /// A jump of the anchor past this (yd) in one frame is a teleport: the spring starts over.
 const TELEPORT: f32 = 2.0;
+/// A leg root is off the centre by this share of the height, with this many bones under it, sits
+/// this share of the height under the shoulder, and its chain reaches this share of the height
+/// from the ground.
+const LEG_OFF_CENTRE: f32 = 0.02;
+const LEG_CHAIN: usize = 2;
+const LEG_UNDER_SHOULDER: f32 = 0.35;
+const LEG_REACH: f32 = 0.15;
+/// The band searched for the rear's tips, under and over the hip, as shares of the height.
+const REAR_BELOW: f32 = 0.15;
+const REAR_ABOVE: f32 = 0.12;
+/// The rear's tips lie between these shares of the hip's distance from the centre.
+const REAR_INNER: f32 = 0.1;
+const REAR_OUTER: f32 = 1.2;
+/// The rear's spring, against the chest's: its frequency (Hz) and damping ratio, the share of the
+/// body's motion it lags, the share of the chest's furthest stray, and the most of a vertex its
+/// bone takes, so the hips and thighs still bend it.
+const REAR_FREQUENCY: f32 = 7.0;
+const REAR_DAMPING: f32 = 0.3;
+const REAR_LAG: f32 = 0.5;
+const REAR_STRAY: f32 = 0.5;
+const REAR_WEIGHT: f32 = 0.75;
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<Sways>()
@@ -100,14 +125,13 @@ struct Sway {
     parts: Vec<(Entity, AssetId<Mesh>)>,
     copies: Vec<(Entity, Entity, Handle<Mesh>)>,
     bones: usize,
-    sides: [Side; 2],
-    radius: f32,
+    sides: Vec<Side>,
 }
 
-/// One side's spring: the bone carrying it, its centre at bind, and the lag.
+/// One soft part's spring: the bone carrying it, the part at bind, and the lag.
 struct Side {
     carrier: usize,
-    centre: Vec3,
+    lobe: Lobe,
     last: Option<Vec3>,
     offset: Vec3,
     velocity: Vec3,
@@ -131,10 +155,26 @@ type BodyPart = (
     Option<&'static ModelPart>,
 );
 
-/// The bind-pose chest a rig's parts show: per side the tip, and the radius.
-struct Chest {
+/// A pair of soft parts at bind: per side the tip, and the radius.
+struct Pair {
     tips: [Vec3; 2],
     radius: f32,
+}
+
+/// What a rig's parts show at bind: the chest and the rear, each found or why not.
+struct Body {
+    chest: Result<Pair, &'static str>,
+    rear: Result<Pair, &'static str>,
+}
+
+/// One soft part at bind: its centre, the way out of the body, its radius, and whether it is
+/// the rear.
+#[derive(Clone, Copy)]
+struct Lobe {
+    centre: Vec3,
+    out: Vec3,
+    radius: f32,
+    rear: bool,
 }
 
 /// Picks the nearest female units to sway, builds their copies, and drops the rest.
@@ -286,7 +326,7 @@ fn manage_sways(
         }
         let name = name.map_or_else(|| format!("{rig}"), |n| n.as_str().to_owned());
         let pivots = bind_pivots(pose);
-        let chest = {
+        let body = {
             let positions: Vec<&[[f32; 3]]> = stocks
                 .iter()
                 .filter_map(
@@ -296,48 +336,86 @@ fn manage_sways(
                     },
                 )
                 .collect();
-            find_chest(&positions, &pivots, &pose.parents)
+            find_body(&positions, &pivots, &pose.parents)
         };
-        let chest = match chest {
-            Ok(chest) => chest,
+        let body = match body {
+            Ok(body) => body,
             Err(why) => {
                 warn!("body physics: {name} left as is: {why}");
                 sways.failed.insert(rig, part_ids.clone());
                 continue;
             }
         };
+        // Each pair found gives a part per side, the chest first.
+        let mut lobes: Vec<Lobe> = Vec::new();
+        for (pair, rear, what) in [(&body.chest, false, "chest"), (&body.rear, true, "rear")] {
+            let pair = match pair {
+                Ok(pair) => pair,
+                Err(why) => {
+                    warn!("body physics: {name}: no {what}: {why}");
+                    continue;
+                }
+            };
+            let out = if rear { Vec3::Z } else { Vec3::NEG_Z };
+            for tip in pair.tips {
+                lobes.push(Lobe {
+                    centre: tip - out * (CENTRE_DEPTH * pair.radius),
+                    out,
+                    radius: pair.radius,
+                    rear,
+                });
+            }
+        }
+        if lobes.is_empty() {
+            sways.failed.insert(rig, part_ids.clone());
+            continue;
+        }
         let bones = skin.bones() as usize;
-        let radius = chest.radius;
-        let centres = chest.tips.map(|t| t + Vec3::Z * (CENTRE_DEPTH * radius));
-        // The copies: each part with chest vertices, re-weighted onto the two new bones.
+        // The copies: each part with vertices near a soft part, re-weighted onto the new bones.
         let mut built: Vec<(Entity, Mesh)> = Vec::new();
-        let mut carried = [HashMap::<u16, f32>::new(), HashMap::<u16, f32>::new()];
+        let mut carried = vec![HashMap::<u16, f32>::new(); lobes.len()];
         for (part, handle) in &stocks {
             let Some(stock) = meshes.get(handle) else {
                 continue;
             };
-            if let Some(copy) = reweight(stock, &centres, radius, bones, &mut carried) {
+            if let Some(copy) = reweight(stock, &lobes, bones, &mut carried) {
                 built.push((*part, copy));
             }
         }
         if built.is_empty() {
-            warn!("body physics: {name} left as is: no vertices near the chest");
+            warn!("body physics: {name} left as is: no vertices near the chest or rear");
             sways.failed.insert(rig, part_ids.clone());
             continue;
         }
-        let carrier = |side: &HashMap<u16, f32>| {
+        // The chest rides its heaviest bone; the rear the root-most of its heavy ones (the pelvis
+        // over a thigh), so a stride does not swing it.
+        let under = bones_under(&pose.parents, pivots.len());
+        let carrier = |side: &HashMap<u16, f32>, rear: bool| {
+            let heaviest = side.values().copied().fold(0.0, f32::max);
+            let rank = |bone: &u16| under.get(*bone as usize).copied().unwrap_or(0);
             side.iter()
-                .max_by(|a, b| a.1.total_cmp(b.1))
+                .filter(|(_, &w)| !rear || w >= 0.25 * heaviest)
+                .max_by(|a, b| {
+                    if rear {
+                        rank(a.0).cmp(&rank(b.0)).then(a.1.total_cmp(b.1))
+                    } else {
+                        a.1.total_cmp(b.1)
+                    }
+                })
                 .map_or(0, |(&bone, _)| bone as usize)
         };
-        let sides = [0, 1].map(|s| Side {
-            carrier: carrier(&carried[s]),
-            centre: centres[s],
-            last: None,
-            offset: Vec3::ZERO,
-            velocity: Vec3::ZERO,
-        });
-        let total = bones as u32 + 2;
+        let sides: Vec<Side> = lobes
+            .iter()
+            .zip(&carried)
+            .map(|(lobe, side)| Side {
+                carrier: carrier(side, lobe.rear),
+                lobe: *lobe,
+                last: None,
+                offset: Vec3::ZERO,
+                velocity: Vec3::ZERO,
+            })
+            .collect();
+        let total = (bones + sides.len()) as u32;
         let ibp = sways
             .ibps
             .entry(total)
@@ -352,12 +430,11 @@ fn manage_sways(
             continue;
         };
         info!(
-            "body physics: {name}: {} parts, radius {:.3}, tips {:?}, carriers {} {}",
+            "body physics: {name}: {} parts, chest {}, rear {}, carriers {:?}",
             built.len(),
-            radius,
-            chest.tips,
-            sides[0].carrier,
-            sides[1].carrier
+            body.chest.is_ok(),
+            body.rear.is_ok(),
+            sides.iter().map(|s| s.carrier).collect::<Vec<_>>()
         );
         let slot = own.slot;
         let holder = commands
@@ -398,7 +475,6 @@ fn manage_sways(
                 copies,
                 bones,
                 sides,
-                radius,
             },
         );
     }
@@ -415,34 +491,51 @@ fn bind_pivots(pose: &RigPose) -> Vec<Vec3> {
     pivots
 }
 
-/// The chest at bind: the shoulder height from the highest arm root, then each side's most
-/// forward vertex (Bevy's front is −Z) in the band under it, between the centre and the arm.
-fn find_chest(
+/// How many bones are under each bone.
+fn bones_under(parents: &[i16], n: usize) -> Vec<usize> {
+    let mut under = vec![0usize; n];
+    for i in (0..n).rev() {
+        if let Some(p) = parent_of(parents, i) {
+            under[p] += under[i] + 1;
+        }
+    }
+    under
+}
+
+/// Bone `i`'s parent, when it comes before it.
+fn parent_of(parents: &[i16], i: usize) -> Option<usize> {
+    parents
+        .get(i)
+        .and_then(|&p| usize::try_from(p).ok())
+        .filter(|&p| p < i)
+}
+
+/// The chest and the rear at bind. The chest: the shoulder height from the highest arm root, then
+/// each side's most forward vertex (Bevy's front is −Z) in the band under it, between the centre
+/// and the arm. The rear: the hip height from the highest leg root, then each side's most backward
+/// vertex in the band about it.
+fn find_body(
     positions: &[&[[f32; 3]]],
     pivots: &[Vec3],
     parents: &[i16],
-) -> Result<Chest, &'static str> {
-    let all = || {
-        positions
-            .iter()
-            .flat_map(|p| p.iter())
-            .map(|&v| Vec3::from(v))
-    };
-    let top = all().map(|v| v.y).fold(f32::MIN, f32::max);
-    let bottom = all().map(|v| v.y).fold(f32::MAX, f32::min);
+) -> Result<Body, &'static str> {
+    let all: Vec<Vec3> = positions
+        .iter()
+        .flat_map(|p| p.iter())
+        .map(|&v| Vec3::from(v))
+        .collect();
+    let top = all.iter().map(|v| v.y).fold(f32::MIN, f32::max);
+    let bottom = all.iter().map(|v| v.y).fold(f32::MAX, f32::min);
     let height = top - bottom;
     if !height.is_finite() || height <= 0.0 {
         return Err("no vertices");
     }
-    // Bones under each bone.
-    let mut under = vec![0usize; pivots.len()];
+    let under = bones_under(parents, pivots.len());
+    // The lowest pivot in each bone's chain.
+    let mut lowest: Vec<f32> = pivots.iter().map(|p| p.y).collect();
     for i in (0..pivots.len()).rev() {
-        if let Some(p) = parents
-            .get(i)
-            .and_then(|&p| usize::try_from(p).ok())
-            .filter(|&p| p < i)
-        {
-            under[p] += under[i] + 1;
+        if let Some(p) = parent_of(parents, i) {
+            lowest[p] = lowest[p].min(lowest[i]);
         }
     }
     let shoulder = (0..pivots.len())
@@ -450,15 +543,48 @@ fn find_chest(
         .max_by(|&a, &b| pivots[a].y.total_cmp(&pivots[b].y))
         .ok_or("no arm found")?;
     let (shoulder_y, shoulder_x) = (pivots[shoulder].y, pivots[shoulder].x.abs());
-    let band = (shoulder_y - BAND * height)..=shoulder_y;
+    let chest = find_pair(
+        &all,
+        (shoulder_y - BAND * height)..=shoulder_y,
+        shoulder_x * INNER..=shoulder_x * OUTER,
+        false,
+    );
+    let rear = (0..pivots.len())
+        .filter(|&i| {
+            pivots[i].x.abs() > LEG_OFF_CENTRE * height
+                && under[i] >= LEG_CHAIN
+                && pivots[i].y < shoulder_y - LEG_UNDER_SHOULDER * height
+                && lowest[i] < bottom + LEG_REACH * height
+        })
+        .max_by(|&a, &b| pivots[a].y.total_cmp(&pivots[b].y))
+        .ok_or("no leg found")
+        .and_then(|hip| {
+            let (hip_y, hip_x) = (pivots[hip].y, pivots[hip].x.abs());
+            find_pair(
+                &all,
+                (hip_y - REAR_BELOW * height)..=(hip_y + REAR_ABOVE * height),
+                hip_x * REAR_INNER..=hip_x * REAR_OUTER,
+                true,
+            )
+        });
+    Ok(Body { chest, rear })
+}
+
+/// A pair in `band` (heights): each side's vertex standing furthest out of the body (forward, or
+/// back for the rear) at a distance from the centre in `span`, the two matching and standing out
+/// from the band's middle depth.
+fn find_pair(
+    all: &[Vec3],
+    band: std::ops::RangeInclusive<f32>,
+    span: std::ops::RangeInclusive<f32>,
+    rear: bool,
+) -> Result<Pair, &'static str> {
+    let out = |v: &Vec3| if rear { v.z } else { -v.z };
     let tip = |sign: f32| {
-        all()
-            .filter(|v| band.contains(&v.y))
-            .filter(|v| {
-                let x = v.x * sign;
-                x >= INNER * shoulder_x && x <= OUTER * shoulder_x
-            })
-            .min_by(|a, b| a.z.total_cmp(&b.z))
+        all.iter()
+            .filter(|v| band.contains(&v.y) && span.contains(&(v.x * sign)))
+            .max_by(|a, b| out(a).total_cmp(&out(b)))
+            .copied()
     };
     let (Some(left), Some(right)) = (tip(1.0), tip(-1.0)) else {
         return Err("no tips in the band");
@@ -471,28 +597,30 @@ fn find_chest(
     if (left.y - right.y).abs() > 0.3 * radius || (left.z - right.z).abs() > 0.3 * radius {
         return Err("the tips do not match");
     }
-    // The tips must stand out from the band's middle depth.
-    let mut depths: Vec<f32> = all().filter(|v| band.contains(&v.y)).map(|v| v.z).collect();
+    let mut depths: Vec<f32> = all
+        .iter()
+        .filter(|v| band.contains(&v.y))
+        .map(out)
+        .collect();
     depths.sort_by(f32::total_cmp);
     let middle = depths[depths.len() / 2];
-    if left.z.max(right.z) > middle - 0.3 * radius {
+    if out(&left).min(out(&right)) < middle + 0.3 * radius {
         return Err("the tips do not stand out");
     }
-    Ok(Chest {
+    Ok(Pair {
         tips: [left, right],
         radius,
     })
 }
 
-/// The stock mesh with its chest vertices re-weighted onto bone `bones` (the +X side) and
-/// `bones + 1`, the weight fading from the centre; each side's old bones are summed into
-/// `carried` by that weight. `None` when no vertex is near.
+/// The stock mesh with each vertex near a soft part re-weighted onto that part's bone (`bones`
+/// plus its index in `lobes`), the weight fading from the centre; each part's old bones are summed
+/// into `carried` by that weight. `None` when no vertex is near.
 fn reweight(
     stock: &Mesh,
-    centres: &[Vec3; 2],
-    radius: f32,
+    lobes: &[Lobe],
     bones: usize,
-    carried: &mut [HashMap<u16, f32>; 2],
+    carried: &mut [HashMap<u16, f32>],
 ) -> Option<Mesh> {
     let Some(VertexAttributeValues::Float32x3(positions)) =
         stock.attribute(Mesh::ATTRIBUTE_POSITION)
@@ -512,21 +640,23 @@ fn reweight(
         return None;
     }
     let (mut joints, mut weights) = (joints.clone(), weights.clone());
-    let reach = REACH * radius;
     let mut any = false;
     for (v, p) in positions.iter().enumerate() {
         let p = Vec3::from(*p);
-        let side = if p.x >= 0.0 { 0 } else { 1 };
-        let centre = centres[side];
-        // Only the front: nothing behind the centre's depth past a fifth of the radius.
-        if p.z > centre.z + 0.2 * radius {
+        // The part weighing this vertex most.
+        let near = lobes.iter().enumerate().filter_map(|(i, lobe)| {
+            // Only its outer side: nothing deeper into the body than a fifth of the radius past
+            // the centre.
+            if (p - lobe.centre).dot(lobe.out) < -0.2 * lobe.radius {
+                return None;
+            }
+            let t = 1.0 - p.distance(lobe.centre) / (REACH * lobe.radius);
+            let most = if lobe.rear { REAR_WEIGHT } else { 1.0 };
+            (t > 0.0).then_some((i, t * t * (3.0 - 2.0 * t) * most))
+        });
+        let Some((lobe, w)) = near.max_by(|a, b| a.1.total_cmp(&b.1)) else {
             continue;
-        }
-        let t = 1.0 - p.distance(centre) / reach;
-        if t <= 0.0 {
-            continue;
-        }
-        let w = t * t * (3.0 - 2.0 * t);
+        };
         if w < 0.01 {
             continue;
         }
@@ -534,7 +664,7 @@ fn reweight(
         let (js, ws) = (&mut joints[v], &mut weights[v]);
         for k in 0..4 {
             if ws[k] > 0.0 {
-                *carried[side].entry(js[k]).or_default() += ws[k] * w;
+                *carried[lobe].entry(js[k]).or_default() += ws[k] * w;
             }
         }
         // The lightest slot takes the new bone; the rest share what is left.
@@ -549,7 +679,7 @@ fn reweight(
                 };
             }
         }
-        js[slot] = (bones + side) as u16;
+        js[slot] = (bones + lobe) as u16;
         ws[slot] = if rest > 0.0 { w } else { 1.0 };
     }
     if !any {
@@ -567,7 +697,7 @@ fn reweight(
     Some(copy)
 }
 
-/// Writes each sway's slot: the unit's rows, then the two spring bones, and keeps the copies on
+/// Writes each sway's slot: the unit's rows, then the spring bones, and keeps the copies on
 /// the stock parts' material and tag.
 #[allow(clippy::too_many_arguments)] // one Bevy system's resources
 fn pose_sways(
@@ -589,9 +719,12 @@ fn pose_sways(
         .and_then(|c| c.num("bodySize"))
         .unwrap_or(1.0)
         .clamp(MIN_SIZE, MAX_SIZE);
+    let rear_size = cvars
+        .as_deref()
+        .and_then(|c| c.num("bodyRearSize"))
+        .unwrap_or(1.0)
+        .clamp(MIN_SIZE, MAX_SIZE);
     let dt = time.delta_secs();
-    let stiffness = (std::f32::consts::TAU * FREQUENCY).powi(2);
-    let damping = 2.0 * DAMPING * stiffness.sqrt();
     let sways = &mut *sways;
     for (rig, sway) in sways.live.iter_mut() {
         let (Ok(unit), Ok(own)) = (rigs.get(*rig), rigs.get(sway.holder)) else {
@@ -606,22 +739,36 @@ fn pose_sways(
         if rows.len() < sway.bones {
             continue;
         }
-        let limit = MAX_OFFSET * sway.radius * amount;
         let mut worlds: Vec<GlobalTransform> = rows
             .iter()
             .map(|m| GlobalTransform::from(Affine3A::from_mat4(*m)))
             .collect();
         for side in &mut sway.sides {
+            let lobe = side.lobe;
+            let (frequency, ratio, lag, stray, size) = if lobe.rear {
+                (
+                    REAR_FREQUENCY,
+                    REAR_DAMPING,
+                    REAR_LAG,
+                    REAR_STRAY,
+                    rear_size,
+                )
+            } else {
+                (FREQUENCY, DAMPING, 1.0, 1.0, size)
+            };
+            let stiffness = (std::f32::consts::TAU * frequency).powi(2);
+            let damping = 2.0 * ratio * stiffness.sqrt();
+            let limit = MAX_OFFSET * lobe.radius * amount * stray;
             let carrier = rows.get(side.carrier).copied().unwrap_or(Mat4::IDENTITY);
             // The anchor in the world, kept apart as rig-relative + origin for precision.
-            let rel = carrier.transform_point3(side.centre);
+            let rel = carrier.transform_point3(lobe.centre);
             let moved = side.last.map(|last| rel + origin - last);
             side.last = Some(rel + origin);
             match moved {
                 Some(moved) if moved.length() < TELEPORT && dt > 0.0 => {
                     // The soft part stays where it was while the body moves under it.
                     let moved = Vec3::new(moved.x * HORIZONTAL, moved.y, moved.z * HORIZONTAL);
-                    side.offset -= moved * amount;
+                    side.offset -= moved * amount * lag;
                     let steps = ((dt / STEP).ceil() as u32).clamp(1, MAX_STEPS);
                     let h = dt / steps as f32;
                     for _ in 0..steps {
@@ -639,15 +786,15 @@ fn pose_sways(
                     side.velocity = Vec3::ZERO;
                 }
             }
-            // Never into the body: the part of the lag pressing back against the chest is dropped,
-            // so moving forward does not flatten it.
-            let forward = carrier.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
-            let into = side.offset.dot(forward).min(0.0);
-            let shown = side.offset - forward * into;
+            // Never into the body: the part of the lag pressing back into it is dropped, so moving
+            // forward does not flatten the chest.
+            let out = carrier.transform_vector3(lobe.out).normalize_or_zero();
+            let into = side.offset.dot(out).min(0.0);
+            let shown = side.offset - out * into;
             // Sized about the centre at bind, then carried and swayed.
-            let sized = Affine3A::from_translation(side.centre)
+            let sized = Affine3A::from_translation(lobe.centre)
                 * Affine3A::from_scale(Vec3::splat(size))
-                * Affine3A::from_translation(-side.centre);
+                * Affine3A::from_translation(-lobe.centre);
             let bone = Affine3A::from_translation(shown) * Affine3A::from_mat4(carrier) * sized;
             worlds.push(GlobalTransform::from(bone));
         }

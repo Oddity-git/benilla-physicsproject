@@ -66,6 +66,10 @@
         BENILLA_TOOLTIP_BODY_SIZE =
             "The size of the chest that Body Physics moves, on female characters."
 
+        BENILLA_TOOLTIP_BODY_REAR_SIZE =
+            "The size of the rear that Body Physics moves, on female characters. It bounces "
+            .. "less than the chest."
+
         -- Joins the options window's page loops; run from the page's OnLoad, after its rows.
         function BenillaPhysicsOptions_Register()
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
@@ -73,7 +77,7 @@
                 "RowBlood", "RowGoreAmount", "RowDismemberment", "RowDismemberAmount",
                 "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay",
                 "RowCloakPhysics", "RowCloakMotion",
-                "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize",
+                "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize", "RowBodyRearSize",
             }
         end
     ]]></Script>
@@ -259,6 +263,17 @@
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "bodySize", "Chest Size",
                         "BENILLA_TOOLTIP_BODY_SIZE")
+                    BenillaOptionsSliderRow_Setup(this, 0.5, 2.5, 0.1)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowBodyRearSize" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowBodySize" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowBodySize" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "bodyRearSize", "Rear Size",
+                        "BENILLA_TOOLTIP_BODY_REAR_SIZE")
                     BenillaOptionsSliderRow_Setup(this, 0.5, 2.5, 0.1)
                 </OnLoad></Scripts>
             </Frame>
