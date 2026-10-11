@@ -34,6 +34,7 @@ fidelity to the 1.12.1 reference client. This fork deliberately adds features 1.
 | Cloth cloaks | `cloak` | `cloakPhysics`, `cloakMotion`, `cloakLooseDrawn` |
 | Soft-body sway on female units | `sway` | `bodyPhysics`, `bodySize`, `bodyRearSize` |
 | Stowed weapons jostle while moving | `jostle` | `weaponMotion` |
+| Feet plant on slopes and steps (foot IK) | `feet` | `footPlanting` |
 | Test crate drop | `testbox` | dev chord + `B` |
 
 All of it lives behind the `ragdoll` Cargo feature, which is on by default.
@@ -152,7 +153,8 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
 - `world_plugins.rs`: the `dynamics` feature path and `SubstepCount 8`.
 - `mesh_tag.rs`: `with_rig` made public.
 - `rig_palette.rs`: `rebase_origin`, `rebase_global` and `write_rig_worlds` made public.
-- `rig_anim/pose.rs`: `RigPose::binds` made public.
+- `rig_anim/pose.rs`: `RigPose::binds` and `RigPose::compose` made public (`feet` composes
+  the animated pose before it bends the legs).
 - `rig_rider.rs`: the `RiderTilt` component. `write_rig_riders` appends it to a rider's frame
   (`F × tilt`), so `jostle` can bounce a stowed weapon's rendered model.
 - `straddle.rs` and `zfill.rs`: water twin meshes are spawned before Bevy reads which meshes need
@@ -282,6 +284,7 @@ The page's rows, in order:
 | Chest Size | `bodySize` | 0.5–2.5 | 1 |
 | Rear Size | `bodyRearSize` | 0.5–2.5 | 1 |
 | Weapon Motion | `weaponMotion` | 0–3, 0 off | 1 |
+| Foot Planting | `footPlanting` | 0–1, 0 off | 1 |
 
 Wide slider ranges (up to 10×) are intentional. Mathieu asked for "wacky high settings".
 
@@ -579,6 +582,27 @@ Do not describe this one in the README (section 2).
 - At `weaponMotion` 0 the root goes back to its stock spot once and `RiderTilt` is removed. A
   drawn or swapped item loses `RiderTilt`; the move or rebuild already placed its `Transform`.
 
+### `feet.rs` (foot planting, two-bone IK)
+- Every living unit on foot with a `RigPose` and an `ObjectStore`, within `RANGE 60` yd of the
+  camera, not a ragdoll, not parked, not mounted (`unit_mount_display_id`). Two or more legs needed.
+- **Legs** come from `rig::build_profile`: a body whose segment runs down off one that does not
+  is a hip, its downward body child the knee, and the knee's direct child nearest the knee
+  segment's end the ankle. A quadruped's four legs all count. A rig without legs is remembered in
+  `failed` until its bone count changes.
+- **Ground.** One down-ray under the unit's feet and one under each ankle (`PROBE_UP 1` to
+  `PROBE_DOWN 1.5`), against the decal receivers like `entities/conform.rs`. Each leg's lift is
+  its ground minus the middle's, × `footPlanting`, capped at `MAX_REACH 0.35` of the leg's
+  length. The middle more than `AIRBORNE 0.3` from the feet (jumping, swimming) plants nothing.
+  Only offsets count, so a swinging foot keeps its stride.
+- **Solve.** The hips (the hub bone's local translation) sink by the lowest lift; each leg then
+  bends at the knee to the law-of-cosines angle for its reach and swings from the hip so the
+  ankle meets its goal. The ankle turns `FOOT_TILT 0.6` of the way to the ground's normal, on
+  ground no steeper than `STEEPEST 0.6` (normal y). Lifts and sink ease at `RATE 14`/s.
+- **Writing the pose.** It edits `locals` in `PosePost` and calls `compose` between steps. The
+  evaluator writes only the bones its clips carry, so each frame first puts back the animated
+  local wherever last frame's edit is still standing (`written`), as `creature_anim/twist.rs`
+  does. Without that the edits would pile up frame on frame.
+
 ### `testbox.rs`
 The dev chord + `B` drops a crate model from the install in front of the camera, cycling through
 every `World\Generic` crate and logging which. It proves the solver and colliders independently
@@ -593,7 +617,7 @@ of rigs.
 | Update | `life`: `track_unit_motion → start_ragdolls`; `gore` chain; `dismember`: `build_limb_copies`, `heal_limbs`; `cloak::manage_cloths`; `sway::manage_sways`; `knock`; `hitstop::start_stops`; `shock`: `note_shock_debuffs`, `jolt_shocked`; `frost`/`shock` tints after `apply_aura_tint`; `lootbag` chain; `bounds::fit_bounds` |
 | FixedUpdate | `pusher::follow_players`, `life::release_parted_pairs` |
 | PostUpdate, before animation | `life::reset_getting_up` |
-| PostUpdate, `PosePost` | `life` chain (section 9), `hitstop::hold_stops` |
+| PostUpdate, `PosePost` | `life` chain (section 9), `hitstop::hold_stops`, `feet::plant_feet` |
 | PostUpdate, after `finalize_rig_worlds`, in `BillboardPlace` | `cloak::simulate_cloths`, `sway::pose_sways` |
 | PostUpdate, before `VisibilityPropagate` | `cloak::hide_stock_cloaks`, `sway::hide_stock_parts` |
 | PostUpdate, after `begin_effect_frame` | `gore::push_decals` |

@@ -75,7 +75,8 @@ impl RigPose {
     /// Fold `locals` into `model`, the `flags & 0x7` arm included since the anchors are seated
     /// from it; a model frame is a similarity, so this agrees with the world pass's arm. M2 bones
     /// are parent-sorted; a malformed child whose parent follows it composes from the root.
-    pub(crate) fn compose(&mut self) {
+    /// Fork: public so the foot planting can read the animated pose before it bends the legs.
+    pub fn compose(&mut self) {
         for i in 0..self.locals.len() {
             let local = self.locals[i].compute_affine();
             let parent = match usize::try_from(self.parents[i]).ok().filter(|&p| p < i) {

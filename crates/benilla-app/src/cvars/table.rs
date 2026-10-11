@@ -819,6 +819,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — 1.12 hangs a stowed weapon rigid",
     ),
+    // benilla's own: the Physics page's Foot Planting slider, how far feet follow the ground.
+    ours(
+        "footPlanting",
+        "1",
+        "benilla's own — 1.12 stands a unit on the one height under its middle",
+    ),
     // benilla's own: the Physics page's Cloak Motion slider, how much the cloth cloaks swing.
     ours(
         "cloakMotion",

@@ -10,7 +10,7 @@
 //! limb (`dismember`), as the Dismemberment option allows. A knockdown, the game's own or our kick,
 //! ragdolls a living unit and stands it back up (`knock`). A lightning kill shakes the body in a
 //! seizure (`shock`), and bleed ticks squirt blood (`gore`). Stowed weapons jostle as their wearer
-//! moves (`jostle`). The dev chord + `B` drops a test box (`testbox`).
+//! moves (`jostle`), and feet stand on the ground under each of them (`feet`). The dev chord + `B` drops a test box (`testbox`).
 
 use bevy::prelude::*;
 
@@ -18,6 +18,7 @@ mod blow;
 mod bounds;
 mod cloak;
 mod dismember;
+mod feet;
 mod frost;
 mod gore;
 mod hitstop;
@@ -44,6 +45,7 @@ impl Plugin for RagdollPlugin {
         frost::plugin(app);
         gore::plugin(app);
         hitstop::plugin(app);
+        feet::plugin(app);
         jostle::plugin(app);
         knock::plugin(app);
         life::plugin(app);

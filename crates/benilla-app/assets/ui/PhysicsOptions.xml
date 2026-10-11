@@ -74,6 +74,10 @@
             "How much weapons and shields on the back or hip bounce and sway as their wearer "
             .. "moves. Lowest turns it off."
 
+        BENILLA_TOOLTIP_FOOT_PLANTING =
+            "How much feet follow the ground under each of them on slopes and steps, the hips "
+            .. "sinking and the legs bending to reach. Lowest turns it off."
+
         BENILLA_TOOLTIP_BLOOD_STAINS =
             "How big the blood stains bleeding hits leave on the body are. Lowest turns them off. "
             .. "Blood must be on."
@@ -86,7 +90,7 @@
                 "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay",
                 "RowCloakPhysics", "RowCloakMotion",
                 "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize", "RowBodyRearSize",
-                "RowWeaponMotion",
+                "RowWeaponMotion", "RowFootPlanting",
             }
         end
     ]]></Script>
@@ -306,6 +310,17 @@
                     BenillaOptionsRow_OnLoad(this, "weaponMotion", "Weapon Motion",
                         "BENILLA_TOOLTIP_WEAPON_MOTION")
                     BenillaOptionsSliderRow_Setup(this, 0, 3, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowFootPlanting" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowWeaponMotion" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowWeaponMotion" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "footPlanting", "Foot Planting",
+                        "BENILLA_TOOLTIP_FOOT_PLANTING")
+                    BenillaOptionsSliderRow_Setup(this, 0, 1, 0.25)
                 </OnLoad></Scripts>
             </Frame>
         </Frames>
