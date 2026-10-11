@@ -687,20 +687,9 @@ pub(super) fn attach_entity_visuals(
             };
             // The shown batches spawn as material groups (`merge`).
             let shows = |part: &super::EntityPart| {
-                let shown = visible_geosets
+                visible_geosets
                     .as_ref()
-                    .is_none_or(|vis| vis.contains(&part.geoset_id));
-                // Fork: a cloak's cape geoset (1501+v) replaces the body's own no-cloak back
-                // under-layer (1501), which is safe while the cape never leaves the back. A cloth
-                // cloak (`ragdoll::cloak`) swings off the back, exposing the gap, so keep the
-                // under-layer's skin piece drawn: the cape hides it while it rests, and it fills
-                // the hole where the cloth has moved. Only when the cloak branch fired (a cape
-                // geoset is selected); the player build (no `ragdoll` feature) keeps the reference.
-                #[cfg(feature = "ragdoll")]
-                let shown = shown
-                    || (equip_geosets.cloak.is_some_and(|g| g != 0)
-                        && crate::ragdoll::keeps_back_part(part.geoset_id, part.char_slot));
-                shown
+                    .is_none_or(|vis| vis.contains(&part.geoset_id))
             };
             let groups = merge::guard_groups(merge::group_parts(parts, shows), parts, &char_mats);
             for group in &groups {

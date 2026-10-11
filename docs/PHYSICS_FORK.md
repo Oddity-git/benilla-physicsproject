@@ -136,8 +136,6 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
   `SPURT_SCALE 0.5`, which plays the stock melee spurt at half size.
 - `creature_anim/spell_visual.rs`: lets the loot sparkle attach to the loot sack.
 - `entities/spell_fx/mod.rs`: an effect can be scaled about its point (the gore spurt).
-- `entities/attach/mod.rs`: keeps the body's no-cloak back under-layer (geoset 1501) drawn under a
-  cape (`ragdoll::keeps_back_part`), so a swinging cloth cloak leaves no hole where it moved.
 - `target/mod.rs`: `UnitPickOverride` set, so pointing at a loot sack targets the corpse.
 - `cvars/table.rs`: the fork's CVar rows (section 7).
 - `ui_script/shipped_xml_tests.rs`: lists `PhysicsOptions.xml`.
@@ -438,11 +436,6 @@ own.
   rigid carry by the pinned rows' main bone, so it hangs from the shoulders and not the hips.
 - Only the nearest `MAX_CLOTHS` (10) within `MAX_RANGE` (60) simulate.
 - Copies use a one-bone palette slot (identity rows) because the CPU writes final positions.
-- **Back under-layer.** The body's own no-cloak back skin is geoset 1501, which the cape geoset
-  (1501+v) replaces; the reference can, because its cape never leaves the back. A cloth cloak
-  swings off it, so `entities/attach` keeps 1501's skin piece drawn under the cape
-  (`ragdoll::keeps_back_part`). It sits a few millimetres inside the cape, so the cape hides it
-  while the cloak rests and it fills the hole where the cloth has moved.
 - Logs `cloth cloak: …` once per model.
 
 ### `sway.rs` (soft-body sway)
