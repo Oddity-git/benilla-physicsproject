@@ -16,6 +16,11 @@ pub(crate) struct BodyTwist {
 }
 
 impl BodyTwist {
+    /// Fork: the head key bone, for the physics fork's ragdoll to give the head a body.
+    pub(crate) fn head_bone(&self) -> Option<u16> {
+        self.head.as_ref().map(|c| c.bone)
+    }
+
     pub(crate) fn new(spine: Option<u16>, head: Option<u16>) -> Self {
         Self {
             yaw_gap: 0.0,

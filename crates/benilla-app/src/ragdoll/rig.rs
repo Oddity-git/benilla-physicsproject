@@ -16,6 +16,10 @@ const HUB_SHARE: f32 = 0.75;
 /// of the hub, not a body of its own: a waist bone between the hub and the legs would wobble.
 const HUB_MERGE_NEAR: f32 = 0.05;
 const HUB_MERGE_SHORT: f32 = 0.1;
+/// An added head body runs this share of the height up from the head bone, with a radius this
+/// share of its segment: a head is rounder than a limb.
+const HEAD_SEGMENT: f32 = 0.1;
+const HEAD_RADIUS: f32 = 0.5;
 /// Capsule radius as a fraction of its segment, clamped to a band of the skeleton's height.
 const RADIUS_OF_SEGMENT: f32 = 0.3;
 const RADIUS_MIN: f32 = 0.03;
@@ -193,6 +197,62 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
         });
     }
     Some(Profile { bodies, body_of })
+}
+
+/// The head's own body, from the model's head key bone, when it has none: the neck and head are
+/// shorter than [`MIN_SEGMENT`], so they rode the chest and a severed head was never possible. The
+/// body hangs from the head's nearest bodied ancestor and runs [`HEAD_SEGMENT`] of the height up.
+/// Nothing changes when the head already has a body, a body hangs below it, or the profile is full.
+pub(super) fn add_head(profile: &mut Profile, binds: &[Vec3], parents: &[i16], head: usize) {
+    let n = binds.len().min(parents.len());
+    if head >= n || profile.body_of.get(head).copied().flatten().is_some() {
+        return;
+    }
+    if profile.bodies.len() >= MAX_BODIES {
+        return;
+    }
+    let parent_of = |i: usize| usize::try_from(parents[i]).ok().filter(|&p| p < i);
+    let under_head = |mut i: usize| loop {
+        match parent_of(i) {
+            Some(p) if p == head => return true,
+            Some(p) => i = p,
+            None => return false,
+        }
+    };
+    if profile.bodies.iter().any(|b| under_head(b.bone as usize)) {
+        return;
+    }
+    let mut pivots = vec![Vec3::ZERO; n];
+    for i in 0..n {
+        pivots[i] = parent_of(i).map_or(Vec3::ZERO, |p| pivots[p]) + binds[i];
+    }
+    let (lo, hi) = pivots.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+        (lo.min(p.y), hi.max(p.y))
+    });
+    let height = (hi - lo).max(f32::EPSILON);
+    let mut up = parent_of(head);
+    let mut parent = None;
+    while let Some(p) = up {
+        if let Some(b) = profile.body_of.get(p).copied().flatten() {
+            parent = Some(b);
+            break;
+        }
+        up = parent_of(p);
+    }
+    let Some(parent) = parent else {
+        return;
+    };
+    let segment = Vec3::Y * HEAD_SEGMENT * height;
+    if let Some(slot) = profile.body_of.get_mut(head) {
+        *slot = Some(profile.bodies.len());
+    }
+    profile.bodies.push(BodySpec {
+        bone: head as u16,
+        pivot: pivots[head],
+        segment,
+        radius: (segment.length() * HEAD_RADIUS).clamp(RADIUS_MIN * height, RADIUS_MAX * height),
+        parent: Some(parent),
+    });
 }
 
 /// The hub: from the root with the most limb length, step into the child that holds at least

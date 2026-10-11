@@ -268,6 +268,7 @@ fn start_ragdolls(
             Option<&GettingUp>,
             Has<AwaitingBlow>,
             Option<&super::shock::ShockDebuff>,
+            Option<&crate::creature_anim::BodyTwist>,
         ),
         (
             With<SeenAlive>,
@@ -293,7 +294,9 @@ fn start_ragdolls(
         .as_deref()
         .and_then(|c| c.flag("dismemberment"))
         .unwrap_or(false);
-    for (unit, store, net, rig, unit_tf, spot, blow, knock, rising, awaiting, debuff) in &dying {
+    for (unit, store, net, rig, unit_tf, spot, blow, knock, rising, awaiting, debuff, twist) in
+        &dying
+    {
         // Creatures and players alike, our own character included; a ghost reads alive again and
         // `cleanup` hands it back to its animation.
         let living_kind = matches!(net.kind, EntityKind::Unit | EntityKind::Player);
@@ -327,9 +330,13 @@ fn start_ragdolls(
         if dead {
             commands.entity(unit).remove::<SeenAlive>();
         }
-        let Some(profile) = build_profile(&rig.binds, &rig.parents) else {
+        let Some(mut profile) = build_profile(&rig.binds, &rig.parents) else {
             continue;
         };
+        // The head's key bone gets a body of its own, so the head can come off.
+        if let Some(head) = twist.and_then(|t| t.head_bone()) {
+            super::rig::add_head(&mut profile, &rig.binds, &rig.parents, head as usize);
+        }
         let Ok(frame) = frames.get(rig.joints_root) else {
             continue;
         };

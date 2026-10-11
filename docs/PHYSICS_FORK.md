@@ -136,6 +136,7 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
   `drop_ragdoll_shadows`. A ragdoll leaves no blob shadow behind. It is appended rather than
   woven in so other forks' merges stay clean.
 - `creature_anim.rs`: re-exports `LootSparkleOn`, `FxEffectScale` and blood helpers for `gore`.
+- `creature_anim/twist.rs`: `BodyTwist::head_bone`, the head key bone, for `rig::add_head`.
 - `creature_anim/blood.rs`: exposes `violence_level` and `unit_blood_id`, and sets
   `SPURT_SCALE 0.5`, which plays the stock melee spurt at half size.
 - `creature_anim/spell_visual.rs`: lets the loot sparkle attach to the loot sack.
@@ -464,6 +465,13 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   alone. It used to be a flat draw within two joints of the hub, which reached the legs but
   never the head. Logs `dismember: severed [...]`.
 - `life` skips the severed limb's joint and flings it (`SEVER_FLING`, `SEVER_LIFT`).
+- **Heads.** The neck and head segments are shorter than `MIN_SEGMENT`, so the head rode the
+  chest body and was never a candidate. `start_ragdolls` now calls `rig::add_head` with the
+  model's head key bone (`BodyTwist::head_bone`, a `Fork:` accessor in
+  `creature_anim/twist.rs`): a stub body `HEAD_SEGMENT 0.1` of the height up from the head
+  bone, radius `HEAD_RADIUS 0.5` of it, hung from its nearest bodied ancestor. The head skips the
+  length floor in `choose_limbs`. Skipped when a body already hangs under the head bone.
+- A limb copy that finds no parts warns `dismember: unit …'s severed limb found no parts to draw`.
 - **Drawing.** There is one mesh per unit, so the limb is drawn by copies of the unit's skinned
   parts on a **second palette slot**. That slot poses the limb's bones at their bodies and
   collapses every other bone to a point (`TINY`). On the unit's own palette, the limb root is

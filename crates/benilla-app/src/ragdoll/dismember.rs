@@ -161,7 +161,11 @@ pub(super) fn choose_limbs(profile: &Profile, share: f32, seed: u64) -> Vec<usiz
         } else {
             MIN_LIMB_LENGTH
         };
-        if !torso && count[k] as f32 > MAX_LIMB_BODIES * n as f32 || length[k] < floor * total {
+        // The head is short (its body is a stub, `rig::add_head`), so no length floor for it.
+        let head = upper && central && count[k] <= HEAD_BODIES;
+        if !torso && count[k] as f32 > MAX_LIMB_BODIES * n as f32
+            || !head && length[k] < floor * total
+        {
             return None;
         }
         Some(match (upper, central) {
@@ -283,6 +287,7 @@ fn build_limb_copies(
                     ChildOf(unit),
                 ))
                 .id();
+            let mut copied = 0;
             for child in children.iter() {
                 let Ok((mesh, parked, material, tag, part)) = parts.get(child) else {
                     continue;
@@ -310,6 +315,10 @@ fn build_limb_copies(
                 if let Some(part) = part {
                     copy.insert(*part);
                 }
+                copied += 1;
+            }
+            if copied == 0 {
+                warn!("dismember: unit {unit}'s severed limb found no parts to draw");
             }
             limb.holder = Some(holder);
         }
