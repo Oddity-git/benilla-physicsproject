@@ -64,7 +64,7 @@ const CAPSULE_REACH: f32 = 0.5;
 /// toward the eye, so it wins the depth test against the body's back under-layer kept for the
 /// hole (`entities/attach`) and the body can never poke through the cape where the cape's own
 /// animation dips into it. In depth units, so the pull grows with distance; sized for a close-up.
-const CAPE_DEPTH_BIAS: f32 = 2.0e4;
+const CAPE_DEPTH_BIAS: f32 = 6.0e4;
 /// The Cloak Motion slider's range (`cloakMotion`): 0 holds the cloak to the animation, 1 is the
 /// tuned swing, more trails and swings further.
 const MAX_MOTION: f32 = 3.0;
