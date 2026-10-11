@@ -361,7 +361,8 @@ pub(super) fn control(
         }
         // `0x514560`, after `apply_server_moves`, so this frame's root edge is already in `modes`.
         let may_translate = mover.may_translate(player.modes.rooted);
-        let axes = input::move_axes(
+        #[cfg_attr(not(feature = "ragdoll"), allow(unused_mut))]
+        let mut axes = input::move_axes(
             binds,
             &buttons,
             &mut player,
@@ -370,6 +371,39 @@ pub(super) fn control(
             may_translate,
             may_turn,
         );
+        // Fork: omni-directional movement (`ragdoll/omni.rs`): the keys name a direction from the
+        // camera, the body turns to it and runs forward.
+        #[cfg(feature = "ragdoll")]
+        let omni = {
+            let right = i32::from(axes.strafe_right || axes.turn_right)
+                - i32::from(axes.strafe_left || axes.turn_left);
+            let in_combat = body
+                .single()
+                .ok()
+                .and_then(|(.., store, _, _, _, _, _)| store)
+                .is_some_and(|s| s.0.unit_flags() & UNIT_FLAG_IN_COMBAT != 0);
+            let steer = crate::ragdoll::omni::steer(
+                axes.fwd,
+                right,
+                axes.mouselook || !may_turn || !may_translate,
+                cam.yaw,
+                player.face_yaw,
+                in_combat,
+                dt,
+            );
+            if let Some(steer) = &steer {
+                player.face_yaw = steer.face_yaw;
+                axes.fwd = i32::from(steer.run);
+                axes.side = 0;
+                axes.translating = steer.run;
+                axes.turning = false;
+                axes.strafe_left = false;
+                axes.strafe_right = false;
+                axes.turn_left = false;
+                axes.turn_right = false;
+            }
+            steer.is_some()
+        };
         let input::MoveAxes {
             fwd: fwd_axis,
             side: side_axis,
@@ -715,6 +749,17 @@ pub(super) fn control(
             );
         }
         // `turn_delta` is our own turn; the deck's yaw reached `cam.yaw` in the ride carry.
+        // Fork: the camera does not swing behind a body the omni steering turns.
+        #[cfg(feature = "ragdoll")]
+        let follow_cfg = if omni {
+            camera::FollowConfig {
+                style: camera::FollowStyle::Never,
+                tracking_style: camera::FollowStyle::Never,
+                ..follow_cfg
+            }
+        } else {
+            follow_cfg
+        };
         let follow = camera::FollowInput {
             cfg: follow_cfg,
             face_yaw: player.face_yaw,

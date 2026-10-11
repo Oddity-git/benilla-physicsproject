@@ -78,6 +78,12 @@
             "How much feet follow the ground under each of them on slopes and steps, the hips "
             .. "sinking and the legs bending to reach. Lowest turns it off."
 
+        BENILLA_TOOLTIP_OMNI_MOVEMENT =
+            "The movement keys run in their direction from the camera: S turns you around and runs "
+            .. "toward the camera instead of backpedalling, A and D run sideways. Letting go in "
+            .. "combat turns you to face where the camera looks. Holding the right mouse button "
+            .. "steers as usual."
+
         BENILLA_TOOLTIP_BLOOD_STAINS =
             "How big the blood stains bleeding hits leave on the body are. Lowest turns them off. "
             .. "Blood must be on."
@@ -90,7 +96,7 @@
                 "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay",
                 "RowCloakPhysics", "RowCloakMotion",
                 "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize", "RowBodyRearSize",
-                "RowWeaponMotion", "RowFootPlanting",
+                "RowWeaponMotion", "RowFootPlanting", "RowOmniMovement",
             }
         end
     ]]></Script>
@@ -321,6 +327,16 @@
                     BenillaOptionsRow_OnLoad(this, "footPlanting", "Foot Planting",
                         "BENILLA_TOOLTIP_FOOT_PLANTING")
                     BenillaOptionsSliderRow_Setup(this, 0, 1, 0.25)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowOmniMovement" inherits="BenillaOptionsCheckboxRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowFootPlanting" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowFootPlanting" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "omniMovement", "Omni-Directional Movement",
+                        "BENILLA_TOOLTIP_OMNI_MOVEMENT")
                 </OnLoad></Scripts>
             </Frame>
         </Frames>

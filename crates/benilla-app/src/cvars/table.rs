@@ -819,6 +819,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — 1.12 hangs a stowed weapon rigid",
     ),
+    // benilla's own: the Physics page's Omni-Directional Movement box, keys steer from the camera.
+    ours(
+        "omniMovement",
+        "0",
+        "benilla's own — 1.12 walks along the facing and backpedals on S",
+    ),
     // benilla's own: the Physics page's Foot Planting slider, how far feet follow the ground.
     ours(
         "footPlanting",

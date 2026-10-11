@@ -206,6 +206,7 @@ impl HeldAttached {
 
     /// Fork: each spawned root with its slot index and the attach point it hangs from, for the
     /// physics fork's weapon jostle.
+    #[cfg_attr(not(feature = "ragdoll"), allow(dead_code))]
     pub(crate) fn spawned_attach(&self) -> impl Iterator<Item = (usize, Entity, u16)> + '_ {
         self.spawned
             .iter()

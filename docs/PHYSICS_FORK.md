@@ -35,6 +35,7 @@ fidelity to the 1.12.1 reference client. This fork deliberately adds features 1.
 | Soft-body sway on female units | `sway` | `bodyPhysics`, `bodySize`, `bodyRearSize` |
 | Stowed weapons jostle while moving | `jostle` | `weaponMotion` |
 | Feet plant on slopes and steps (foot IK) | `feet` | `footPlanting` |
+| Omni-directional movement (keys steer from the camera) | `omni` | `omniMovement` |
 | Test crate drop | `testbox` | dev chord + `B` |
 
 All of it lives behind the `ragdoll` Cargo feature, which is on by default.
@@ -143,6 +144,9 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
 - `cvars/table.rs`: the fork's CVar rows (section 7).
 - `entities/equipment/mod.rs`: `HeldAttached::spawned_attach`, each held item's root and attach
   point, for `jostle`.
+- `player/controller.rs`: after `input::move_axes`, calls `ragdoll::omni::steer` and rewrites
+  the axes and the facing when it steers; and while it steers, the camera's follow styles are
+  `Never` so the camera does not swing behind the turning body.
 - `ui_script/shipped_xml_tests.rs`: lists `PhysicsOptions.xml`.
 - `assets/ui/layer.toc`: loads `PhysicsOptions.xml`.
 - `tests/world_api_wall.rs`: allows the ragdoll collision layer through the API wall.
@@ -285,6 +289,7 @@ The page's rows, in order:
 | Rear Size | `bodyRearSize` | 0.5–2.5 | 1 |
 | Weapon Motion | `weaponMotion` | 0–3, 0 off | 1 |
 | Foot Planting | `footPlanting` | 0–1, 0 off | 1 |
+| Omni-Directional Movement | `omniMovement` | box | 0 |
 
 Wide slider ranges (up to 10×) are intentional. Mathieu asked for "wacky high settings".
 
@@ -602,6 +607,22 @@ Do not describe this one in the README (section 2).
   evaluator writes only the bones its clips carry, so each frame first puts back the animated
   local wherever last frame's edit is still standing (`written`), as `creature_anim/twist.rs`
   does. Without that the edits would pile up frame on frame.
+
+### `omni.rs` (omni-directional movement)
+- Mathieu asked for it; he first wondered whether it belonged in wowpad (the gamepad fork) and
+  chose this fork, because it changes keyboard movement too. A stick can feed the same direction
+  later.
+- `steer(fwd, right, stock, cam_yaw, face_yaw, in_combat, dt)` is called by the controller hook
+  (section 5). `fwd` is the net W/S axis (autorun counts as W), `right` the A/D and Q/E keys
+  together. It returns `None`, leaving the stock controls alone, when the box is off, when
+  `stock` (right mouse held, `may_turn` or `may_translate` down), or when nothing is pressed.
+- With input, the target yaw is `cam_yaw + atan2(−right, fwd)` (yaw grows leftward, forward is
+  −Z); the facing turns toward it at `TURN_RATE 12` rad/s and the axes become a plain forward
+  run: no backpedal, no strafe bits, no turn bits. The facing streams as `SET_FACING`.
+- Letting go while `UNIT_FLAG_IN_COMBAT` turns the facing back to the camera's yaw at the same
+  rate, until within `DONE 0.01` rad or a key is pressed.
+- State is three statics (`ON`, `MOVING`, `FACING_CAMERA`); `read_box` (PreUpdate) reads the
+  CVar, so the controller needs no new system parameter.
 
 ### `testbox.rs`
 The dev chord + `B` drops a crate model from the install in front of the camera, cycling through
