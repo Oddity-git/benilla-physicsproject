@@ -588,8 +588,9 @@ Do not describe this one in the README (section 2).
   drawn or swapped item loses `RiderTilt`; the move or rebuild already placed its `Transform`.
 
 ### `feet.rs` (foot planting, two-bone IK)
-- Every living unit on foot with a `RigPose` and an `ObjectStore`, within `RANGE 60` yd of the
-  camera, not a ragdoll, not parked, not mounted (`unit_mount_display_id`). Two or more legs needed.
+- Players only (`object_type() == Player`; Mathieu asked for players only after creatures sank
+  through the floor), alive, on foot, within `RANGE 60` yd of the camera, not a ragdoll, not
+  parked, not mounted (`unit_mount_display_id`). Two or more legs needed.
 - **Legs** come from `rig::build_profile`: a body whose segment runs down off one that does not
   is a hip, its downward body child the knee, and the knee's direct child nearest the knee
   segment's end the ankle. A quadruped's four legs all count. A rig without legs is remembered in
@@ -606,7 +607,9 @@ Do not describe this one in the README (section 2).
 - **Writing the pose.** It edits `locals` in `PosePost` and calls `compose` between steps. The
   evaluator writes only the bones its clips carry, so each frame first puts back the animated
   local wherever last frame's edit is still standing (`written`), as `creature_anim/twist.rs`
-  does. Without that the edits would pile up frame on frame.
+  does, **field by field**: a clip that rewrites a bone's rotation but not its translation would
+  otherwise keep the old translation edit and add the new one on top. That piling up sank a boar
+  into the ground on end.
 
 ### `omni.rs` (omni-directional movement)
 - Mathieu asked for it; he first wondered whether it belonged in wowpad (the gamepad fork) and

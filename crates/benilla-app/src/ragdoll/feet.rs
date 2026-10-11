@@ -1,7 +1,7 @@
 //! Fork: foot planting, behind the Physics page's Foot Planting slider (`footPlanting`, 0 off).
 //!
 //! 1.12 stands every unit on the one ground height under its middle, so on a slope or a step one
-//! foot sinks in and the other hangs. Here each leg probes the ground under its own ankle: the hips
+//! foot sinks in and the other hangs. Players only: creatures are left as they are. Here each leg probes the ground under its own ankle: the hips
 //! sink to the lowest foot's ground, and every other leg bends at hip and knee (two-bone IK) to lift
 //! its ankle onto its own ground, the foot turned to the ground's slope. Only the offset between a
 //! foot's ground and the middle's counts, never the height of the step itself, so a swinging foot
@@ -21,6 +21,8 @@ use benilla_world::view::WorldCamera;
 
 use super::life::Ragdoll;
 use super::rig::build_profile;
+use benilla_protocol::messages::ObjectType;
+
 use crate::net::ObjectStore;
 
 /// The slider's top: 1 plants fully.
@@ -172,8 +174,9 @@ fn plant_feet(
     for (unit, rig, at, store) in &mut rigs {
         let feet = at.translation();
         let n = rig.locals.len().min(rig.model.len());
-        // A unit standing on the ground, near, alive and on foot plants; any other lets go.
+        // A player standing on the ground, near, alive and on foot plants; any other lets go.
         let wanted = amount > 0.0
+            && store.0.object_type() == Some(ObjectType::Player)
             && eye.is_some_and(|eye| eye.distance(feet) < RANGE)
             && store.0.unit_mount_display_id() == 0
             && store.0.unit_health() != Some(0);
@@ -206,9 +209,15 @@ fn plant_feet(
         }
         // Back to the animated pose where the animation left last frame's edit standing.
         let rig = rig.into_inner();
-        for &(bone, wrote, base) in &state.written {
-            if rig.locals[bone] == wrote {
-                rig.locals[bone] = base;
+        // Field by field: a clip may rewrite a bone's rotation and leave its translation, and a
+        // whole-transform compare would then keep the old edit and add this frame's on top.
+        for &(bone, wrote, base) in state.written.iter().rev() {
+            let local = &mut rig.locals[bone];
+            if local.translation == wrote.translation {
+                local.translation = base.translation;
+            }
+            if local.rotation == wrote.rotation {
+                local.rotation = base.rotation;
             }
         }
         let undone = !state.written.is_empty();
