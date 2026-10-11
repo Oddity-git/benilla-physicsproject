@@ -52,7 +52,7 @@ These come from the maintainer (Mathieu). They override generic habits.
   cargo build --release -p benilla
   ```
 - **Verification is compile and clippy only.** Run `cargo build --release -p benilla` and
-  `cargo clippy -p benilla-app --all-targets -- -D warnings` (add `-p benilla-world` when touching
+  `cargo clippy -p benilla-app --features ragdoll --all-targets -- -D warnings` (without `--features ragdoll` the whole `ragdoll/` module is skipped and clippy passes trivially) (add `-p benilla-world` when touching
   it). Do not run the test suite; he tests in game. "Done" means it compiles clean and is
   pushed. The in-game result comes from him.
 - **Do not write files into `~`.** Scratch work goes elsewhere.
