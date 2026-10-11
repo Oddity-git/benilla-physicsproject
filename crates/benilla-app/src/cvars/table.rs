@@ -807,6 +807,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — 1.12 draws a cloak stiff on the body's bones",
     ),
+    // benilla's own: the Physics page's Weapon Motion slider, how much stowed weapons jostle.
+    ours(
+        "weaponMotion",
+        "1",
+        "benilla's own — 1.12 hangs a stowed weapon rigid",
+    ),
     // benilla's own: the Physics page's Cloak Motion slider, how much the cloth cloaks swing.
     ours(
         "cloakMotion",

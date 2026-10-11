@@ -70,6 +70,10 @@
             "The size of the rear that Body Physics moves, on female characters. It bounces "
             .. "less than the chest."
 
+        BENILLA_TOOLTIP_WEAPON_MOTION =
+            "How much weapons and shields on the back or hip bounce and sway as their wearer "
+            .. "moves. Lowest turns it off."
+
         -- Joins the options window's page loops; run from the page's OnLoad, after its rows.
         function BenillaPhysicsOptions_Register()
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
@@ -78,6 +82,7 @@
                 "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay",
                 "RowCloakPhysics", "RowCloakMotion",
                 "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize", "RowBodyRearSize",
+                "RowWeaponMotion",
             }
         end
     ]]></Script>
@@ -275,6 +280,17 @@
                     BenillaOptionsRow_OnLoad(this, "bodyRearSize", "Rear Size",
                         "BENILLA_TOOLTIP_BODY_REAR_SIZE")
                     BenillaOptionsSliderRow_Setup(this, 0.5, 2.5, 0.1)
+                </OnLoad></Scripts>
+            </Frame>
+            <Frame name="$parentRowWeaponMotion" inherits="BenillaOptionsSliderRowTemplate">
+                <Anchors>
+                    <Anchor point="TOPLEFT" relativeTo="$parentRowBodyRearSize" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                    <Anchor point="TOPRIGHT" relativeTo="$parentRowBodyRearSize" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                </Anchors>
+                <Scripts><OnLoad>
+                    BenillaOptionsRow_OnLoad(this, "weaponMotion", "Weapon Motion",
+                        "BENILLA_TOOLTIP_WEAPON_MOTION")
+                    BenillaOptionsSliderRow_Setup(this, 0, 3, 0.25)
                 </OnLoad></Scripts>
             </Frame>
         </Frames>

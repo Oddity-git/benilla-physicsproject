@@ -204,6 +204,16 @@ impl HeldAttached {
         &self.spawned
     }
 
+    /// Fork: each spawned root with its slot index and the attach point it hangs from, for the
+    /// physics fork's weapon jostle.
+    pub(crate) fn spawned_attach(&self) -> impl Iterator<Item = (usize, Entity, u16)> + '_ {
+        self.spawned
+            .iter()
+            .zip(&self.applied.slots)
+            .enumerate()
+            .filter_map(|(i, (root, slot))| Some((i, (*root)?, slot.as_ref()?.attach)))
+    }
+
     #[cfg(test)]
     pub(crate) fn with_spawned(spawned: [Option<Entity>; ATTACH_SLOTS]) -> Self {
         Self {

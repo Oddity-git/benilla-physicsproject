@@ -31,6 +31,11 @@ pub struct RigRider {
     pub slot: u16,
 }
 
+/// Fork: an extra placement after the attachment point's offset, `F × tilt`, the physics fork's
+/// jostle of a stowed weapon. Absent, the rider is placed as stock.
+#[derive(Component, Clone, Copy)]
+pub struct RiderTilt(pub bevy::math::Affine3A);
+
 /// Writes every rider's frame, with the palette's writers ([`crate::rig_palette::plugin`]): after
 /// propagation and the billboard joint pass, before the publish. A missing host, pose or bone
 /// leaves the rows at their last frame; [`RigPalettes::write_rider`] is idempotent, so a standing
@@ -38,7 +43,7 @@ pub struct RigRider {
 /// re-arms on `[CGUnit+0xd24]`'s instance (BowPull 160 at `$BWP`, BowRelease 161 or Stand 0 at
 /// `$BWR`), writes row `b` as `F × own.model[b] × ibp[b]`, every frame.
 pub(crate) fn write_rig_riders(
-    riders: Query<(Entity, &RigRider)>,
+    riders: Query<(Entity, &RigRider, Option<&RiderTilt>)>,
     poses: Query<&RigPose>,
     skins: Query<&RigSkin>,
     frames: Query<&GlobalTransform>,
@@ -47,7 +52,7 @@ pub(crate) fn write_rig_riders(
     mut scratch: Local<Vec<GlobalTransform>>,
     mut palettes: ResMut<RigPalettes>,
 ) {
-    for (entity, rider) in &riders {
+    for (entity, rider, tilt) in &riders {
         let Ok(pose) = poses.get(rider.host) else {
             continue;
         };
@@ -62,7 +67,11 @@ pub(crate) fn write_rig_riders(
         let origin = rebase_origin(root_g.translation());
         let mut basis = root_g.affine();
         basis.translation -= bevy::math::Vec3A::from(origin);
-        let frame = basis * *bone * bevy::math::Affine3A::from_translation(rider.local);
+        let mut frame = basis * *bone * bevy::math::Affine3A::from_translation(rider.local);
+        // Fork: the stowed weapon's jostle.
+        if let Some(tilt) = tilt {
+            frame *= tilt.0;
+        }
         // A prop with its own pose: its bone frames compose onto the placement and are written as
         // a body's rows.
         let posed = poses
