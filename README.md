@@ -69,7 +69,9 @@ Everything here is **client side only**. The server, other players and their cli
   the hit is reported.
 - **Cloth cloaks.** Cloaks hang and swing as cloth: they trail behind when you run, sway when you
   stop, and stay outside the legs. With a weapon drawn they hang from the shoulders only, so
-  the weapon swings clear. The ten nearest cloaks are simulated.
+  the weapon swings clear. The ten nearest cloaks are simulated. A cloak replaces the body's own
+  15xx back geoset, which vanilla hid safely under a cape that never moved; because this cape does,
+  the body's back under-layer is kept drawn, so a swinging cloth never leaves a hole where it moved.
 - **Options.** The options window has its own **Physics** page, under Audio: a **Blood** choice
   (Red, Green or Off, the game's own `violenceLevel`), a **Gore Amount** slider, a
   **Dismemberment** checkbox (off by default) with a **Dismemberment Amount** slider for how easily
