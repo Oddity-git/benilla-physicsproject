@@ -53,6 +53,19 @@ const DROP_STRETCH: f32 = 0.12;
 const CHEST: f32 = 0.6;
 /// A landed droplet's splat half-size range (yd), and the one under a hit victim's feet.
 const DROP_SPLAT: (f32, f32) = (0.08, 0.22);
+/// A droplet landing faster than this across the ground (yd/s) smears into a streak along its
+/// flight, this many times longer per multiple of that speed (at most `STREAK_MAX`), this share
+/// as wide.
+const STREAK_SPEED: f32 = 2.5;
+const STREAK_MAX: f32 = 3.5;
+const STREAK_WIDTH: f32 = 0.45;
+/// Each spraying hit trails this many long thin lines from under its victim, away from the
+/// attacker, plus this many more for a hit worth its whole health, × Gore Amount; each this long
+/// and wide (yd, half-sizes), longer for a bigger hit, turned up to `SPREAD` either way.
+const LINES: f32 = 1.0;
+const LINES_PER_BAR: f32 = 2.0;
+const LINE_LENGTH: (f32, f32) = (0.3, 0.8);
+const LINE_WIDTH: (f32, f32) = (0.03, 0.06);
 const HIT_SPLAT: (f32, f32) = (0.25, 0.4);
 /// A splat stays this long, the last [`FADE`] of it fading.
 const SPLAT_LIFE: f32 = 45.0;
@@ -507,6 +520,29 @@ fn spray_hits(
             let start = chest + Vec3::new(gore.range((-0.1, 0.1)), 0.0, gore.range((-0.1, 0.1)));
             throw_droplet(&mut gore, b, start, v, feet.y, now);
         }
+        // Thin lines trailing away from the victim, as if flung off the blow.
+        let lines = ((LINES + LINES_PER_BAR * share) * amount).round() as usize;
+        for _ in 0..lines {
+            let Some(texture) = gore.pick_texture(&server, &splats) else {
+                break;
+            };
+            let dir = Quat::from_rotation_y(gore.range((-SPREAD, SPREAD))) * away;
+            let long = gore.range(LINE_LENGTH) * (0.6 + share);
+            let wide = gore.range(LINE_WIDTH);
+            let start = gore.range((0.1, 0.4));
+            let at = feet + dir * (start + long);
+            let b = Blood { texture, violence };
+            lay_stretched(
+                &mut commands,
+                &mut gore,
+                &decals,
+                at,
+                dir,
+                (long, wide),
+                b,
+                now,
+            );
+        }
         // The splat under the victim.
         if let Some(texture) = gore.pick_texture(&server, &splats) {
             let half = gore.range(HIT_SPLAT);
@@ -685,8 +721,40 @@ fn lay_splat(
     now: f32,
 ) {
     let yaw = gore.range((0.0, std::f32::consts::TAU));
+    lay_decal(commands, gore, decals, at, yaw, (half, half), blood, now);
+}
+
+/// A splat stretched along `dir` (horizontal): half-sizes `(along, across)`.
+#[allow(clippy::too_many_arguments)] // a decal's whole description
+fn lay_stretched(
+    commands: &mut Commands,
+    gore: &mut Gore,
+    decals: &WorldDecal,
+    at: Vec3,
+    dir: Vec3,
+    halves: (f32, f32),
+    blood: Blood,
+    now: f32,
+) {
+    // The frame's x axis lies along (cos, −sin) in world x and z.
+    let yaw = (-dir.z).atan2(dir.x);
+    lay_decal(commands, gore, decals, at, yaw, halves, blood, now);
+}
+
+/// A splat turned `yaw`, half-sizes `(x, z)` in its frame.
+#[allow(clippy::too_many_arguments)] // a decal's whole description
+fn lay_decal(
+    commands: &mut Commands,
+    gore: &mut Gore,
+    decals: &WorldDecal,
+    at: Vec3,
+    yaw: f32,
+    halves: (f32, f32),
+    blood: Blood,
+    now: f32,
+) {
     let mut verts = Vec::new();
-    if !project(decals, &mut verts, at, yaw, half) {
+    if !project(decals, &mut verts, at, yaw, halves) {
         return;
     }
     let id = commands
@@ -711,22 +779,22 @@ fn lay_splat(
     }
 }
 
-/// A square decal of half-size `half` turned `yaw` about `at`.
+/// A rectangular decal of half-sizes `(x, z)` turned `yaw` about `at`.
 fn project(
     decals: &WorldDecal,
     out: &mut Vec<EffectVertex>,
     at: Vec3,
     yaw: f32,
-    half: f32,
+    (half_x, half_z): (f32, f32),
 ) -> bool {
     let frame = DecalFrame {
         center: at,
         sin: yaw.sin(),
         cos: yaw.cos(),
-        min_x: -half,
-        max_x: half,
-        min_z: -half,
-        max_z: half,
+        min_x: -half_x,
+        max_x: half_x,
+        min_z: -half_z,
+        max_z: half_z,
         min_y: -BELOW,
         max_y: ABOVE,
     };
@@ -750,15 +818,33 @@ fn fly_droplets(
         if landed {
             let half = gore.range(DROP_SPLAT);
             let at = drop.at.with_y(drop.ground);
-            lay_splat(
-                &mut commands,
-                &mut gore,
-                &decals,
-                at,
-                half,
-                drop.blood.clone(),
-                now,
-            );
+            let across = drop.velocity.with_y(0.0);
+            let speed = across.length();
+            if speed > STREAK_SPEED {
+                // A fast drop smears on along its flight.
+                let dir = across / speed;
+                let long = half * (speed / STREAK_SPEED).min(STREAK_MAX);
+                lay_stretched(
+                    &mut commands,
+                    &mut gore,
+                    &decals,
+                    at + dir * (long - half),
+                    dir,
+                    (long, half * STREAK_WIDTH),
+                    drop.blood.clone(),
+                    now,
+                );
+            } else {
+                lay_splat(
+                    &mut commands,
+                    &mut gore,
+                    &decals,
+                    at,
+                    half,
+                    drop.blood.clone(),
+                    now,
+                );
+            }
         }
         !landed && now - drop.born <= DROP_LIFE
     });
@@ -908,7 +994,7 @@ fn grow_pools(
         let (centre, yaw) = (pool.centre, pool.yaw);
         let mut verts = std::mem::take(&mut pool.verts);
         verts.clear();
-        project(&decals, &mut verts, centre, yaw, half);
+        project(&decals, &mut verts, centre, yaw, (half, half));
         pool.verts = verts;
         pool.projected_at = now;
     }

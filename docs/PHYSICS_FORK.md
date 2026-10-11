@@ -375,6 +375,13 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
 - **Spray.** A hit throws droplets away from the attacker, more for a bigger share of health and
   most on a kill. Each droplet splats where it lands. `FAST_SHARE 0.3` of them fly faster, scaled
   by `FAST_PER_AMOUNT 0.5` × `goreAmount`.
+- **Streaks.** A droplet landing faster than `STREAK_SPEED 2.5` yd/s across the ground lays a
+  splat stretched along its flight (up to `STREAK_MAX 3.5` times longer, `STREAK_WIDTH 0.45` as
+  wide) instead of a round one. Each spraying hit also lays `(LINES 1 + LINES_PER_BAR 2 × share)
+  × goreAmount` long thin lines from under the victim, away from the attacker (half-sizes
+  `LINE_LENGTH 0.3–0.8` × (0.6 + share) by `LINE_WIDTH 0.03–0.06`). Both are the stock splat
+  textures through `lay_stretched`: `yaw = atan2(−dir.z, dir.x)`, because the decal frame's x
+  axis lies along (cos, −sin). Mathieu asked for more variety than round splats.
 - **Splats** are decals on the shared ground projector and fade out. The cap is
   `MAX_SPLATS 400 × goreAmount`, up to `MAX_SPLATS_EVER 4000`.
 - **Pools** start under a ragdoll, centred on its bodies' middle at the lowest body's height. A
@@ -392,7 +399,10 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
 ### `stain.rs` (blood stains on the body)
 - Reads the same `Hit` messages as `gore`, with the same gates: Blood off, a bloodless creature
   row, or a non-physical hit that does not kill leaves nothing. Colour is gore's
-  `default_colour(violence)`: red, or green at violence 1.
+  `default_colour(violence)`: red, or green at violence 1. On orcs, taurens and trolls (race 2, 6,
+  8) at violence 2 it is `STRONG_RED [1.8, 0.1, 0.07]`: the vertex colour multiplies the texture,
+  so the plain red turned green orc skin brown and tauren fur maroon. Over 1 in red is fine; the
+  shader does not clamp the vertex colour.
 - **Why copies.** A body's composited texture (`skin_composite.rs`, cached by `SkinKey`) and its
   materials are shared by every unit of the same look, so a stain painted there would stain them
   all. Instead each stained unit's skinned parts (capes excluded, the cloaks draw those) are
