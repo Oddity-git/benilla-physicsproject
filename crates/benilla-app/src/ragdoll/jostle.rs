@@ -2,11 +2,11 @@
 //! slider (`weaponMotion`, 0 off).
 //!
 //! A weapon or shield on the back or the hip hangs rigid from its attachment point in 1.12. Here
-//! each one keeps a damped spring on that point's world position, as the body's sway does: the
-//! point moves, the spring lags behind it, and the lag tips the item about the point, the part
-//! above it trailing the motion and a bounce tilting it about the body's side axis. The tilt goes
-//! on the item root's `Transform`, which the collision, picking and glow read, and on its
-//! [`RiderTilt`], which the rendered rider frame takes. A drawn weapon is left alone.
+//! each one keeps a damped spring on that point's height, as the body's sway does: each footstep
+//! moves the point up and down, the spring lags behind it, and the item is shifted by the lag,
+//! straight up and down and never tipped. The shift goes on the item root's `Transform`, which
+//! the collision, picking and glow read, and on its [`RiderTilt`], which the rendered rider frame
+//! takes. A drawn weapon is left alone.
 
 use bevy::ecs::entity::EntityHashMap;
 use bevy::math::Affine3A;
@@ -21,14 +21,10 @@ const FREQUENCY: f32 = 4.0;
 const DAMPING: f32 = 0.25;
 const STEP: f32 = 1.0 / 120.0;
 const MAX_STEPS: u32 = 8;
-/// The share of the attachment point's motion the spring lags, and the furthest it lags (yd) at
-/// Weapon Motion 1.
+/// The share of the attachment point's rise and fall the spring lags, and the furthest the item
+/// strays from its spot (yd) at Weapon Motion 1.
 const LAG: f32 = 0.6;
-const MAX_LAG: f32 = 0.08;
-/// The lever the lag tips the item by (yd): a lag this long is a radian.
-const ARM: f32 = 0.35;
-/// The most the item tips (rad) at Weapon Motion 1.
-const MAX_TILT: f32 = 0.3;
+const MAX_BOUNCE: f32 = 0.025;
 /// The Weapon Motion slider's top.
 const MAX_AMOUNT: f32 = 3.0;
 /// A jump of the point past this (yd) in one frame is a teleport: the spring starts over.
@@ -44,9 +40,9 @@ pub(super) fn plugin(app: &mut App) {
 /// One stowed item's spring.
 struct Spring {
     attach: u16,
-    last: Option<Vec3>,
-    offset: Vec3,
-    velocity: Vec3,
+    last: Option<f32>,
+    offset: f32,
+    velocity: f32,
 }
 
 /// The stowed attach points: the back, the lower back and the hips, never a hand.
@@ -65,7 +61,7 @@ fn stowed(attach: u16) -> bool {
 }
 
 fn jostle_stowed(
-    units: Query<(&HeldAttached, &BoneAttach, &GlobalTransform)>,
+    units: Query<(&HeldAttached, &BoneAttach)>,
     mut roots: Query<(
         &mut Transform,
         &ChildOf,
@@ -88,11 +84,10 @@ fn jostle_stowed(
     let stiffness = (std::f32::consts::TAU * FREQUENCY).powi(2);
     let damping = 2.0 * DAMPING * stiffness.sqrt();
     seen.clear();
-    for (held, bones, unit) in &units {
-        let side = unit.right().as_vec3();
+    for (held, bones) in &units {
         // Only the weapon slots: mainhand and offhand.
         for (_, root, attach) in held.spawned_attach().filter(|&(slot, _, _)| slot < 2) {
-            if amount <= 0.0 || !stowed(attach) {
+            if !stowed(attach) {
                 continue;
             }
             let Some(&(_, offset)) = bones.points.get(&attach) else {
@@ -101,6 +96,14 @@ fn jostle_stowed(
             let Ok((mut transform, parent, rider, mut rider_tilt)) = roots.get_mut(root) else {
                 continue;
             };
+            // Off: back to the stock spot once, then left alone.
+            if amount <= 0.0 {
+                if springs.remove(&root).is_some() {
+                    *transform = Transform::from_translation(offset);
+                    commands.entity(root).remove::<RiderTilt>();
+                }
+                continue;
+            }
             let Ok(anchor) = anchors.get(parent.parent()) else {
                 continue;
             };
@@ -108,22 +111,22 @@ fn jostle_stowed(
             let spring = springs.entry(root).or_insert(Spring {
                 attach,
                 last: None,
-                offset: Vec3::ZERO,
-                velocity: Vec3::ZERO,
+                offset: 0.0,
+                velocity: 0.0,
             });
             if spring.attach != attach {
                 *spring = Spring {
                     attach,
                     last: None,
-                    offset: Vec3::ZERO,
-                    velocity: Vec3::ZERO,
+                    offset: 0.0,
+                    velocity: 0.0,
                 };
             }
-            let point = anchor.transform_point(offset);
-            let moved = spring.last.map(|last| point - last);
-            spring.last = Some(point);
+            let height = anchor.transform_point(offset).y;
+            let moved = spring.last.map(|last| height - last);
+            spring.last = Some(height);
             match moved {
-                Some(moved) if moved.length() < TELEPORT && dt > 0.0 => {
+                Some(moved) if moved.abs() < TELEPORT && dt > 0.0 => {
                     spring.offset -= moved * LAG;
                     let steps = ((dt / STEP).ceil() as u32).clamp(1, MAX_STEPS);
                     let h = dt / steps as f32;
@@ -132,29 +135,26 @@ fn jostle_stowed(
                         spring.velocity += accel * h;
                         spring.offset += spring.velocity * h;
                     }
-                    if spring.offset.length() > MAX_LAG {
-                        spring.offset = spring.offset.normalize_or_zero() * MAX_LAG;
+                    if spring.offset.abs() > MAX_BOUNCE {
+                        spring.offset = spring.offset.clamp(-MAX_BOUNCE, MAX_BOUNCE);
                         spring.velocity *= 0.5;
                     }
                 }
                 _ => {
-                    spring.offset = Vec3::ZERO;
-                    spring.velocity = Vec3::ZERO;
+                    spring.offset = 0.0;
+                    spring.velocity = 0.0;
                 }
             }
-            // A sideways or forward lag tips the part above the point back along it; a bounce
-            // tips the item about the body's side axis.
-            let lag = spring.offset * amount;
-            let level = Vec3::new(lag.x, 0.0, lag.z);
-            let axis = (Vec3::Y.cross(level) - side * lag.y) / ARM;
-            let axis = axis.clamp_length_max(MAX_TILT * amount);
-            let (_, parent_rot, _) = anchor.to_scale_rotation_translation();
-            let tilt = parent_rot.inverse() * Quat::from_scaled_axis(axis) * parent_rot;
-            let want = Transform::from_translation(offset).with_rotation(tilt);
+            // The lag, straight up or down in the world, in the attach bone's frame.
+            let bounce = anchor
+                .affine()
+                .inverse()
+                .transform_vector3(Vec3::Y * (spring.offset * amount));
+            let want = Transform::from_translation(offset + bounce);
             if *transform != want {
                 *transform = want;
             }
-            let placed = Affine3A::from_quat(tilt);
+            let placed = Affine3A::from_translation(bounce);
             match rider_tilt.as_deref_mut() {
                 Some(RiderTilt(now)) => *now = placed,
                 None if rider => {
@@ -164,7 +164,8 @@ fn jostle_stowed(
             }
         }
     }
-    // Items no longer stowed, swapped out, or with the slider at 0: back to the stock placement.
+    // Items drawn or swapped out: the move or the rebuild placed them anew, so only the extra
+    // placement goes.
     let gone: Vec<Entity> = springs
         .keys()
         .copied()
@@ -172,9 +173,6 @@ fn jostle_stowed(
         .collect();
     for root in gone {
         springs.remove(&root);
-        if let Ok((mut transform, _, _, _)) = roots.get_mut(root) {
-            transform.rotation = Quat::IDENTITY;
-        }
         if let Ok(mut entity) = commands.get_entity(root) {
             entity.remove::<RiderTilt>();
         }

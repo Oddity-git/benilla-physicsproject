@@ -153,7 +153,7 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
 - `rig_palette.rs`: `rebase_origin`, `rebase_global` and `write_rig_worlds` made public.
 - `rig_anim/pose.rs`: `RigPose::binds` made public.
 - `rig_rider.rs`: the `RiderTilt` component. `write_rig_riders` appends it to a rider's frame
-  (`F × tilt`), so `jostle` can tip a stowed weapon's rendered model.
+  (`F × tilt`), so `jostle` can bounce a stowed weapon's rendered model.
 - `straddle.rs` and `zfill.rs`: water twin meshes are spawned before Bevy reads which meshes need
   pipelines. This fixed a crash near water that ragdolls exposed. It is a real bug fix, not a
   feature.
@@ -503,17 +503,18 @@ Do not describe this one in the README (section 2).
 - Applies to the mainhand and offhand roots (`HeldAttached::spawned_attach`, slots 0 and 1) on a
   stowed attach point: back (26, 27), shield on the back (28), lower back (30, 31) or hip (32,
   33). A drawn weapon is left alone. Every unit with held items gets it; there is no range cap.
-- Each item keeps a damped spring on its attach point's world position (the anchor's
+- Each item keeps a damped spring on its attach point's world height (the anchor's
   `GlobalTransform`, one frame old, × the attach offset): `FREQUENCY 4`, `DAMPING 0.25`, `LAG 0.6`
-  of the motion, capped at `MAX_LAG 0.08` yd. A jump over `TELEPORT 2` resets it.
-- The lag becomes a tilt about the attach point: a horizontal lag tips the part above the point
-  back along it (`Y × lag`), a vertical one tips it about the unit's side axis. `ARM 0.35` yd of
-  lag is a radian, capped at `MAX_TILT 0.3` rad, both × `weaponMotion`.
-- The tilt goes on two places: the root's `Transform` (rotation, translation kept at the attach
-  offset), which collision, picking and the glow read, and `RiderTilt`, which the rendered rider
-  frame takes. Runs in PostUpdate before `TransformSystems::Propagate`.
-- When an item stops jostling (drawn, swapped, or `weaponMotion` 0), its rotation goes back to
-  identity and `RiderTilt` is removed.
+  of the rise and fall, capped at `MAX_BOUNCE 0.025` yd, × `weaponMotion`. A jump over
+  `TELEPORT 2` resets it.
+- **Vertical only, no tilt.** The lag shifts the item straight up or down in the world. An
+  earlier version tipped it about the attach point from the horizontal lag too; running forward
+  at Weapon Motion 3 swung a back weapon nearly flat, and Mathieu asked for footstep bounce only.
+- The shift goes on two places: the root's `Transform` (the attach offset plus the shift in the
+  anchor's frame), which collision, picking and the glow read, and `RiderTilt` (a translation),
+  which the rendered rider frame takes. Runs in PostUpdate before `TransformSystems::Propagate`.
+- At `weaponMotion` 0 the root goes back to its stock spot once and `RiderTilt` is removed. A
+  drawn or swapped item loses `RiderTilt`; the move or rebuild already placed its `Transform`.
 
 ### `testbox.rs`
 The dev chord + `B` drops a crate model from the install in front of the camera, cycling through
