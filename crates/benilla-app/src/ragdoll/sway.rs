@@ -79,9 +79,12 @@ const LEG_REACH: f32 = 0.15;
 /// The band searched for the rear's tips, under and over the hip, as shares of the height.
 const REAR_BELOW: f32 = 0.15;
 const REAR_ABOVE: f32 = 0.12;
-/// The rear's tips lie between these shares of the hip's distance from the centre.
-const REAR_INNER: f32 = 0.1;
-const REAR_OUTER: f32 = 1.2;
+/// The rear's tips lie between these shares of the hip's distance from the centre, and its
+/// radius is at least this share of that distance: the most backward vertices can sit close
+/// together by the cleft, which would leave each side too small to see.
+const REAR_INNER: f32 = 0.5;
+const REAR_OUTER: f32 = 1.4;
+const REAR_MIN_RADIUS: f32 = 0.9;
 /// The rear's spring, against the chest's: its frequency (Hz) and damping ratio, the share of the
 /// body's motion it lags, the share of the chest's furthest stray, and the most of a vertex its
 /// bone takes, so the hips and thighs still bend it.
@@ -430,11 +433,14 @@ fn manage_sways(
             continue;
         };
         info!(
-            "body physics: {name}: {} parts, chest {}, rear {}, carriers {:?}",
+            "body physics: {name}: {} parts, chest {}, rear {}, carriers {:?}, radii {:?}, \
+             centres {:?}",
             built.len(),
             body.chest.is_ok(),
             body.rear.is_ok(),
-            sides.iter().map(|s| s.carrier).collect::<Vec<_>>()
+            sides.iter().map(|s| s.carrier).collect::<Vec<_>>(),
+            sides.iter().map(|s| s.lobe.radius).collect::<Vec<_>>(),
+            sides.iter().map(|s| s.lobe.centre).collect::<Vec<_>>()
         );
         let slot = own.slot;
         let holder = commands
@@ -566,6 +572,10 @@ fn find_body(
                 hip_x * REAR_INNER..=hip_x * REAR_OUTER,
                 true,
             )
+            .map(|pair| Pair {
+                radius: pair.radius.max(REAR_MIN_RADIUS * hip_x),
+                ..pair
+            })
         });
     Ok(Body { chest, rear })
 }
