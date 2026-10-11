@@ -400,7 +400,8 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
 - Reads the same `Hit` messages as `gore`, with the same gates: Blood off, a bloodless creature
   row, or a non-physical hit that does not kill leaves nothing. Colour is gore's
   `default_colour(violence)`: red, or green at violence 1. On orcs, taurens and trolls (race 2, 6,
-  8) at violence 2 it is `STRONG_RED [1.8, 0.1, 0.07]`: the vertex colour multiplies the texture,
+  8) at violence 2 it is brighter: `STRONG_RED [1.8, 0.1, 0.07]` on taurens, `GREEN_SKIN_RED
+  [1.3, 0.1, 0.07]` on orcs and trolls (1.8 looked neon on green skin): the vertex colour multiplies the texture,
   so the plain red turned green orc skin brown and tauren fur maroon. Over 1 in red is fine; the
   shader does not clamp the vertex colour.
 - **Why copies.** A body's composited texture (`skin_composite.rs`, cached by `SkinKey`) and its

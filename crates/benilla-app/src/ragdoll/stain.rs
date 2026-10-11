@@ -63,11 +63,13 @@ const FADE: f32 = 40.0;
 /// The most a stain covers the texture, and how ragged its edge is (a share of the radius).
 const MAX_COVER: f32 = 0.9;
 const RAGGED: f32 = 0.6;
-/// The red a stain takes on the races whose skin or fur is green or dark (orc 2, tauren 6,
-/// troll 8): over 1 in red, so multiplied into green or grey-blue it still reads as red, not as
-/// brown or maroon.
+/// The red a stain takes on the races whose skin or fur is green or dark: over 1 in red, so
+/// multiplied into it it still reads as red, not as brown or maroon. Tauren fur (6) takes the
+/// strongest; the green skins of orcs (2) and trolls (8) less, or it glows.
 const STRONG_RED: [f32; 3] = [1.8, 0.1, 0.07];
-const STRONG_RACES: [u8; 3] = [2, 6, 8];
+const GREEN_SKIN_RED: [f32; 3] = [1.3, 0.1, 0.07];
+const STRONG_RACES: [(u8, [f32; 3]); 3] =
+    [(2, GREEN_SKIN_RED), (6, STRONG_RED), (8, GREEN_SKIN_RED)];
 /// Fading stains are repainted this often (s).
 const REPAINT: f32 = 0.5;
 
@@ -325,15 +327,14 @@ fn stain_hits(
         };
         let radius = height * (BASE_RADIUS + RADIUS_PER_BAR * share) * scale;
         let seed = (stains.rand() * u32::MAX as f32) as u32;
-        let colour = if violence == 2
-            && store
-                .0
-                .unit_race()
-                .is_some_and(|r| STRONG_RACES.contains(&r))
-        {
-            STRONG_RED
-        } else {
-            default_colour(violence)
+        let strong = store
+            .0
+            .unit_race()
+            .and_then(|r| STRONG_RACES.iter().find(|&&(race, _)| race == r))
+            .map(|&(_, red)| red);
+        let colour = match strong {
+            Some(red) if violence == 2 => red,
+            _ => default_colour(violence),
         };
         if !stains.units.contains_key(&hit.victim) {
             info!(
