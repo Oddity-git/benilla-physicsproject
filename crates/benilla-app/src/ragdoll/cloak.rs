@@ -60,6 +60,11 @@ const TELEPORT: f32 = 5.0;
 /// back and the body clipped out). Bones further than this share of the cloak's length get none.
 const CAPSULE_FIT: f32 = 1.0;
 const CAPSULE_REACH: f32 = 0.5;
+/// The depth bias a cape material draws with: the cape is pulled this many depth-texture units
+/// toward the eye, so it wins the depth test against the body's back under-layer kept for the
+/// hole (`entities/attach`) and the body can never poke through the cape where the cape's own
+/// animation dips into it. In depth units, so the pull grows with distance; sized for a close-up.
+const CAPE_DEPTH_BIAS: f32 = 2.0e4;
 /// The Cloak Motion slider's range (`cloakMotion`): 0 holds the cloak to the animation, 1 is the
 /// tuned swing, more trails and swings further.
 const MAX_MOTION: f32 = 3.0;
@@ -157,7 +162,7 @@ fn manage_cloths(
     parts: Query<CapePart>,
     rigs: Query<(&RigSkin, &GlobalTransform, Option<&Name>)>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
-    materials: Res<Assets<WowModelMaterial>>,
+    mut materials: ResMut<Assets<WowModelMaterial>>,
     mut material_events: MessageReader<AssetEvent<WowModelMaterial>>,
     server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -209,6 +214,18 @@ fn manage_cloths(
                     cape
                 }
             };
+            // Fork: pull the cape in front of the body (`CAPE_DEPTH_BIAS`), so the back under-layer
+            // kept for the hole cannot poke through it. Set once, and only on a change: a rewrite
+            // marks the asset Modified, which the event watcher above would re-ask every frame.
+            if cape
+                && materials
+                    .get(material.id())
+                    .is_some_and(|m| m.base.depth_bias != CAPE_DEPTH_BIAS)
+            {
+                if let Some(m) = materials.get_mut(material.id()) {
+                    m.base.depth_bias = CAPE_DEPTH_BIAS;
+                }
+            }
             let d = at.translation().distance(eye);
             if cape && d <= MAX_RANGE {
                 by_rig
