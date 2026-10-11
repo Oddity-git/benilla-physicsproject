@@ -71,11 +71,13 @@ const MAX_SIZE: f32 = 2.5;
 const TELEPORT: f32 = 2.0;
 /// A leg root is off the centre by this share of the height, with this many bones under it, sits
 /// this share of the height under the shoulder, and its chain reaches this share of the height
-/// from the ground.
+/// from the ground. The hip found must sit at least `HIP_LOWEST` of the height off the ground, so
+/// a knee is never taken for it.
 const LEG_OFF_CENTRE: f32 = 0.02;
 const LEG_CHAIN: usize = 2;
-const LEG_UNDER_SHOULDER: f32 = 0.35;
+const LEG_UNDER_SHOULDER: f32 = 0.15;
 const LEG_REACH: f32 = 0.15;
+const HIP_LOWEST: f32 = 0.35;
 /// The band searched for the rear's tips, under and over the hip, as shares of the height.
 const REAR_BELOW: f32 = 0.15;
 const REAR_ABOVE: f32 = 0.12;
@@ -566,6 +568,9 @@ fn find_body(
         .ok_or("no leg found")
         .and_then(|hip| {
             let (hip_y, hip_x) = (pivots[hip].y, pivots[hip].x.abs());
+            if hip_y < bottom + HIP_LOWEST * height {
+                return Err("the hip found is too low");
+            }
             find_pair(
                 &all,
                 (hip_y - REAR_BELOW * height)..=(hip_y + REAR_ABOVE * height),
