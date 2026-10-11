@@ -403,7 +403,15 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
 - **Bleeding.** `bleed()` inserts or extends `Bleeding` (`BLEED_HOLD 3.5` s). `squirt_bleeds`
   shoots heartbeat pulses (`PULSE 0.7`, `SPURT 0.35`) from one wound at
   `WOUND_HEIGHT 0.35–0.75` of the body.
-- **Cuts.** `bleed_cuts` makes each severed limb burst and splash once.
+- **Cuts.** `bleed_cuts` makes each severed limb burst and splash once, and spawns two `Wound`
+  entities per cut: a stock splat texture on the stump's face and one on the severed piece's.
+  `dismember::pose_limbs` stores each cut's faces in world space every frame (`Wounds`: the
+  stump at the root's bind point on its parent, facing along the bone; the piece at its root
+  joint, facing back up it), and `push_wounds` draws each as a quad turned to the eye, half-size
+  `CUT_FACE 0.07` × the unit's height, pushed `CUT_FACE_OUT 0.25` of that out of the flesh and
+  `CUT_FACE_TO_EYE 0.5` toward the eye so the body does not hide it. Mathieu found the cut's
+  vertex stain too faint and asked for the ground splat on the stump. `drop_wounds` removes them
+  when the unit is healed or gone, or Blood is off.
 - Droplets are drawn as effect quads through `WorldEffectDraw` (`push_decals` after
   `begin_effect_frame`). Do not spawn an entity per droplet; that was too slow.
 - Update chain: `spray_hits → bleed_cuts → squirt_bleeds → fly_droplets → start_pools →

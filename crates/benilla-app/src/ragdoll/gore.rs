@@ -5,6 +5,8 @@
 //!   share of the victim's health and the most on a killing blow; each leaves a splat where it lands.
 //! - A ragdoll bleeds a pool that spreads under its body, where the body ends up.
 //! - A bleed's ticks keep its victim squirting blood from one wound, in heartbeat pulses.
+//! - A severed limb wears a splat on each face of its cut, the stump's and the piece's, turned to
+//!   the eye and riding them.
 //!
 //! The splat art is `UnitBlood`'s ground-splat column, which 1.12.1 ships but never draws
 //! (`benilla_formats::blood`): through the same censored row as the spurt, so green blood at
@@ -102,6 +104,11 @@ const CUT_SPLATS: (f32, f32) = (3.0, 5.0);
 const CUT_SPLAT: (f32, f32) = (0.35, 0.6);
 /// Each lost limb grows the body's pool by this share.
 const POOL_PER_LIMB: f32 = 0.5;
+/// A cut's splat: its half-size as a share of the unit's height, pushed this share of it out of
+/// the flesh and toward the eye so the body does not swallow it.
+const CUT_FACE: f32 = 0.07;
+const CUT_FACE_OUT: f32 = 0.25;
+const CUT_FACE_TO_EYE: f32 = 0.5;
 /// The height a unit with no model bound counts as (yd).
 const DEFAULT_HEIGHT: f32 = 1.8;
 
@@ -121,6 +128,7 @@ pub(super) fn plugin(app: &mut App) {
             )
                 .chain(),
         )
+        .add_systems(Update, drop_wounds)
         .add_systems(PostUpdate, push_decals.after(begin_effect_frame));
 }
 
@@ -268,6 +276,17 @@ struct Pool {
     born: f32,
     projected_at: f32,
     verts: Vec<EffectVertex>,
+    blood: Blood,
+}
+
+/// A splat on one face of a severed limb's cut: the stump's, or the piece's.
+#[derive(Component)]
+struct Wound {
+    unit: Entity,
+    bone: usize,
+    piece: bool,
+    half: f32,
+    roll: f32,
     blood: Blood,
 }
 
@@ -651,7 +670,7 @@ fn squirt_bleeds(
 fn bleed_cuts(
     mut commands: Commands,
     mut cuts: MessageReader<super::dismember::Severed>,
-    units: Query<(&Transform, &NetEntity)>,
+    units: Query<(&Transform, &NetEntity, Option<&ModelBound>)>,
     creatures: Option<Res<Creatures>>,
     blood: Option<Res<BloodTables>>,
     cvars: Option<Res<crate::cvars::Cvars>>,
@@ -668,7 +687,7 @@ fn bleed_cuts(
     };
     let now = time.elapsed_secs();
     for cut in cuts.read() {
-        let Ok((tf, net)) = units.get(cut.unit) else {
+        let Ok((tf, net, bound)) = units.get(cut.unit) else {
             continue;
         };
         let Some(id) = unit_blood_id(creatures.as_deref(), &blood, net.display_id) else {
@@ -676,6 +695,23 @@ fn bleed_cuts(
         };
         let splats = blood.0.splats(id, violence);
         let ground = tf.translation.y;
+        for piece in [false, true] {
+            let Some(texture) = gore.pick_texture(&server, splats) else {
+                break;
+            };
+            let roll = gore.range((0.0, std::f32::consts::TAU));
+            commands.spawn((
+                Name::new("cut splat"),
+                Wound {
+                    unit: cut.unit,
+                    bone: cut.bone,
+                    piece,
+                    half: CUT_FACE * height_of(net, bound),
+                    roll,
+                    blood: Blood { texture, violence },
+                },
+            ));
+        }
         for _ in 0..(CUT_DROPS as f32 * amount).round() as usize {
             let Some(texture) = gore.pick_texture(&server, splats) else {
                 break; // bloodless
@@ -1016,6 +1052,21 @@ fn age_splats(
     gore.splats.retain(|e| splats.contains(*e));
 }
 
+/// A cut's splats go with their limb: the unit made whole or gone, or the Blood option off.
+fn drop_wounds(
+    mut commands: Commands,
+    wounds: Query<(Entity, &Wound)>,
+    cut: Query<(), With<super::dismember::Dismembered>>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+) {
+    let off = violence_level(cvars.as_deref()) == 0;
+    for (e, wound) in &wounds {
+        if off || !cut.contains(wound.unit) {
+            commands.entity(e).despawn();
+        }
+    }
+}
+
 /// Draw every splat and pool: alpha-blended on the footprint rung, so they paint over the blob
 /// shadows and under everything standing.
 #[allow(clippy::too_many_arguments)] // one Bevy system's resources
@@ -1024,6 +1075,8 @@ fn push_decals(
     mut draw: WorldEffectDraw,
     splats: Query<(Entity, &Splat)>,
     pools: Query<(Entity, &Pool)>,
+    wounds: Query<(Entity, &Wound)>,
+    cut: Query<&super::dismember::Dismembered>,
     images: Res<Assets<Image>>,
     time: Res<Time>,
     mut gore: ResMut<Gore>,
@@ -1033,6 +1086,7 @@ fn push_decals(
     };
     let now = time.elapsed_secs();
     push_droplets(&mut draw, cam, cam_tf, &gore);
+    push_wounds(&mut draw, cam, cam_tf, &mut gore, &images, &wounds, &cut);
     let draws = splats
         .iter()
         .map(|(e, s)| (e, &s.verts, &s.blood, s.anchor, SPLAT_LIFE - (now - s.born)))
@@ -1058,6 +1112,70 @@ fn push_decals(
             color: [colour[0], colour[1], colour[2], v.color[3] * fade],
             ..*v
         }));
+        batch.tris();
+    }
+}
+
+/// Draw each cut's splats facing the eye, a little out of the flesh on each face, lit no brighter
+/// than the ground's.
+fn push_wounds(
+    draw: &mut WorldEffectDraw,
+    cam: Entity,
+    cam_tf: &GlobalTransform,
+    gore: &mut Gore,
+    images: &Assets<Image>,
+    wounds: &Query<(Entity, &Wound)>,
+    cut: &Query<&super::dismember::Dismembered>,
+) {
+    let eye = cam_tf.translation();
+    for (owner, wound) in wounds {
+        let Some(faces) = cut.get(wound.unit).ok().and_then(|c| c.wounds(wound.bone)) else {
+            continue;
+        };
+        let (at, out) = if wound.piece {
+            faces.piece
+        } else {
+            faces.stump
+        };
+        let half = wound.half;
+        let to_eye = (eye - at).normalize_or(Vec3::Y);
+        let centre = at + out * half * CUT_FACE_OUT + to_eye * half * CUT_FACE_TO_EYE;
+        let up = if to_eye.y.abs() > 0.99 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
+        let right = up.cross(to_eye).normalize();
+        let up = to_eye.cross(right);
+        let (sin, cos) = wound.roll.sin_cos();
+        let a = (right * cos + up * sin) * half;
+        let b = (up * cos - right * sin) * half;
+        let (texture, tint) = resolve_look(gore, images, &wound.blood);
+        let color = [tint[0] * DIM, tint[1] * DIM, tint[2] * DIM, 1.0];
+        let corner = |p: Vec3, uv: [f32; 2]| EffectVertex {
+            pos: p.to_array(),
+            uv,
+            color,
+        };
+        let (p00, p10, p11, p01) = (
+            centre - a - b,
+            centre + a - b,
+            centre + a + b,
+            centre - a + b,
+        );
+        let mut batch = draw
+            .batch(cam, texture)
+            .alpha()
+            .anchored(centre)
+            .owner(owner);
+        batch.extend([
+            corner(p00, [0.0, 0.0]),
+            corner(p10, [1.0, 0.0]),
+            corner(p11, [1.0, 1.0]),
+            corner(p00, [0.0, 0.0]),
+            corner(p11, [1.0, 1.0]),
+            corner(p01, [0.0, 1.0]),
+        ]);
         batch.tris();
     }
 }

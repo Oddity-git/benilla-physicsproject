@@ -76,12 +76,26 @@ struct Limb {
     mask: Vec<bool>,
     holder: Option<Entity>,
     tried: bool,
+    /// Where the cut is this frame, on the stump and on the severed piece ([`pose_limbs`]).
+    wounds: Option<Wounds>,
+}
+
+/// The two faces of a cut in the world: each a point and the way it faces out of the flesh.
+#[derive(Clone, Copy)]
+pub(super) struct Wounds {
+    pub(super) stump: (Vec3, Vec3),
+    pub(super) piece: (Vec3, Vec3),
 }
 
 impl Dismembered {
     /// How many limbs the unit lost.
     pub(super) fn count(&self) -> usize {
         self.limbs.len()
+    }
+
+    /// The cut of the limb rooted at `bone`, once posed.
+    pub(super) fn wounds(&self, bone: usize) -> Option<Wounds> {
+        self.limbs.iter().find(|l| l.root == bone)?.wounds
     }
 
     /// The limbs rooted at `roots`, each taking every bone below it.
@@ -102,6 +116,7 @@ impl Dismembered {
                     mask,
                     holder: None,
                     tried: false,
+                    wounds: None,
                 }
             })
             .collect();
@@ -356,7 +371,7 @@ fn heal_limbs(
 /// bones where they are, the rest collapsed onto its joint), then fold the limb into the stump on
 /// the unit's own pose. A frozen ragdoll keeps its copies' last rows.
 pub(super) fn pose_limbs(
-    mut rigs: Query<(&mut RigPose, &Ragdoll, &Dismembered)>,
+    mut rigs: Query<(&mut RigPose, &Ragdoll, &mut Dismembered)>,
     frames: Query<&GlobalTransform>,
     skins: Query<&RigSkin>,
     ibps: Res<Assets<SkinnedMeshInverseBindposes>>,
@@ -364,6 +379,7 @@ pub(super) fn pose_limbs(
 ) {
     for (rig, rag, cut) in &mut rigs {
         let rig = rig.into_inner();
+        let cut = cut.into_inner();
         if rag.frozen.is_none() {
             if let Ok(root_g) = frames.get(rig.joints_root) {
                 let n = rig.locals.len().min(rig.parents.len());
@@ -377,6 +393,10 @@ pub(super) fn pose_limbs(
                 }
                 let origin = rebase_origin(root_g.translation());
                 let root_rel = rebase_global(*root_g, origin).affine();
+                let world = root_g.affine();
+                for limb in cut.limbs.iter_mut() {
+                    limb.wounds = wounds(rig, &model, limb, &world);
+                }
                 for limb in &cut.limbs {
                     let Some(skin) = limb.holder.and_then(|h| skins.get(h).ok()) else {
                         continue;
@@ -418,4 +438,33 @@ pub(super) fn pose_limbs(
         }
         rig.pose_dirty = true;
     }
+}
+
+/// Where `limb`'s cut is in the world, from the pose before the fold: the stump's face at the
+/// root's bind point on its parent, facing along the bone, and the piece's at the root's joint,
+/// facing back up it.
+fn wounds(rig: &RigPose, model: &[Affine3A], limb: &Limb, world: &Affine3A) -> Option<Wounds> {
+    let at = |i: usize| {
+        model
+            .get(i)
+            .map(|m| world.transform_point3(m.translation.into()))
+    };
+    let parent = usize::try_from(*rig.parents.get(limb.root)?)
+        .ok()
+        .filter(|&p| p < limb.root)?;
+    let bind = *rig.binds.get(limb.root)?;
+    let stump = world.transform_point3(model.get(parent)?.transform_point3(bind));
+    let piece = at(limb.root)?;
+    let out = (stump - at(parent)?).normalize_or(Vec3::Y);
+    // The piece faces away from its first child, else straight back at the stump.
+    let child = (limb.root + 1..rig.parents.len())
+        .find(|&i| usize::try_from(rig.parents[i]).ok() == Some(limb.root));
+    let back = child
+        .and_then(at)
+        .and_then(|c| (piece - c).try_normalize())
+        .unwrap_or(-out);
+    Some(Wounds {
+        stump: (stump, out),
+        piece: (piece, back),
+    })
 }
