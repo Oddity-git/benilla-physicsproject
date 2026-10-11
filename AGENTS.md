@@ -14,4 +14,8 @@ The rest of the root is code and data: `crates/` the workspace, `reference/` the
 catalogues the tests check against, `scripts/` the gates and instruments, `third_party/`
 vendored code.
 
+Fork: this is the physics fork. Read `docs/PHYSICS_FORK.md` first; it lists where the fork
+departs from the rules below and how its features are built.
+
 @docs/METHOD.md
+@docs/PHYSICS_FORK.md
