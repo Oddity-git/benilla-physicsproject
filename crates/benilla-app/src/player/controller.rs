@@ -375,8 +375,8 @@ pub(super) fn control(
         // camera, the body turns to it and runs forward.
         #[cfg(feature = "ragdoll")]
         let omni = {
-            let right = i32::from(axes.strafe_right || axes.turn_right)
-                - i32::from(axes.strafe_left || axes.turn_left);
+            let right = i32::from(axes.turn_right) - i32::from(axes.turn_left);
+            let strafe = i32::from(axes.strafe_right) - i32::from(axes.strafe_left);
             let in_combat = body
                 .single()
                 .ok()
@@ -385,6 +385,7 @@ pub(super) fn control(
             let steer = crate::ragdoll::omni::steer(
                 axes.fwd,
                 right,
+                strafe != 0,
                 axes.mouselook || !may_turn || !may_translate,
                 cam.yaw,
                 player.face_yaw,
@@ -394,11 +395,10 @@ pub(super) fn control(
             if let Some(steer) = &steer {
                 player.face_yaw = steer.face_yaw;
                 axes.fwd = i32::from(steer.run);
-                axes.side = 0;
-                axes.translating = steer.run;
+                // Q/E keep strafing along the facing.
+                axes.side = strafe;
+                axes.translating = steer.run || strafe != 0;
                 axes.turning = false;
-                axes.strafe_left = false;
-                axes.strafe_right = false;
                 axes.turn_left = false;
                 axes.turn_right = false;
             }

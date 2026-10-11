@@ -12,7 +12,6 @@
 //! The edit goes on the animated `locals` in the pose post-pass, remembered so a frame the
 //! animation does not rewrite starts from the animated pose again, not from this frame's edit.
 
-use avian3d::prelude::SpatialQuery;
 use bevy::ecs::entity::EntityHashMap;
 use bevy::prelude::*;
 
@@ -84,7 +83,8 @@ fn find_legs(rig: &RigPose) -> Option<(usize, Vec<Leg>)> {
         let Some(parent) = body.parent else {
             continue;
         };
-        if !down(body.segment) || down(bodies[parent].segment) {
+        // A leg hangs straight off the hub (the pelvis); an arm hangs off the shoulder.
+        if parent != 0 || !down(body.segment) {
             continue;
         }
         let Some(knee) = bodies
@@ -141,8 +141,7 @@ fn plant_feet(
     >,
     roots: Query<&GlobalTransform>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
-    spatial: SpatialQuery,
-    decals: benilla_world::decal::WorldDecal,
+    collide: benilla_world::collision::WorldCollision,
     time: Res<Time>,
     cvars: Option<Res<crate::cvars::Cvars>>,
     mut planted: Local<EntityHashMap<Planted>>,
@@ -155,17 +154,10 @@ fn plant_feet(
         .clamp(0.0, MAX_AMOUNT);
     let eye = camera.single().ok().map(|g| g.translation());
     let follow = 1.0 - (-RATE * time.delta_secs()).exp();
-    let filter = benilla_world::collision::WorldCollision::body_filter();
+    // What the body walks on: terrain, buildings and doodads such as rocks.
     let ground = |at: Vec3| {
-        spatial
-            .cast_ray_predicate(
-                at + Vec3::Y * PROBE_UP,
-                Dir3::NEG_Y,
-                PROBE_UP + PROBE_DOWN,
-                true,
-                &filter,
-                &|e| decals.receives(e),
-            )
+        collide
+            .ray_body(at + Vec3::Y * PROBE_UP, Dir3::NEG_Y, PROBE_UP + PROBE_DOWN)
             .map(|hit| (at.y + PROBE_UP - hit.distance, hit.normal))
     };
     planted.retain(|e, _| rigs.contains(*e));

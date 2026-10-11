@@ -3,7 +3,8 @@
 //!
 //! 1.12 walks the character along its own facing: S backpedals and A/D turn. With the box on, and
 //! the right mouse button up, the movement keys name a direction from the camera instead: W runs
-//! away from it, S toward it, A/D and Q/E to its sides, and diagonals between. The character turns
+//! away from it, S toward it, A/D to its sides, and diagonals between; Q/E strafe along the facing
+//! as they always do. The character turns
 //! to that direction and runs forward, never backpedalling. Letting go in combat turns it back to
 //! where the camera looks, so it faces what it fights. Holding the right mouse button is the stock
 //! steering, untouched.
@@ -65,12 +66,15 @@ fn turn_toward(face: f32, target: f32, dt: f32) -> f32 {
     face + left.clamp(-budget, budget)
 }
 
-/// Steer from the camera: `fwd` is W/S (+1 away from the camera), `right` the A/D and Q/E keys
-/// (+1 right). `None` leaves the stock controls alone: the box off, the right button held
-/// (`stock`), or nothing to do. The yaws are the camera's and the character's, one convention.
+/// Steer from the camera: `fwd` is W/S (+1 away from the camera), `right` the A/D keys (+1
+/// right). Q/E strafe as they always do, along the facing. `None` leaves the stock controls alone:
+/// the box off, the right button held (`stock`), only a strafe key held (`strafing`), or nothing to
+/// do. The yaws are the camera's and the character's, one convention.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn steer(
     fwd: i32,
     right: i32,
+    strafing: bool,
     stock: bool,
     cam_yaw: f32,
     face_yaw: f32,
@@ -83,6 +87,11 @@ pub(crate) fn steer(
         return None;
     }
     let (fwd, right) = (fwd.signum(), right.signum());
+    if fwd == 0 && right == 0 && strafing {
+        MOVING.store(false, Ordering::Relaxed);
+        FACING_CAMERA.store(false, Ordering::Relaxed);
+        return None;
+    }
     if fwd != 0 || right != 0 {
         MOVING.store(true, Ordering::Relaxed);
         FACING_CAMERA.store(false, Ordering::Relaxed);

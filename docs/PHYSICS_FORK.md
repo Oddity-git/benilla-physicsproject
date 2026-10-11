@@ -591,12 +591,15 @@ Do not describe this one in the README (section 2).
 - Players only (`object_type() == Player`; Mathieu asked for players only after creatures sank
   through the floor), alive, on foot, within `RANGE 60` yd of the camera, not a ragdoll, not
   parked, not mounted (`unit_mount_display_id`). Two or more legs needed.
-- **Legs** come from `rig::build_profile`: a body whose segment runs down off one that does not
-  is a hip, its downward body child the knee, and the knee's direct child nearest the knee
-  segment's end the ankle. A quadruped's four legs all count. A rig without legs is remembered in
+- **Legs** come from `rig::build_profile`: a body whose segment runs down straight off the hub
+  (body 0, the pelvis) is a hip, its downward body child the knee, and the knee's direct child
+  nearest the knee segment's end the ankle. An earlier rule (a downward body off one that does
+  not run down) took the arms for legs too, and they reached for the ground. A rig without legs is remembered in
   `failed` until its bone count changes.
 - **Ground.** One down-ray under the unit's feet and one under each ankle (`PROBE_UP 1` to
-  `PROBE_DOWN 1.5`), against the decal receivers like `entities/conform.rs`. Each leg's lift is
+  `PROBE_DOWN 1.5`), `WorldCollision::ray_body`: what the body walks on, rocks and other doodads
+  included. The decal receivers (as `entities/conform.rs` uses) missed a rock, so standing on
+  one read as airborne and planted nothing. Each leg's lift is
   its ground minus the middle's, × `footPlanting`, capped at `MAX_REACH 0.35` of the leg's
   length. The middle more than `AIRBORNE 0.3` from the feet (jumping, swimming) plants nothing.
   Only offsets count, so a swinging foot keeps its stride.
@@ -616,9 +619,11 @@ Do not describe this one in the README (section 2).
   chose this fork, because it changes keyboard movement too. A stick can feed the same direction
   later.
 - `steer(fwd, right, stock, cam_yaw, face_yaw, in_combat, dt)` is called by the controller hook
-  (section 5). `fwd` is the net W/S axis (autorun counts as W), `right` the A/D and Q/E keys
-  together. It returns `None`, leaving the stock controls alone, when the box is off, when
-  `stock` (right mouse held, `may_turn` or `may_translate` down), or when nothing is pressed.
+  (section 5). `fwd` is the net W/S axis (autorun counts as W), `right` the A/D keys
+  (the turn keys). Q/E strafe along the facing as in 1.12, also while steering (Mathieu asked for
+  strafe to stay as it was). It returns `None`, leaving the stock controls alone, when the box is
+  off, when `stock` (right mouse held, `may_turn` or `may_translate` down), when only a strafe key
+  is held, or when nothing is pressed.
 - With input, the target yaw is `cam_yaw + atan2(−right, fwd)` (yaw grows leftward, forward is
   −Z); the facing turns toward it at `TURN_RATE 12` rad/s and the axes become a plain forward
   run: no backpedal, no strafe bits, no turn bits. The facing streams as `SET_FACING`.
