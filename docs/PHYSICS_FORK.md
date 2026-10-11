@@ -99,7 +99,7 @@ the install, and keep local state in `benilla-config/`.
 
 ## 4. Repository layout
 
-- **Upstream base:** commit `2e82d34c`. The first fork commit is `6ead3cdf` ("Ragdoll step 1").
+- **Upstream base:** commit `2e82d34c` (`v0.2.0-116`, between releases). The first fork commit is `6ead3cdf` ("Ragdoll step 1").
   `git diff 2e82d34 HEAD` shows everything the fork changed.
 - **Fork code:** `crates/benilla-app/src/ragdoll/`, about 5,500 lines in 16 files.
 - **Fork options page:** `crates/benilla-app/assets/ui/PhysicsOptions.xml`.
@@ -158,6 +158,10 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
 - `straddle.rs` and `zfill.rs`: water twin meshes are spawned before Bevy reads which meshes need
   pipelines. This fixed a crash near water that ragdolls exposed. It is a real bug fix, not a
   feature.
+
+**Only merge upstream releases.** Mathieu follows benilla's tagged releases, never its `main`:
+the next merge is the first release tag after v0.2.0 (`git fetch up --tags`, then
+`git merge <tag>`), and no upstream commit between tags is pulled in.
 
 **When merging upstream:** keep each hook a one- or two-line change. If upstream moved the code,
 re-apply the hook in the new place and keep the `Fork:` comment.
