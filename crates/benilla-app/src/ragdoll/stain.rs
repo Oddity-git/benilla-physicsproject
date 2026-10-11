@@ -21,6 +21,7 @@ use benilla_assets::materials::WowModelMaterial;
 use benilla_world::mesh_tag::rig_of;
 use benilla_world::model_render::park::ParkedMesh;
 use benilla_world::model_render::ModelPart;
+use benilla_world::rig_anim::RigPose;
 use benilla_world::rig_palette::{RigPart, RigSkin};
 
 use super::blow::Hit;
@@ -70,6 +71,10 @@ const STRONG_RED: [f32; 3] = [1.8, 0.1, 0.07];
 const GREEN_SKIN_RED: [f32; 3] = [1.3, 0.1, 0.07];
 const STRONG_RACES: [(u8, [f32; 3]); 3] =
     [(2, GREEN_SKIN_RED), (6, STRONG_RED), (8, GREEN_SKIN_RED)];
+/// A severed limb's cut: a stain this share of the body's height across, on the stump and on the
+/// severed piece, the stain's colour darkened by this much and covering fully.
+const CUT_RADIUS: f32 = 0.07;
+const CUT_DARKEN: f32 = 0.5;
 /// Fading stains are repainted this often (s).
 const REPAINT: f32 = 0.5;
 
@@ -77,13 +82,13 @@ pub(super) fn plugin(app: &mut App) {
     app.init_resource::<Stains>()
         .add_systems(
             Update,
-            (stain_hits, manage_stains, manage_weapon_stains)
+            (stain_hits, stain_cuts, manage_stains, manage_weapon_stains)
                 .chain()
                 .after(manage_sways),
         )
         .add_systems(
             PostUpdate,
-            (sync_stain_copies, hide_stained_parts)
+            (sync_stain_copies, draw_limb_stains, hide_stained_parts)
                 .chain()
                 .before(VisibilitySystems::VisibilityPropagate),
         );
@@ -133,12 +138,13 @@ struct Weapon {
     last_paint: f32,
 }
 
-/// One stain, in bind space.
+/// One stain, in bind space; a cut is the deep red where a limb came off.
 struct Stain {
     centre: Vec3,
     radius: f32,
     born: f32,
     seed: u32,
+    cut: bool,
 }
 
 /// A stock part and where its stains are drawn.
@@ -360,6 +366,7 @@ fn stain_hits(
             radius,
             born: now,
             seed,
+            cut: false,
         });
         if unit.stains.len() > MAX_STAINS {
             unit.stains.remove(0);
@@ -423,11 +430,118 @@ fn stain_hits(
                     radius: size * (WEAPON_RADIUS + WEAPON_RADIUS_PER_BAR * share) * scale,
                     born: now,
                     seed,
+                    cut: false,
                 });
                 if entry.stains.len() > MAX_STAINS {
                     entry.stains.remove(0);
                 }
             }
+        }
+    }
+}
+
+/// A severed limb's cut: a deep red stain at its root bone's bind pivot, on the unit's stained
+/// parts, which draw the stump, and through [`draw_limb_stains`] on the severed piece.
+fn stain_cuts(
+    mut cuts: MessageReader<super::dismember::Severed>,
+    victims: Query<(&RigPose, &NetEntity, &ObjectStore)>,
+    creatures: Option<Res<Creatures>>,
+    blood: Option<Res<BloodTables>>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+    time: Res<Time>,
+    mut stains: ResMut<Stains>,
+) {
+    let violence = violence_level(cvars.as_deref());
+    let scale = cvars
+        .as_deref()
+        .and_then(|c| c.num("bloodStains"))
+        .unwrap_or(1.0);
+    let Some(blood) = blood.filter(|_| violence > 0 && scale > 0.0) else {
+        cuts.clear();
+        return;
+    };
+    let now = time.elapsed_secs();
+    for cut in cuts.read() {
+        let Ok((rig, net, store)) = victims.get(cut.unit) else {
+            continue;
+        };
+        let Some(id) = unit_blood_id(creatures.as_deref(), &blood, net.display_id) else {
+            continue;
+        };
+        if blood.0.splats(id, violence).is_empty() {
+            continue; // bloodless
+        }
+        // The bind pivots, the space the mesh vertices are in.
+        let n = rig.binds.len().min(rig.parents.len());
+        let mut pivots = vec![Vec3::ZERO; n];
+        for i in 0..n {
+            let parent = usize::try_from(rig.parents[i]).ok().filter(|&p| p < i);
+            pivots[i] = parent.map_or(Vec3::ZERO, |p| pivots[p]) + rig.binds[i];
+        }
+        let Some(&centre) = pivots.get(cut.bone) else {
+            continue;
+        };
+        let (lo, hi) = pivots.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+            (lo.min(p.y), hi.max(p.y))
+        });
+        let height = (hi - lo).max(f32::EPSILON);
+        let strong = store
+            .0
+            .unit_race()
+            .and_then(|r| STRONG_RACES.iter().find(|&&(race, _)| race == r))
+            .map(|&(_, red)| red);
+        let colour = match strong {
+            Some(red) if violence == 2 => red,
+            _ => default_colour(violence),
+        };
+        let seed = (stains.rand() * u32::MAX as f32) as u32;
+        let unit = stains.units.entry(cut.unit).or_insert_with(|| Stained {
+            stains: Vec::new(),
+            colour,
+            parts: Vec::new(),
+            last_hit: now,
+            last_paint: now,
+            dirty: true,
+        });
+        unit.colour = colour;
+        unit.last_hit = now;
+        unit.dirty = true;
+        unit.stains.push(Stain {
+            centre,
+            radius: CUT_RADIUS * height,
+            born: now,
+            seed,
+            cut: true,
+        });
+        // The cut stays: the oldest hit stain goes first.
+        if unit.stains.len() > MAX_STAINS {
+            if let Some(at) = unit.stains.iter().position(|s| !s.cut) {
+                unit.stains.remove(at);
+            }
+        }
+    }
+}
+
+/// Draws each severed limb's parts with the unit's stained mesh while it has one, so the piece
+/// shows its stains and its cut, and with the stock mesh again once they fade.
+fn draw_limb_stains(
+    stains: Res<Stains>,
+    mut limbs: Query<(&super::dismember::LimbPart, &mut Mesh3d)>,
+) {
+    for (limb, mut mesh) in &mut limbs {
+        let stained = stains
+            .units
+            .values()
+            .flat_map(|u| &u.parts)
+            .find(|p| p.part == limb.stock)
+            .and_then(|p| match &p.target {
+                Target::Own { mesh, .. } => Some(mesh),
+                // The sway's mesh rides extra bones the limb's palette does not have.
+                Target::Sway { .. } => None,
+            });
+        let want = stained.unwrap_or(&limb.mesh);
+        if mesh.0 != *want {
+            mesh.0 = want.clone();
         }
     }
 }
@@ -460,16 +574,20 @@ fn paint(stock: &Mesh, stains: &[Stain], colour: [f32; 3], now: f32) -> Option<V
             .enumerate()
             .map(|(i, p)| {
                 let p = Vec3::from(*p);
-                let cover = stains
-                    .iter()
-                    .map(|s| {
-                        let edge = s.radius * (1.0 - RAGGED * 0.5 + RAGGED * ragged(i, s.seed));
-                        let t = (1.0 - p.distance(s.centre) / edge).clamp(0.0, 1.0);
-                        t * t * (3.0 - 2.0 * t) * left(s, now)
-                    })
-                    .fold(0.0, f32::max)
-                    * MAX_COVER;
-                let c = Vec3::ONE.lerp(tint, cover);
+                let cover = |cut: bool| {
+                    stains
+                        .iter()
+                        .filter(|s| s.cut == cut)
+                        .map(|s| {
+                            let edge = s.radius * (1.0 - RAGGED * 0.5 + RAGGED * ragged(i, s.seed));
+                            let t = (1.0 - p.distance(s.centre) / edge).clamp(0.0, 1.0);
+                            t * t * (3.0 - 2.0 * t) * left(s, now)
+                        })
+                        .fold(0.0, f32::max)
+                };
+                let c = Vec3::ONE
+                    .lerp(tint, cover(false) * MAX_COVER)
+                    .lerp(tint * CUT_DARKEN, cover(true));
                 let b = base.as_ref().map_or([1.0; 4], |b| b[i]);
                 [b[0] * c.x, b[1] * c.y, b[2] * c.z, b[3]]
             })

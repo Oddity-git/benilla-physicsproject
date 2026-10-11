@@ -595,7 +595,12 @@ fn start_ragdolls(
                 let at = rig.model.get(bone).map_or(unit_tf.translation(), |m| {
                     world.transform_point3(m.translation.into())
                 });
-                severs.write(super::dismember::Severed { unit, at, away });
+                severs.write(super::dismember::Severed {
+                    unit,
+                    bone,
+                    at,
+                    away,
+                });
             }
             info!("ragdoll: unit {unit} loses bones {roots:?}");
             commands

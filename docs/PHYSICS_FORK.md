@@ -443,7 +443,15 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   A re-dress rebuilds the copies; the stains stay.
 - Hidden stock parts follow the 6.2 rules: `hide_stained_parts` re-asserts `Hidden` before
   `VisibilityPropagate`, and `release` restores `Inherited` unless the sway holds the part.
-- A severed limb (`dismember`) draws from the stock mesh, so it shows no stains.
+- **Cuts.** `stain_cuts` reads `dismember::Severed` (which carries the limb's root `bone`) and adds
+  a cut stain at that bone's bind pivot: `CUT_RADIUS 0.07` of the height across, the unit's stain
+  colour × `CUT_DARKEN 0.5`, covering fully. Mathieu asked for a deep red where the limb comes off.
+  The stained parts draw the stump. The severed piece's parts carry `dismember::LimbPart` (their
+  stock part and mesh), and `draw_limb_stains` (PostUpdate) swaps their `Mesh3d` to the unit's
+  stained copy of that part while there is one, so the piece shows the cut and any earlier stains,
+  and back to the stock mesh after. A part the sway draws keeps the stock mesh on the piece (the
+  sway's mesh rides extra bones the limb's palette lacks). Cut stains are kept when the
+  `MAX_STAINS` cap drops old ones. Blood off, a bloodless creature or Blood Stains 0 skip it.
 - **Weapons.** When the attacker stands within `WEAPON_REACH 8` yd, its mainhand (and its
   offhand on `OFFHAND_SHARE 0.5` of hits) is bloodied too. Item mesh parts are the held root's
   children and grandchildren (`HeldAttached::spawned_attach`). An item's model is that unit's own

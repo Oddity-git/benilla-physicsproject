@@ -57,6 +57,8 @@ pub(super) fn plugin(app: &mut App) {
 #[derive(Message, Clone, Copy)]
 pub(super) struct Severed {
     pub(super) unit: Entity,
+    /// The limb's root bone, where the cut is.
+    pub(super) bone: usize,
     pub(super) at: Vec3,
     pub(super) away: Vec3,
 }
@@ -105,6 +107,14 @@ impl Dismembered {
             .collect();
         Self { limbs }
     }
+}
+
+/// On each part of a limb copy: the stock part it copies and that part's mesh, so the stains can
+/// draw it with the unit's stained mesh (the cut's own stain included) and put it back after.
+#[derive(Component)]
+pub(super) struct LimbPart {
+    pub(super) stock: Entity,
+    pub(super) mesh: Handle<Mesh>,
 }
 
 /// On a limb copy's palette holder: the unit it was cut from.
@@ -304,6 +314,10 @@ fn build_limb_copies(
                     continue;
                 }
                 let mut copy = commands.spawn((
+                    LimbPart {
+                        stock: child,
+                        mesh: mesh.clone(),
+                    },
                     Mesh3d(mesh),
                     MeshMaterial3d(material.0.clone()),
                     MeshTag(with_rig(tag.0, slot)),
