@@ -400,9 +400,11 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   attribute on skinned layouts and Bevy multiplies it into the base colour, so no shader change
   is needed. The copies use the unit's **own** palette slot and the stock part's tag unchanged,
   because their joints are the stock ones.
-- **Placement.** In bind space, from the stock meshes' vertices: a random vertex between
-  `BAND 0.3–0.85` of the height whose horizontal direction faces the attacker (dot ≥ `FACING
-  0.35`, the attacker's position taken into the rig's frame). Radius is `(BASE_RADIUS 0.09 +
+- **Placement.** In bind space, from the stock meshes' vertices. A spot is drawn evenly, not a
+  vertex: a height uniform in `BAND 0.35–0.72` of the body's height, a direction turned up to
+  `SPREAD 0.7` rad from the attacker's (its position taken into the rig's frame), and the
+  outermost vertex that way within `SLICE 0.04 H` of that height. Picking a random vertex
+  favoured the face, whose mesh is dense, and the band reached it at 0.85. Radius is `(BASE_RADIUS 0.09 +
   RADIUS_PER_BAR 0.2 × share) × height × bloodStains`. Blood Stains 0 turns them off. A killing blow counts
   as share 1. Bind space means stains ride every pose and a ragdoll.
 - **Painting.** Per vertex, the strongest stain's smoothstep falloff, its edge ragged by a
@@ -418,6 +420,13 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
 - Hidden stock parts follow the 6.2 rules: `hide_stained_parts` re-asserts `Hidden` before
   `VisibilityPropagate`, and `release` restores `Inherited` unless the sway holds the part.
 - A severed limb (`dismember`) draws from the stock mesh, so it shows no stains.
+- **Weapons.** When the attacker stands within `WEAPON_REACH 8` yd, its mainhand (and its
+  offhand on `OFFHAND_SHARE 0.5` of hits) is bloodied too. Item mesh parts are the held root's
+  children and grandchildren (`HeldAttached::spawned_attach`). An item's model is that unit's own
+  entity, so no copy is needed: its `Mesh3d` is swapped for a stained clone, and put back when
+  the stains fade. A stain is a random vertex of the item, radius `(WEAPON_RADIUS 0.15 +
+  WEAPON_RADIUS_PER_BAR 0.25 × share) × item size × bloodStains`. If the item's `Mesh3d` changes
+  under us (a rebuild), we let it go. At most `MAX_WEAPONS 24` parts.
 - Logs `blood stain: unit … stained over N parts, M vertices` on a unit's first stain.
 
 ### `dismember.rs`
@@ -568,7 +577,7 @@ of rigs.
 | PostUpdate, before `VisibilityPropagate` | `cloak::hide_stock_cloaks`, `sway::hide_stock_parts` |
 | PostUpdate, after `begin_effect_frame` | `gore::push_decals` |
 | PostUpdate, before `TransformSystems::Propagate` | `jostle::jostle_stowed` |
-| Update, after `sway::manage_sways` | `stain`: `stain_hits → manage_stains` |
+| Update, after `sway::manage_sways` | `stain`: `stain_hits → manage_stains → manage_weapon_stains` |
 | PostUpdate, before `VisibilityPropagate` (stain) | `stain`: `sync_stain_copies → hide_stained_parts` |
 
 ---

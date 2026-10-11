@@ -27,7 +27,7 @@ use super::blow::Hit;
 use super::gore::default_colour;
 use super::sway::{manage_sways, Sways};
 use crate::creature_anim::{unit_blood_id, violence_level, BloodTables};
-use crate::entities::Creatures;
+use crate::entities::{Creatures, HeldAttached};
 use crate::net::{GuidIndex, NetEntity, ObjectStore};
 
 /// At most this many units carry stains; a newly stained unit drops the one hit longest ago.
@@ -40,10 +40,23 @@ const BASE_RADIUS: f32 = 0.09;
 const RADIUS_PER_BAR: f32 = 0.2;
 /// The Blood Stains slider's top.
 const MAX_AMOUNT: f32 = 3.0;
-/// Stains land between these shares of the height off the feet, on vertices facing the attacker
-/// at least this much (a dot of the horizontal directions).
-const BAND: (f32, f32) = (0.3, 0.85);
-const FACING: f32 = 0.35;
+/// Stains land at a height drawn evenly between these shares of the body's height off the feet
+/// (the thighs to the chest, under the face), on the surface the way the attacker stands, turned
+/// up to this much (rad) either side; the vertices searched lie within this share of the height
+/// of that height. A spot drawn evenly, not a vertex, so the dense face and hands are not
+/// favoured.
+const BAND: (f32, f32) = (0.35, 0.72);
+const SPREAD: f32 = 0.7;
+const SLICE: f32 = 0.04;
+/// The attacker's weapons are bloodied too when it stands within this (yd) of its victim: the
+/// mainhand always, the offhand on this share of hits. A weapon stain's radius is this share of
+/// the item's size, plus this much more for a hit worth the victim's whole health.
+const WEAPON_REACH: f32 = 8.0;
+const OFFHAND_SHARE: f32 = 0.5;
+const WEAPON_RADIUS: f32 = 0.15;
+const WEAPON_RADIUS_PER_BAR: f32 = 0.25;
+/// At most this many bloodied weapon parts.
+const MAX_WEAPONS: usize = 24;
 /// How long a stain lasts (s), the last stretch of it fading out.
 const LIFE: f32 = 120.0;
 const FADE: f32 = 40.0;
@@ -57,7 +70,9 @@ pub(super) fn plugin(app: &mut App) {
     app.init_resource::<Stains>()
         .add_systems(
             Update,
-            (stain_hits, manage_stains).chain().after(manage_sways),
+            (stain_hits, manage_stains, manage_weapon_stains)
+                .chain()
+                .after(manage_sways),
         )
         .add_systems(
             PostUpdate,
@@ -71,6 +86,9 @@ pub(super) fn plugin(app: &mut App) {
 #[derive(Resource, Default)]
 struct Stains {
     units: EntityHashMap<Stained>,
+    /// Bloodied weapon mesh parts, by entity: an item's model is the unit's own entity, so its
+    /// `Mesh3d` is swapped for a stained clone and put back when the stains fade.
+    weapons: EntityHashMap<Weapon>,
     /// Which materials are capes, by id: the cloth cloaks draw those.
     capes: HashMap<AssetId<WowModelMaterial>, bool>,
     rng: u32,
@@ -96,6 +114,16 @@ struct Stained {
     last_hit: f32,
     last_paint: f32,
     dirty: bool,
+}
+
+/// One bloodied weapon part: the mesh it had, our stained clone, and its stains.
+struct Weapon {
+    original: Handle<Mesh>,
+    mine: Option<Handle<Mesh>>,
+    stains: Vec<Stain>,
+    colour: [f32; 3],
+    dirty: bool,
+    last_paint: f32,
 }
 
 /// One stain, in bind space.
@@ -202,6 +230,9 @@ fn stain_hits(
     server: Res<AssetServer>,
     time: Res<Time>,
     mut stains: ResMut<Stains>,
+    held: Query<&HeldAttached>,
+    children: Query<&Children>,
+    items: Query<&Mesh3d, With<MeshMaterial3d<WowModelMaterial>>>,
 ) {
     let violence = violence_level(cvars.as_deref());
     let scale = cvars
@@ -273,16 +304,20 @@ fn stain_hits(
                 Vec3::new(angle.cos(), 0.0, angle.sin())
             })
             .normalize();
-        let band = (bottom + BAND.0 * height)..=(bottom + BAND.1 * height);
-        let facing: Vec<Vec3> = verts
+        // A spot drawn evenly: a height in the band, a way round from the attacker's, and the
+        // outermost vertex that way in a thin slice at that height.
+        let y = bottom + height * (BAND.0 + (BAND.1 - BAND.0) * stains.rand());
+        let turn = (stains.rand() * 2.0 - 1.0) * SPREAD;
+        let way = Quat::from_rotation_y(turn) * toward;
+        let slice = SLICE * height;
+        let Some(centre) = verts
             .iter()
             .copied()
-            .filter(|v| band.contains(&v.y))
-            .filter(|v| v.with_y(0.0).normalize_or_zero().dot(toward) >= FACING)
-            .collect();
-        let pool = if facing.is_empty() { &verts } else { &facing };
-        let pick = ((stains.rand() * pool.len() as f32) as usize).min(pool.len() - 1);
-        let centre = pool[pick];
+            .filter(|v| (v.y - y).abs() <= slice)
+            .max_by(|a, b| a.with_y(0.0).dot(way).total_cmp(&b.with_y(0.0).dot(way)))
+        else {
+            continue;
+        };
         let radius = height * (BASE_RADIUS + RADIUS_PER_BAR * share) * scale;
         let seed = (stains.rand() * u32::MAX as f32) as u32;
         let colour = default_colour(violence);
@@ -313,6 +348,71 @@ fn stain_hits(
         });
         if unit.stains.len() > MAX_STAINS {
             unit.stains.remove(0);
+        }
+        // The attacker's weapon, when it stood close enough to have struck with it.
+        let Some(&attacker) = index.0.get(&hit.attacker) else {
+            continue;
+        };
+        let close = places
+            .get(attacker)
+            .is_ok_and(|a| a.translation().distance(at.translation()) <= WEAPON_REACH);
+        let Some(attached) = held.get(attacker).ok().filter(|_| close) else {
+            continue;
+        };
+        let offhand = stains.rand() < OFFHAND_SHARE;
+        let roots: Vec<Entity> = attached
+            .spawned_attach()
+            .filter(|&(slot, _, _)| slot == 0 || slot == 1 && offhand)
+            .map(|(_, root, _)| root)
+            .collect();
+        for root in roots {
+            // The item's mesh parts: its root's children and theirs.
+            let mut found = Vec::new();
+            for child in children.get(root).into_iter().flatten() {
+                found.push(*child);
+                found.extend(children.get(*child).into_iter().flatten().copied());
+            }
+            for part in found {
+                let Ok(mesh) = items.get(part) else {
+                    continue;
+                };
+                let original = stains
+                    .weapons
+                    .get(&part)
+                    .map_or_else(|| mesh.0.clone(), |w| w.original.clone());
+                let Some(verts) = meshes.get(&original).and_then(positions) else {
+                    continue;
+                };
+                if verts.is_empty() {
+                    continue;
+                }
+                let (lo, hi) = verts.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), &v| {
+                    (lo.min(Vec3::from(v)), hi.max(Vec3::from(v)))
+                });
+                let size = lo.distance(hi);
+                let pick = ((stains.rand() * verts.len() as f32) as usize).min(verts.len() - 1);
+                let centre = Vec3::from(verts[pick]);
+                let seed = (stains.rand() * u32::MAX as f32) as u32;
+                let entry = stains.weapons.entry(part).or_insert_with(|| Weapon {
+                    original,
+                    mine: None,
+                    stains: Vec::new(),
+                    colour,
+                    dirty: true,
+                    last_paint: now,
+                });
+                entry.colour = colour;
+                entry.dirty = true;
+                entry.stains.push(Stain {
+                    centre,
+                    radius: size * (WEAPON_RADIUS + WEAPON_RADIUS_PER_BAR * share) * scale,
+                    born: now,
+                    seed,
+                });
+                if entry.stains.len() > MAX_STAINS {
+                    entry.stains.remove(0);
+                }
+            }
         }
     }
 }
@@ -559,6 +659,92 @@ fn hide_stained_parts(stains: Res<Stains>, mut visibility: Query<&mut Visibility
                 if *vis != Visibility::Hidden {
                     *vis = Visibility::Hidden;
                 }
+            }
+        }
+    }
+}
+
+/// Draws each bloodied weapon part with its stained clone, repainted as the stains fade, and
+/// puts its own mesh back once they have.
+fn manage_weapon_stains(
+    mut stains: ResMut<Stains>,
+    mut items: Query<&mut Mesh3d>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    time: Res<Time>,
+) {
+    let now = time.elapsed_secs();
+    let stains = &mut *stains;
+    // The newest kept: an over-cap part goes like a faded one.
+    if stains.weapons.len() > MAX_WEAPONS {
+        let mut newest: Vec<(f32, Entity)> = stains
+            .weapons
+            .iter()
+            .map(|(e, w)| (w.stains.last().map_or(0.0, |s| s.born), *e))
+            .collect();
+        newest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, e) in newest.into_iter().skip(MAX_WEAPONS) {
+            if let Some(w) = stains.weapons.get_mut(&e) {
+                w.stains.clear();
+            }
+        }
+    }
+    let mut done = Vec::new();
+    for (part, weapon) in stains.weapons.iter_mut() {
+        weapon.stains.retain(|s| left(s, now) > 0.0);
+        let Ok(mut mesh) = items.get_mut(*part) else {
+            // The item is gone.
+            done.push(*part);
+            continue;
+        };
+        let ours = weapon.mine.as_ref().is_some_and(|m| m.id() == mesh.0.id());
+        if !ours && mesh.0.id() != weapon.original.id() {
+            // The model was rebuilt under us: let it be.
+            done.push(*part);
+            continue;
+        }
+        if weapon.stains.is_empty() {
+            if ours {
+                mesh.0 = weapon.original.clone();
+            }
+            done.push(*part);
+            continue;
+        }
+        let fading = weapon.stains.iter().any(|s| now - s.born > LIFE - FADE);
+        if !(weapon.dirty || fading && now - weapon.last_paint >= REPAINT) {
+            continue;
+        }
+        weapon.dirty = false;
+        weapon.last_paint = now;
+        let Some(colours) = meshes
+            .get(&weapon.original)
+            .and_then(|m| paint(m, &weapon.stains, weapon.colour, now))
+        else {
+            continue;
+        };
+        match &weapon.mine {
+            Some(mine) => {
+                if let Some(m) = meshes.get_mut(mine) {
+                    m.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+                }
+            }
+            None => {
+                let Some(mut copy) = meshes.get(&weapon.original).cloned() else {
+                    continue;
+                };
+                copy.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+                weapon.mine = Some(meshes.add(copy));
+            }
+        }
+        if let Some(mine) = &weapon.mine {
+            if mesh.0.id() != mine.id() {
+                mesh.0 = mine.clone();
+            }
+        }
+    }
+    for part in done {
+        if let Some(weapon) = stains.weapons.remove(&part) {
+            if let Some(mine) = weapon.mine {
+                meshes.remove(&mine);
             }
         }
     }
