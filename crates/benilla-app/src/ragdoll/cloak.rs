@@ -55,9 +55,10 @@ const FOLLOW_HEM: f32 = 0.04;
 const MAX_DRIFT: f32 = 0.6;
 /// A target jump past this (yd) is a teleport: the cloth starts over on the target.
 const TELEPORT: f32 = 5.0;
-/// A capsule's radius is this share of the cloak's closest approach to its bone at rest, and
-/// bones further than this share of the cloak's length from it get none.
-const CAPSULE_FIT: f32 = 0.85;
+/// A capsule's radius is this share of the cloak's closest approach to its bone at rest: at 1 the
+/// cloth is held at the body's surface and cannot press into the body (below 1 it sank through the
+/// back and the body clipped out). Bones further than this share of the cloak's length get none.
+const CAPSULE_FIT: f32 = 1.0;
 const CAPSULE_REACH: f32 = 0.5;
 /// The Cloak Motion slider's range (`cloakMotion`): 0 holds the cloak to the animation, 1 is the
 /// tuned swing, more trails and swings further.
