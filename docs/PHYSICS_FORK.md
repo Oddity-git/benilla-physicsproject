@@ -25,7 +25,7 @@ fidelity to the 1.12.1 reference client. This fork deliberately adds features 1.
 | Loot sack where the server's corpse is | `lootbag` | always |
 | Flung ragdolls stay drawn | `bounds` | always |
 | Blood spray, splats, pools, bleed squirts | `gore` | `violenceLevel`, `goreAmount` |
-| Blood stains on the body | `stain` | `violenceLevel`, `goreAmount` |
+| Blood stains on the body | `stain` | `violenceLevel`, `bloodStains` |
 | Dismemberment | `dismember` | `dismemberment`, `dismemberAmount` |
 | Frost kills freeze stiff and icy | `frost`, `life` | always |
 | Lightning kills shake in a seizure | `shock`, `life` | always |
@@ -262,6 +262,7 @@ The page's rows, in order:
 |---|---|---|---|
 | Blood | `violenceLevel` | Off / Green / Red | 2 |
 | Gore Amount | `goreAmount` | 0–10 | 1 |
+| Blood Stains | `bloodStains` | 0–3, 0 off | 1 |
 | Dismemberment | `dismemberment` | box | 0 |
 | Dismember Amount | `dismemberAmount` | 0.25–10 | 1 |
 | Hitstop | `hitstop` | box | 1 |
@@ -401,8 +402,8 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   because their joints are the stock ones.
 - **Placement.** In bind space, from the stock meshes' vertices: a random vertex between
   `BAND 0.3–0.85` of the height whose horizontal direction faces the attacker (dot ≥ `FACING
-  0.35`, the attacker's position taken into the rig's frame). Radius is `(BASE_RADIUS 0.05 +
-  RADIUS_PER_BAR 0.1 × share) × height × √goreAmount` (clamped to 0.5–2). A killing blow counts
+  0.35`, the attacker's position taken into the rig's frame). Radius is `(BASE_RADIUS 0.09 +
+  RADIUS_PER_BAR 0.2 × share) × height × bloodStains`. Blood Stains 0 turns them off. A killing blow counts
   as share 1. Bind space means stains ride every pose and a ragdoll.
 - **Painting.** Per vertex, the strongest stain's smoothstep falloff, its edge ragged by a
   per-vertex hash (`RAGGED 0.6`), times `MAX_COVER 0.9`, lerps white toward the blood colour. A

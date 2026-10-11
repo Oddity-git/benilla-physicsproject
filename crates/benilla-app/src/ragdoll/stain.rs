@@ -1,5 +1,5 @@
-//! Fork: blood stains on the body, gated by the Blood option (`violenceLevel`) and sized by Gore
-//! Amount (`goreAmount`).
+//! Fork: blood stains on the body, gated by the Blood option (`violenceLevel`) and sized by the
+//! Physics page's Blood Stains slider (`bloodStains`, 0 off).
 //!
 //! A hit that sprays blood (`gore`) also leaves a stain on its victim, on the side facing the
 //! attacker, bigger the bigger the hit's share of the victim's health and biggest on a killing
@@ -24,7 +24,7 @@ use benilla_world::model_render::ModelPart;
 use benilla_world::rig_palette::{RigPart, RigSkin};
 
 use super::blow::Hit;
-use super::gore::{default_colour, gore_amount};
+use super::gore::default_colour;
 use super::sway::{manage_sways, Sways};
 use crate::creature_anim::{unit_blood_id, violence_level, BloodTables};
 use crate::entities::Creatures;
@@ -35,11 +35,11 @@ const MAX_UNITS: usize = 12;
 /// At most this many stains on one unit; a new one drops the oldest.
 const MAX_STAINS: usize = 16;
 /// A stain's radius as a share of the body's height: this much for any hit, plus this much more
-/// for a hit worth the victim's whole health, × the square root of Gore Amount within these
-/// bounds.
-const BASE_RADIUS: f32 = 0.05;
-const RADIUS_PER_BAR: f32 = 0.1;
-const AMOUNT_SCALE: (f32, f32) = (0.5, 2.0);
+/// for a hit worth the victim's whole health, × Blood Stains.
+const BASE_RADIUS: f32 = 0.09;
+const RADIUS_PER_BAR: f32 = 0.2;
+/// The Blood Stains slider's top.
+const MAX_AMOUNT: f32 = 3.0;
 /// Stains land between these shares of the height off the feet, on vertices facing the attacker
 /// at least this much (a dot of the horizontal directions).
 const BAND: (f32, f32) = (0.3, 0.85);
@@ -204,13 +204,16 @@ fn stain_hits(
     mut stains: ResMut<Stains>,
 ) {
     let violence = violence_level(cvars.as_deref());
-    let Some(blood) = blood.filter(|_| violence > 0) else {
+    let scale = cvars
+        .as_deref()
+        .and_then(|c| c.num("bloodStains"))
+        .unwrap_or(1.0)
+        .clamp(0.0, MAX_AMOUNT);
+    let Some(blood) = blood.filter(|_| violence > 0 && scale > 0.0) else {
         hits.clear();
         return;
     };
-    let scale = gore_amount(cvars.as_deref())
-        .sqrt()
-        .clamp(AMOUNT_SCALE.0, AMOUNT_SCALE.1);
+
     let now = time.elapsed_secs();
     for hit in hits.read() {
         let Ok((skin, at, net, store)) = victims.get(hit.victim) else {

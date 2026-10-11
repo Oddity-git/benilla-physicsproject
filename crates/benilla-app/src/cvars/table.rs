@@ -738,6 +738,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — 1.12's gore has no amount",
     ),
+    // benilla's own: the Physics page's Blood Stains slider, how big the stains on the body are.
+    ours(
+        "bloodStains",
+        "1",
+        "benilla's own — 1.12 never stains a body",
+    ),
     ours(
         "dismemberAmount",
         "1",
