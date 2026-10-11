@@ -91,13 +91,16 @@ const REAR_RADIUS: f32 = 0.055;
 /// reaches further up so it slopes from the collar instead of standing as a ball, the rear's
 /// less so it stays off the waist and thighs.
 const CHEST_REACH_UP: f32 = 2.0;
-const REAR_REACH_VERTICAL: f32 = 0.7;
+const REAR_REACH_VERTICAL: f32 = 0.9;
 /// The share of each size step taken across and up and down: a part grows mostly outward, so
 /// it neither balloons upward to the neck nor widens the waist.
 const CHEST_GROW_ACROSS: f32 = 0.7;
 const CHEST_GROW_VERTICAL: f32 = 0.5;
-const REAR_GROW_ACROSS: f32 = 0.35;
-const REAR_GROW_VERTICAL: f32 = 0.5;
+const REAR_GROW_ACROSS: f32 = 0.75;
+const REAR_GROW_VERTICAL: f32 = 0.75;
+/// How far behind its tip the rear's centre sits, as a share of its radius: deeper than the
+/// chest's, so it swells round instead of drawing its tip out to a point.
+const REAR_CENTRE_DEPTH: f32 = 0.8;
 /// The rear's spring, against the chest's: its frequency (Hz) and damping ratio, the share of the
 /// body's motion it lags, the share of the chest's furthest stray, and the most of a vertex its
 /// bone takes, so the hips and thighs still bend it.
@@ -375,7 +378,13 @@ fn manage_sways(
             let out = if rear { Vec3::Z } else { Vec3::NEG_Z };
             for tip in pair.tips {
                 lobes.push(Lobe {
-                    centre: tip - out * (CENTRE_DEPTH * pair.radius),
+                    centre: tip
+                        - out
+                            * (if rear {
+                                REAR_CENTRE_DEPTH
+                            } else {
+                                CENTRE_DEPTH
+                            } * pair.radius),
                     out,
                     radius: pair.radius,
                     rear,

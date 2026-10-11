@@ -471,8 +471,9 @@ Do not describe this one in the README (section 2).
   `REAR_WEIGHT 0.75` of a vertex, so the hips and thighs still bend it. The distance is
   stretched per axis: the chest's reaches `CHEST_REACH_UP 2` further upward so it slopes from
   the collar (Mathieu found the orc chest a harsh ball), and the rear's reaches only
-  `REAR_REACH_VERTICAL 0.7` up and down and takes nothing deeper than its centre, to stay off the
-  waist and thighs.
+  `REAR_REACH_VERTICAL 0.9` up and down and takes nothing deeper than its centre, to stay off the
+  waist and thighs. The rear's centre sits `REAR_CENTRE_DEPTH 0.8 × radius` behind its tip
+  (the chest's 0.4), so it swells round.
 - Carriers: a chest lobe rides its heaviest original bone. A rear lobe rides the root-most of
   its heavy bones (the pelvis rather than a thigh), so a stride does not swing it.
 - The copy slot has `bones + lobes` rows (2 or 4) with identity ibp. Its rows are the unit's own
@@ -486,7 +487,8 @@ Do not describe this one in the README (section 2).
   forward.
 - Bone matrix: `T(shown) · carrier · T(c) · S(grow) · T(−c)`, where size is `bodySize` for the
   chest and `bodyRearSize` for the rear, and `grow` takes the full size step along Z (outward)
-  but only part of it across and vertically: chest 0.7 and 0.5, rear 0.35 and 0.5. A uniform scale
+  but only part of it across and vertically: chest 0.7 and 0.5, rear 0.75 and 0.75 (at 0.35 and
+  0.5 the orc rear grew to a point). A uniform scale
   ballooned the chest toward the neck and widened the rear around the waist.
 - Rebuilds on re-dress (6.2). Removing a chest item on orcs and dwarves used to break it.
 - Logs `body physics: …`.
