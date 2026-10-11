@@ -28,12 +28,22 @@ use super::rig::Profile;
 /// sever two.
 const SEVER_SHARE: f32 = 0.2;
 const SECOND_LIMB_SHARE: f32 = 0.5;
-/// A limb is a body this few joints from the hub (a shoulder, a hip, the neck, or one further
-/// down), holding at most this share of the bodies and at least this share of the skeleton's
-/// length, so a severed piece is a real limb and never half the body or a stub.
-const MAX_DEPTH: usize = 2;
+/// A limb holds at most this share of the bodies and at least this share of the skeleton's length,
+/// so a severed piece is never half the body or a stub. Above the waist the floor is lower, so a
+/// hand or the head can come off on its own.
 const MAX_LIMB_BODIES: f32 = 0.4;
 const MIN_LIMB_LENGTH: f32 = 0.12;
+const MIN_UPPER_LENGTH: f32 = 0.04;
+/// How likely each kind of limb is to be the one cut: arms and hands, the head, the upper body off
+/// the hips, and a leg (rare). A body is central when it sits within this share of the height of
+/// the hub's vertical line.
+const ARM_WEIGHT: f32 = 1.0;
+const HEAD_WEIGHT: f32 = 1.5;
+const TORSO_WEIGHT: f32 = 0.5;
+const LEG_WEIGHT: f32 = 0.1;
+const CENTRAL: f32 = 0.08;
+/// A central limb of at most this many bodies is the head (with the neck); more is the torso.
+const HEAD_BODIES: usize = 3;
 /// The scale a collapsed bone is drawn at: zero would leave the normals undefined.
 const TINY: f32 = 1e-4;
 
@@ -102,7 +112,9 @@ struct LimbHolder(Entity);
 
 /// The bodies a killing blow taking `share` of the unit's health severs: none below
 /// [`SEVER_SHARE`], else one limb, two apart from each other past [`SECOND_LIMB_SHARE`], and one
-/// more for each further [`SECOND_LIMB_SHARE`] (a high Dismemberment Amount gets there).
+/// more for each further [`SECOND_LIMB_SHARE`] (a high Dismemberment Amount gets there). Each cut
+/// is drawn by weight: mostly arms, hands and the head, sometimes the upper body off the hips, a
+/// leg seldom.
 pub(super) fn choose_limbs(profile: &Profile, share: f32, seed: u64) -> Vec<usize> {
     if share < SEVER_SHARE {
         return Vec::new();
@@ -120,14 +132,45 @@ pub(super) fn choose_limbs(profile: &Profile, share: f32, seed: u64) -> Vec<usiz
             length[a] += own;
         }
     }
-    let candidates: Vec<usize> = (0..n)
-        .filter(|&k| {
-            profile.bodies[k].parent.is_some()
-                && ancestors(k).count() <= MAX_DEPTH
-                && count[k] as f32 <= MAX_LIMB_BODIES * n as f32
-                && length[k] >= MIN_LIMB_LENGTH * total
+    let (lo, hi) = profile
+        .bodies
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), b| {
+            let end = b.pivot + b.segment;
+            (lo.min(b.pivot.y).min(end.y), hi.max(b.pivot.y).max(end.y))
+        });
+    let height = (hi - lo).max(f32::EPSILON);
+    // The hub is body 0, the hips on a biped: the waistline.
+    let hub = profile.bodies[0].pivot;
+    let weight = |k: usize| -> Option<f32> {
+        let body = &profile.bodies[k];
+        body.parent?;
+        // Above the waist: on a branch off the hub that runs up (the spine), not down (a leg),
+        // wherever the bind pose holds the hands.
+        let branch = std::iter::once(k)
+            .chain(ancestors(k))
+            .find(|&b| profile.bodies[b].parent == Some(0))
+            .unwrap_or(k);
+        let upper = profile.bodies[branch].segment.y > 0.0;
+        let central = (body.pivot - hub).with_y(0.0).length() < CENTRAL * height;
+        // The upper body straight off the hub may hold most of the bodies: the cut in half.
+        let torso = upper && central && body.parent == Some(0) && count[k] < n;
+        let floor = if upper {
+            MIN_UPPER_LENGTH
+        } else {
+            MIN_LIMB_LENGTH
+        };
+        if !torso && count[k] as f32 > MAX_LIMB_BODIES * n as f32 || length[k] < floor * total {
+            return None;
+        }
+        Some(match (upper, central) {
+            (false, _) => LEG_WEIGHT,
+            (true, false) => ARM_WEIGHT,
+            (true, true) if count[k] <= HEAD_BODIES => HEAD_WEIGHT,
+            (true, true) => TORSO_WEIGHT,
         })
-        .collect();
+    };
+    let mut pool: Vec<(usize, f32)> = (0..n).filter_map(|k| Some((k, weight(k)?))).collect();
     let mut rng = seed;
     let mut next = || {
         // splitmix64
@@ -135,13 +178,21 @@ pub(super) fn choose_limbs(profile: &Profile, share: f32, seed: u64) -> Vec<usiz
         let mut z = rng;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
+        (z ^ (z >> 31)) as f32 / u64::MAX as f32
     };
     let wanted = 1 + (share / SECOND_LIMB_SHARE).floor() as usize;
     let mut chosen: Vec<usize> = Vec::new();
-    let mut pool = candidates;
     while chosen.len() < wanted && !pool.is_empty() {
-        let k = pool.swap_remove((next() % pool.len() as u64) as usize);
+        let sum: f32 = pool.iter().map(|&(_, w)| w).sum();
+        let mut pick = next() * sum;
+        let at = pool
+            .iter()
+            .position(|&(_, w)| {
+                pick -= w;
+                pick <= 0.0
+            })
+            .unwrap_or(pool.len() - 1);
+        let (k, _) = pool.swap_remove(at);
         // Never a limb inside one already taken, or around it.
         let related = chosen
             .iter()
@@ -150,6 +201,16 @@ pub(super) fn choose_limbs(profile: &Profile, share: f32, seed: u64) -> Vec<usiz
             chosen.push(k);
         }
     }
+    let kinds: Vec<&str> = chosen
+        .iter()
+        .map(|&k| match weight(k) {
+            Some(w) if w == LEG_WEIGHT => "leg",
+            Some(w) if w == HEAD_WEIGHT => "head",
+            Some(w) if w == TORSO_WEIGHT => "torso",
+            _ => "arm",
+        })
+        .collect();
+    info!("dismember: severed {kinds:?} (bodies {chosen:?})");
     chosen
 }
 

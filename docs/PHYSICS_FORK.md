@@ -447,8 +447,14 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
 ### `dismember.rs`
 - `choose_limbs(profile, share, seed)` severs `1 + floor(share / SECOND_LIMB_SHARE)` limbs when
   the killing blow's share of health, scaled by `dismemberAmount`, is at least `SEVER_SHARE`
-  (0.2). It only cuts limbs within `MAX_DEPTH 2` of the hub, of at most `MAX_LIMB_BODIES 0.4` of
-  the body, and at least `MIN_LIMB_LENGTH` long.
+  (0.2). Each cut is a weighted draw: a limb on a branch off the hub that runs up is an arm
+  (`ARM_WEIGHT 1`) or, within `CENTRAL 0.08` of the height of the hub's line, the head
+  (`HEAD_WEIGHT 1.5`, at most `HEAD_BODIES 3`) or the torso (`TORSO_WEIGHT 0.5`); a limb on a
+  branch that runs down is a leg (`LEG_WEIGHT 0.1`). A limb holds at most `MAX_LIMB_BODIES 0.4`
+  of the bodies (the torso straight off the hub is exempt) and at least `MIN_LIMB_LENGTH 0.12`
+  of the skeleton's length, `MIN_UPPER_LENGTH 0.04` above the waist so a hand or the head can go
+  alone. It used to be a flat draw within two joints of the hub, which reached the legs but
+  never the head. Logs `dismember: severed [...]`.
 - `life` skips the severed limb's joint and flings it (`SEVER_FLING`, `SEVER_LIFT`).
 - **Drawing.** There is one mesh per unit, so the limb is drawn by copies of the unit's skinned
   parts on a **second palette slot**. That slot poses the limb's bones at their bodies and
