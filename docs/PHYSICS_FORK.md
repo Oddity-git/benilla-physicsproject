@@ -44,7 +44,7 @@ These come from the maintainer (Mathieu). They override generic habits.
 
 - **Environment.** CachyOS with the fish shell. The local clone is
   `~/Games/benilla-physicsproject`. He tests against a local cMaNGOS server with
-  `WOW_HOST=localhost:3725`.
+  `WOW_HOST=localhost:3726`.
 - **Commands for him are fish blocks that start with the `cd`**, for example:
   ```fish
   cd ~/Games/benilla-physicsproject
@@ -70,7 +70,7 @@ These come from the maintainer (Mathieu). They override generic habits.
   lines. To capture them:
   ```fish
   cd ~/Games/benilla-physicsproject
-  env WOW_HOST=localhost:3725 cargo run --release -p benilla 2>&1 | tee /tmp/benilla.log
+  env WOW_HOST=localhost:3726 cargo run --release -p benilla 2>&1 | tee /tmp/benilla.log
   grep -E "cloth cloak|body physics" /tmp/benilla.log
   ```
 
