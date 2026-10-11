@@ -386,6 +386,8 @@ pub(super) fn control(
                 axes.fwd,
                 right,
                 strafe != 0,
+                rig.look == Some(LookButton::Left),
+                axes.mouselook,
                 axes.mouselook || !may_turn || !may_translate,
                 cam.yaw,
                 player.face_yaw,

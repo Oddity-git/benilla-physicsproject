@@ -13,7 +13,7 @@
 //! it sets streams to the server as any facing change does (`SET_FACING`).
 
 use std::f32::consts::PI;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use bevy::prelude::*;
 
@@ -28,6 +28,24 @@ static ON: AtomicBool = AtomicBool::new(false);
 static MOVING: AtomicBool = AtomicBool::new(false);
 /// Turning back to the camera after letting go in combat.
 static FACING_CAMERA: AtomicBool = AtomicBool::new(false);
+/// The camera's yaw last frame, and how far left-button orbits have turned it since the right
+/// button last steered (f32 bits): the keys steer from the camera less that orbit.
+static LAST_CAM: AtomicU32 = AtomicU32::new(0);
+static ORBIT: AtomicU32 = AtomicU32::new(0);
+
+/// The yaw the keys steer from: the camera's, less what left-button orbits turned it, so a
+/// left-drag looks around without turning the character. The right button resets it.
+fn reference(cam_yaw: f32, orbiting: bool, mouselook: bool) -> f32 {
+    let last = f32::from_bits(LAST_CAM.swap(cam_yaw.to_bits(), Ordering::Relaxed));
+    let mut orbit = f32::from_bits(ORBIT.load(Ordering::Relaxed));
+    if mouselook {
+        orbit = 0.0;
+    } else if orbiting {
+        orbit = wrap(orbit + wrap(cam_yaw - last));
+    }
+    ORBIT.store(orbit.to_bits(), Ordering::Relaxed);
+    cam_yaw - orbit
+}
 
 pub(super) fn plugin(app: &mut App) {
     app.add_systems(PreUpdate, read_box);
@@ -66,7 +84,7 @@ fn turn_toward(face: f32, target: f32, dt: f32) -> f32 {
     face + left.clamp(-budget, budget)
 }
 
-/// Steer from the camera: `fwd` is W/S (+1 away from the camera), `right` the A/D keys (+1
+/// Steer from the camera (less any left-button orbit, `orbiting` while it is held): `fwd` is W/S (+1 away from the camera), `right` the A/D keys (+1
 /// right). Q/E strafe as they always do, along the facing. `None` leaves the stock controls alone:
 /// the box off, the right button held (`stock`), only a strafe key held (`strafing`), or nothing to
 /// do. The yaws are the camera's and the character's, one convention.
@@ -75,12 +93,15 @@ pub(crate) fn steer(
     fwd: i32,
     right: i32,
     strafing: bool,
+    orbiting: bool,
+    mouselook: bool,
     stock: bool,
     cam_yaw: f32,
     face_yaw: f32,
     in_combat: bool,
     dt: f32,
 ) -> Option<Steer> {
+    let cam_yaw = reference(cam_yaw, orbiting, mouselook);
     if !ON.load(Ordering::Relaxed) || stock {
         MOVING.store(false, Ordering::Relaxed);
         FACING_CAMERA.store(false, Ordering::Relaxed);

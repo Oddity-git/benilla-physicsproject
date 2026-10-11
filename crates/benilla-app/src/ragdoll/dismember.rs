@@ -17,6 +17,7 @@ use bevy::prelude::*;
 
 use benilla_assets::materials::WowModelMaterial;
 use benilla_world::mesh_tag::{rig_of, with_rig};
+use benilla_world::model_render::park::ParkedMesh;
 use benilla_world::model_render::ModelPart;
 use benilla_world::rig_anim::RigPose;
 use benilla_world::rig_palette::{rebase_global, rebase_origin, RigPalettes, RigPart, RigSkin};
@@ -232,9 +233,11 @@ pub(super) fn heal(commands: &mut Commands, unit: Entity) {
     });
 }
 
-/// What a limb copy takes from each of its unit's skinned parts.
+/// What a limb copy takes from each of its unit's skinned parts: the mesh, or the parked one of a
+/// part a blood stain or the body sway hides and draws a copy of instead.
 type SkinnedPart = (
-    &'static Mesh3d,
+    Option<&'static Mesh3d>,
+    Option<&'static ParkedMesh>,
     &'static MeshMaterial3d<WowModelMaterial>,
     &'static MeshTag,
     Option<&'static ModelPart>,
@@ -246,7 +249,21 @@ fn build_limb_copies(
     mut units: Query<(Entity, &mut Dismembered, &RigSkin, &Children)>,
     parts: Query<SkinnedPart, With<RigPart>>,
     mut palettes: ResMut<RigPalettes>,
+    materials: Res<Assets<WowModelMaterial>>,
+    server: Res<AssetServer>,
 ) {
+    // A cape part: the cloth cloak draws it, and it would hang stiff off a severed limb.
+    let cape = |material: &MeshMaterial3d<WowModelMaterial>| {
+        materials
+            .get(material.id())
+            .and_then(|m| m.base.base_color_texture.as_ref())
+            .and_then(|t| server.get_path(t.id()))
+            .is_some_and(|p| {
+                p.to_string()
+                    .to_ascii_lowercase()
+                    .contains("objectcomponents/cape")
+            })
+    };
     for (unit, mut cut, skin, children) in &mut units {
         for limb in cut.limbs.iter_mut().filter(|l| !l.tried) {
             limb.tried = true;
@@ -267,14 +284,22 @@ fn build_limb_copies(
                 ))
                 .id();
             for child in children.iter() {
-                let Ok((mesh, material, tag, part)) = parts.get(child) else {
+                let Ok((mesh, parked, material, tag, part)) = parts.get(child) else {
+                    continue;
+                };
+                // A part hidden long enough is parked: its mesh moved off it, so a bloodied or
+                // swaying unit's limb would otherwise copy nothing and vanish.
+                let Some(mesh) = mesh.map(|m| m.0.clone()).or(parked.map(|p| p.0.clone())) else {
                     continue;
                 };
                 if rig_of(tag.0) != skin.slot {
                     continue;
                 }
+                if parked.is_some() && cape(material) {
+                    continue;
+                }
                 let mut copy = commands.spawn((
-                    Mesh3d(mesh.0.clone()),
+                    Mesh3d(mesh),
                     MeshMaterial3d(material.0.clone()),
                     MeshTag(with_rig(tag.0, slot)),
                     Transform::default(),

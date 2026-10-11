@@ -468,6 +468,9 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   parts on a **second palette slot**. That slot poses the limb's bones at their bodies and
   collapses every other bone to a point (`TINY`). On the unit's own palette, the limb root is
   scaled to zero, which folds the limb into the stump **at its joint**.
+- **Parked parts.** A part a blood stain or the sway hides is parked after 30 frames (6.2), its
+  `Mesh3d` moved to `ParkedMesh`. `build_limb_copies` takes the mesh from either, or a bloodied
+  unit's limb copied nothing and vanished. A parked cape (the cloth cloak draws it) is skipped.
 - `heal` undoes this when a unit revives.
 
 ### `hitstop.rs`
@@ -629,7 +632,10 @@ Do not describe this one in the README (section 2).
   run: no backpedal, no strafe bits, no turn bits. The facing streams as `SET_FACING`.
 - Letting go while `UNIT_FLAG_IN_COMBAT` turns the facing back to the camera's yaw at the same
   rate, until within `DONE 0.01` rad or a key is pressed.
-- State is three statics (`ON`, `MOVING`, `FACING_CAMERA`); `read_box` (PreUpdate) reads the
+- **Left-drag looks, it does not steer.** The keys steer from the camera's yaw less `ORBIT`,
+  the turn left-button orbits have added since the right button last steered (`reference`); the
+  right button resets it. Mathieu asked that only right-click camera movement change direction.
+- State is statics (`ON`, `MOVING`, `FACING_CAMERA`, `LAST_CAM`, `ORBIT`); `read_box` (PreUpdate) reads the
   CVar, so the controller needs no new system parameter.
 
 ### `testbox.rs`
