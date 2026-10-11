@@ -25,6 +25,7 @@ fidelity to the 1.12.1 reference client. This fork deliberately adds features 1.
 | Loot sack where the server's corpse is | `lootbag` | always |
 | Flung ragdolls stay drawn | `bounds` | always |
 | Blood spray, splats, pools, bleed squirts | `gore` | `violenceLevel`, `goreAmount` |
+| Blood stains on the body | `stain` | `violenceLevel`, `goreAmount` |
 | Dismemberment | `dismember` | `dismemberment`, `dismemberAmount` |
 | Frost kills freeze stiff and icy | `frost`, `life` | always |
 | Lightning kills shake in a seizure | `shock`, `life` | always |
@@ -387,6 +388,37 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
 - Update chain: `spray_hits → bleed_cuts → squirt_bleeds → fly_droplets → start_pools →
   grow_pools → age_splats`.
 
+### `stain.rs` (blood stains on the body)
+- Reads the same `Hit` messages as `gore`, with the same gates: Blood off, a bloodless creature
+  row, or a non-physical hit that does not kill leaves nothing. Colour is gore's
+  `default_colour(violence)`: red, or green at violence 1.
+- **Why copies.** A body's composited texture (`skin_composite.rs`, cached by `SkinKey`) and its
+  materials are shared by every unit of the same look, so a stain painted there would stain them
+  all. Instead each stained unit's skinned parts (capes excluded, the cloaks draw those) are
+  drawn as copies of their meshes with a `Mesh::ATTRIBUTE_COLOR`. `WowModelMaterial` binds that
+  attribute on skinned layouts and Bevy multiplies it into the base colour, so no shader change
+  is needed. The copies use the unit's **own** palette slot and the stock part's tag unchanged,
+  because their joints are the stock ones.
+- **Placement.** In bind space, from the stock meshes' vertices: a random vertex between
+  `BAND 0.3–0.85` of the height whose horizontal direction faces the attacker (dot ≥ `FACING
+  0.35`, the attacker's position taken into the rig's frame). Radius is `(BASE_RADIUS 0.05 +
+  RADIUS_PER_BAR 0.1 × share) × height × √goreAmount` (clamped to 0.5–2). A killing blow counts
+  as share 1. Bind space means stains ride every pose and a ragdoll.
+- **Painting.** Per vertex, the strongest stain's smoothstep falloff, its edge ragged by a
+  per-vertex hash (`RAGGED 0.6`), times `MAX_COVER 0.9`, lerps white toward the blood colour. A
+  stock vertex colour, if any, is kept under it. Stains last `LIFE 120` s, fading over the last
+  `FADE 40` s, repainted every `REPAINT 0.5` s while fading.
+- **With the sway.** A part the body sway already copies is painted on the sway's copy
+  (`Sways::copy_mesh`) instead of getting a second copy. If the sway takes a part over, our copy
+  goes; if the sway lets go (out of range, rebuild), our own copy comes back. `manage_stains` runs
+  after `sway::manage_sways` for this.
+- Caps: `MAX_UNITS 12` stained units (the one hit longest ago drops), `MAX_STAINS 16` per unit.
+  A re-dress rebuilds the copies; the stains stay.
+- Hidden stock parts follow the 6.2 rules: `hide_stained_parts` re-asserts `Hidden` before
+  `VisibilityPropagate`, and `release` restores `Inherited` unless the sway holds the part.
+- A severed limb (`dismember`) draws from the stock mesh, so it shows no stains.
+- Logs `blood stain: unit … stained over N parts, M vertices` on a unit's first stain.
+
 ### `dismember.rs`
 - `choose_limbs(profile, share, seed)` severs `1 + floor(share / SECOND_LIMB_SHARE)` limbs when
   the killing blow's share of health, scaled by `dismemberAmount`, is at least `SEVER_SHARE`
@@ -535,6 +567,8 @@ of rigs.
 | PostUpdate, before `VisibilityPropagate` | `cloak::hide_stock_cloaks`, `sway::hide_stock_parts` |
 | PostUpdate, after `begin_effect_frame` | `gore::push_decals` |
 | PostUpdate, before `TransformSystems::Propagate` | `jostle::jostle_stowed` |
+| Update, after `sway::manage_sways` | `stain`: `stain_hits → manage_stains` |
+| PostUpdate, before `VisibilityPropagate` (stain) | `stain`: `sync_stain_copies → hide_stained_parts` |
 
 ---
 

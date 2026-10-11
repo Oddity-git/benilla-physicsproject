@@ -330,7 +330,7 @@ fn droplet_dot() -> Image {
 }
 
 /// The colour blood is when its art cannot say: red, or green at violence 1.
-fn default_colour(violence: usize) -> [f32; 3] {
+pub(super) fn default_colour(violence: usize) -> [f32; 3] {
     if violence == 1 {
         [0.2, 0.42, 0.05]
     } else {
@@ -518,7 +518,7 @@ fn spray_hits(
 }
 
 /// The Gore Amount slider (`goreAmount`): how many droplets and splats, and how big the pools.
-fn gore_amount(cvars: Option<&crate::cvars::Cvars>) -> f32 {
+pub(super) fn gore_amount(cvars: Option<&crate::cvars::Cvars>) -> f32 {
     cvars
         .and_then(|c| c.num("goreAmount"))
         .map_or(1.0, |v| v.clamp(0.0, 10.0))

@@ -125,7 +125,7 @@ pub(super) fn plugin(app: &mut App) {
 
 /// Every swaying unit, by its rig.
 #[derive(Resource, Default)]
-struct Sways {
+pub(super) struct Sways {
     live: EntityHashMap<Sway>,
     /// Rigs whose chest could not be found, with the parts it was looked for on; retried once
     /// those change (a re-dress).
@@ -135,6 +135,17 @@ struct Sways {
     capes: HashMap<AssetId<WowModelMaterial>, bool>,
     /// Identity bindposes, by bone count.
     ibps: HashMap<u32, Handle<SkinnedMeshInverseBindposes>>,
+}
+
+impl Sways {
+    /// The mesh of the copy drawn in a stock part's place, if one is: the stains paint it.
+    pub(super) fn copy_mesh(&self, part: Entity) -> Option<&Handle<Mesh>> {
+        self.live
+            .values()
+            .flat_map(|s| &s.copies)
+            .find(|(p, _, _)| *p == part)
+            .map(|(_, _, mesh)| mesh)
+    }
 }
 
 /// One swaying unit: its candidate parts (to notice a re-dress), the copies, and the springs.
@@ -158,7 +169,7 @@ struct Side {
 
 /// On a sway copy, so the stock and copy queries stay apart.
 #[derive(Component)]
-struct SwayCopy;
+pub(super) struct SwayCopy;
 
 /// A rig's candidate parts with their meshes, by part.
 type PartMeshes = Vec<(Entity, AssetId<Mesh>)>;
@@ -198,7 +209,7 @@ struct Lobe {
 
 /// Picks the nearest female units to sway, builds their copies, and drops the rest.
 #[allow(clippy::too_many_arguments)] // one Bevy system's resources
-fn manage_sways(
+pub(super) fn manage_sways(
     mut commands: Commands,
     mut sways: ResMut<Sways>,
     parts: Query<BodyPart, Without<SwayCopy>>,
