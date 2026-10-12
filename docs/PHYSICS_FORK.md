@@ -231,6 +231,13 @@ Gotchas, each learned the hard way:
   `sway` tracks `(Entity, AssetId<Mesh>)` per part and rebuilds when the set changes or when an
   `AssetEvent<Mesh>::Modified` names one of them. A failed build is remembered in
   `Sways.failed` and retried only when the parts change.
+- **Zero-alpha batches.** A unit batch whose animated alpha (`MatAnim`, written into the tag by
+  `apply_unit_mat_alpha`) reaches 0 is culled by the visibility authority, not drawn clear; an
+  opaque batch ignores the tag's alpha. Elementals swap shapes this way. A copy whose stock part
+  we hide must take that cull itself: `stain::shown(tag)` hides it while `alpha_of(tag) <= 0`,
+  and both `sync_stain_copies` and `dismember::sync_limb_copies` (which also keeps a limb copy on
+  its stock part's material and tag, on its own slot) apply it. Without it a hit elemental drew
+  its hidden shapes too and looked doubled.
 - **Ordering.** Upstream writes palette rows in `finalize_rig_worlds` (PostUpdate). Systems that
   write copy rows run `.after(finalize_rig_worlds).in_set(BillboardPlace)` so they read this
   frame's pose and are not overwritten.

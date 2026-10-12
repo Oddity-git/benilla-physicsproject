@@ -18,7 +18,7 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
 use benilla_assets::materials::WowModelMaterial;
-use benilla_world::mesh_tag::rig_of;
+use benilla_world::mesh_tag::{alpha_of, rig_of};
 use benilla_world::model_render::park::ParkedMesh;
 use benilla_world::model_render::ModelPart;
 use benilla_world::rig_anim::RigPose;
@@ -761,17 +761,27 @@ fn release(
     }
 }
 
-/// Keeps our copies on the stock parts' material and tag: fades, fog and the slot.
+/// Keeps our copies on the stock parts' material and tag: fades, fog and the slot. A batch whose
+/// animated alpha is down to nothing is culled by visibility, not drawn clear (an elemental swaps
+/// its shapes so), and the stock part is ours to hide, so the copy takes that cull itself.
+#[allow(clippy::type_complexity)]
 fn sync_stain_copies(
     stains: Res<Stains>,
     stock: Query<(&MeshMaterial3d<WowModelMaterial>, &MeshTag), Without<StainCopy>>,
-    mut copies: Query<(&mut MeshMaterial3d<WowModelMaterial>, &mut MeshTag), With<StainCopy>>,
+    mut copies: Query<
+        (
+            &mut MeshMaterial3d<WowModelMaterial>,
+            &mut MeshTag,
+            &mut Visibility,
+        ),
+        With<StainCopy>,
+    >,
 ) {
     for part in stains.units.values().flat_map(|u| &u.parts) {
         let Target::Own { copy, .. } = part.target else {
             continue;
         };
-        if let (Ok((mat, tag)), Ok((mut copy_mat, mut copy_tag))) =
+        if let (Ok((mat, tag)), Ok((mut copy_mat, mut copy_tag, mut vis))) =
             (stock.get(part.part), copies.get_mut(copy))
         {
             if copy_mat.0 != mat.0 {
@@ -780,7 +790,20 @@ fn sync_stain_copies(
             if copy_tag.0 != tag.0 {
                 copy_tag.0 = tag.0;
             }
+            let want = shown(tag.0);
+            if *vis != want {
+                *vis = want;
+            }
         }
+    }
+}
+
+/// A copy's visibility from its stock part's tag: hidden while the batch's alpha is nothing.
+pub(super) fn shown(tag: u32) -> Visibility {
+    if alpha_of(tag) <= 0.0 {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
     }
 }
 

@@ -50,7 +50,12 @@ const TINY: f32 = 1e-4;
 
 pub(super) fn plugin(app: &mut App) {
     app.add_message::<Severed>()
-        .add_systems(Update, (build_limb_copies, heal_limbs));
+        .add_systems(Update, (build_limb_copies, heal_limbs))
+        .add_systems(
+            PostUpdate,
+            sync_limb_copies
+                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+        );
 }
 
 /// A limb came off: where its joint was, and the way the body was thrown.
@@ -350,6 +355,36 @@ fn build_limb_copies(
                 warn!("dismember: unit {unit}'s severed limb found no parts to draw");
             }
             limb.holder = Some(holder);
+        }
+    }
+}
+
+/// Keeps each limb copy on its stock part's material and tag (fades, fog, the batch's animated
+/// alpha), on its own slot, and culled while that alpha is nothing, as the stock part is.
+#[allow(clippy::type_complexity)]
+fn sync_limb_copies(
+    stock: Query<(&MeshMaterial3d<WowModelMaterial>, &MeshTag), Without<LimbPart>>,
+    mut copies: Query<(
+        &LimbPart,
+        &mut MeshMaterial3d<WowModelMaterial>,
+        &mut MeshTag,
+        &mut Visibility,
+    )>,
+) {
+    for (limb, mut copy_mat, mut copy_tag, mut vis) in &mut copies {
+        let Ok((mat, tag)) = stock.get(limb.stock) else {
+            continue;
+        };
+        if copy_mat.0 != mat.0 {
+            copy_mat.0 = mat.0.clone();
+        }
+        let want_tag = with_rig(tag.0, rig_of(copy_tag.0));
+        if copy_tag.0 != want_tag {
+            copy_tag.0 = want_tag;
+        }
+        let want = super::stain::shown(tag.0);
+        if *vis != want {
+            *vis = want;
         }
     }
 }
