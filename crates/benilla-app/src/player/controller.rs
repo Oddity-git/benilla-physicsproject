@@ -371,40 +371,27 @@ pub(super) fn control(
             may_translate,
             may_turn,
         );
-        // Fork: omni-directional movement (`ragdoll/omni.rs`): the keys name a direction from the
-        // camera, the body turns to it and runs forward.
+        // Fork: turn around on S (`ragdoll/omni.rs`): S turns the body about and runs it forward
+        // instead of backpedalling; `true` while it turns.
         #[cfg(feature = "ragdoll")]
         let omni = {
-            let right = i32::from(axes.turn_right) - i32::from(axes.turn_left);
-            let strafe = i32::from(axes.strafe_right) - i32::from(axes.strafe_left);
-            let in_combat = body
-                .single()
-                .ok()
-                .and_then(|(.., store, _, _, _, _, _)| store)
-                .is_some_and(|s| s.0.unit_flags() & UNIT_FLAG_IN_COMBAT != 0);
             let steer = crate::ragdoll::omni::steer(
                 axes.fwd,
-                right,
-                strafe != 0,
-                rig.look == Some(LookButton::Left),
-                axes.mouselook,
                 axes.mouselook || !may_turn || !may_translate,
-                cam.yaw,
                 player.face_yaw,
-                in_combat,
                 dt,
             );
             if let Some(steer) = &steer {
-                player.face_yaw = steer.face_yaw;
-                axes.fwd = i32::from(steer.run);
-                // Q/E keep strafing along the facing.
-                axes.side = strafe;
-                axes.translating = steer.run || strafe != 0;
-                axes.turning = false;
-                axes.turn_left = false;
-                axes.turn_right = false;
+                axes.fwd = 1;
+                axes.translating = true;
+                if let Some(yaw) = steer.face_yaw {
+                    player.face_yaw = yaw;
+                    axes.turning = false;
+                    axes.turn_left = false;
+                    axes.turn_right = false;
+                }
             }
-            steer.is_some()
+            steer.is_some_and(|s| s.face_yaw.is_some())
         };
         let input::MoveAxes {
             fwd: fwd_axis,
@@ -751,7 +738,7 @@ pub(super) fn control(
             );
         }
         // `turn_delta` is our own turn; the deck's yaw reached `cam.yaw` in the ride carry.
-        // Fork: the camera does not swing behind a body the omni steering turns.
+        // Fork: the camera does not swing round while the body turns about on S.
         #[cfg(feature = "ragdoll")]
         let follow_cfg = if omni {
             camera::FollowConfig {

@@ -1,13 +1,11 @@
-//! Fork: omni-directional movement, behind the Physics page's Omni-Directional Movement box
+//! Fork: turn around instead of backpedalling, behind the Physics page's Turn Around on Back box
 //! (`omniMovement`, off by default).
 //!
-//! 1.12 walks the character along its own facing: S backpedals and A/D turn. With the box on, and
-//! the right mouse button up, the movement keys name a direction from the camera instead: W runs
-//! away from it, S toward it, A/D to its sides, and diagonals between; Q/E strafe along the facing
-//! as they always do. The character turns
-//! to that direction and runs forward, never backpedalling. Letting go in combat turns it back to
-//! where the camera looks, so it faces what it fights. Holding the right mouse button is the stock
-//! steering, untouched.
+//! 1.12 walks the character backward at a slower pace while S is held. With the box on, and the
+//! right mouse button up, pressing S (or pulling a gamepad stick down) turns the character about
+//! and runs it forward at full pace while S stays held; once it has turned, S drives like W and
+//! A/D, Q/E and the camera work as they always do. Holding the right mouse button is the stock
+//! backpedal, untouched.
 //!
 //! The player controller calls [`steer`] after it reads the keys (its one `Fork:` hook); the facing
 //! it sets streams to the server as any facing change does (`SET_FACING`).
@@ -17,35 +15,18 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use bevy::prelude::*;
 
-/// How fast the character turns to its direction (rad/s): a turn about takes a quarter second.
+/// How fast the character turns about (rad/s): a half turn takes about a quarter second.
 const TURN_RATE: f32 = 12.0;
 /// A turn this close (rad) to its direction is done.
 const DONE: f32 = 0.01;
 
 /// The box, read once a frame.
 static ON: AtomicBool = AtomicBool::new(false);
-/// Steering last frame, so letting go is an edge.
-static MOVING: AtomicBool = AtomicBool::new(false);
-/// Turning back to the camera after letting go in combat.
-static FACING_CAMERA: AtomicBool = AtomicBool::new(false);
-/// The camera's yaw last frame, and how far left-button orbits have turned it since the right
-/// button last steered (f32 bits): the keys steer from the camera less that orbit.
-static LAST_CAM: AtomicU32 = AtomicU32::new(0);
-static ORBIT: AtomicU32 = AtomicU32::new(0);
-
-/// The yaw the keys steer from: the camera's, less what left-button orbits turned it, so a
-/// left-drag looks around without turning the character. The right button resets it.
-fn reference(cam_yaw: f32, orbiting: bool, mouselook: bool) -> f32 {
-    let last = f32::from_bits(LAST_CAM.swap(cam_yaw.to_bits(), Ordering::Relaxed));
-    let mut orbit = f32::from_bits(ORBIT.load(Ordering::Relaxed));
-    if mouselook {
-        orbit = 0.0;
-    } else if orbiting {
-        orbit = wrap(orbit + wrap(cam_yaw - last));
-    }
-    ORBIT.store(orbit.to_bits(), Ordering::Relaxed);
-    cam_yaw - orbit
-}
+/// S held last frame, so pressing it is an edge.
+static BACKING: AtomicBool = AtomicBool::new(false);
+/// Turning about, toward [`TARGET`] (f32 bits).
+static TURNING: AtomicBool = AtomicBool::new(false);
+static TARGET: AtomicU32 = AtomicU32::new(0);
 
 pub(super) fn plugin(app: &mut App) {
     app.add_systems(PreUpdate, read_box);
@@ -59,12 +40,11 @@ fn read_box(cvars: Option<Res<crate::cvars::Cvars>>) {
     ON.store(on, Ordering::Relaxed);
 }
 
-/// What the controller does this frame instead of the stock axes.
+/// What the controller does this frame instead of backpedalling.
 pub(crate) struct Steer {
-    /// The character's new facing.
-    pub(crate) face_yaw: f32,
-    /// Run forward along it.
-    pub(crate) run: bool,
+    /// The character's new facing while it turns about; `None` once turned, when the turn keys
+    /// work as usual.
+    pub(crate) face_yaw: Option<f32>,
 }
 
 /// `angle` wrapped into (−π, π].
@@ -77,64 +57,28 @@ fn wrap(angle: f32) -> f32 {
     }
 }
 
-/// The facing turned toward `target` by at most `TURN_RATE · dt`.
-fn turn_toward(face: f32, target: f32, dt: f32) -> f32 {
-    let left = wrap(target - face);
+/// `fwd` is the W/S axis (−1 backward). `None` leaves the stock controls alone: the box off, the
+/// right button held or movement locked (`stock`), or S up. Otherwise the controller runs forward,
+/// turning the facing about first.
+pub(crate) fn steer(fwd: i32, stock: bool, face_yaw: f32, dt: f32) -> Option<Steer> {
+    if !ON.load(Ordering::Relaxed) || stock || fwd >= 0 {
+        BACKING.store(false, Ordering::Relaxed);
+        TURNING.store(false, Ordering::Relaxed);
+        return None;
+    }
+    if !BACKING.swap(true, Ordering::Relaxed) {
+        TARGET.store(wrap(face_yaw + PI).to_bits(), Ordering::Relaxed);
+        TURNING.store(true, Ordering::Relaxed);
+    }
+    if !TURNING.load(Ordering::Relaxed) {
+        return Some(Steer { face_yaw: None });
+    }
+    let left = wrap(f32::from_bits(TARGET.load(Ordering::Relaxed)) - face_yaw);
+    if left.abs() < DONE {
+        TURNING.store(false, Ordering::Relaxed);
+    }
     let budget = TURN_RATE * dt;
-    face + left.clamp(-budget, budget)
-}
-
-/// Steer from the camera (less any left-button orbit, `orbiting` while it is held): `fwd` is W/S (+1 away from the camera), `right` the A/D keys (+1
-/// right). Q/E strafe as they always do, along the facing. `None` leaves the stock controls alone:
-/// the box off, the right button held (`stock`), only a strafe key held (`strafing`), or nothing to
-/// do. The yaws are the camera's and the character's, one convention.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn steer(
-    fwd: i32,
-    right: i32,
-    strafing: bool,
-    orbiting: bool,
-    mouselook: bool,
-    stock: bool,
-    cam_yaw: f32,
-    face_yaw: f32,
-    in_combat: bool,
-    dt: f32,
-) -> Option<Steer> {
-    let cam_yaw = reference(cam_yaw, orbiting, mouselook);
-    if !ON.load(Ordering::Relaxed) || stock {
-        MOVING.store(false, Ordering::Relaxed);
-        FACING_CAMERA.store(false, Ordering::Relaxed);
-        return None;
-    }
-    let (fwd, right) = (fwd.signum(), right.signum());
-    if fwd == 0 && right == 0 && strafing {
-        MOVING.store(false, Ordering::Relaxed);
-        FACING_CAMERA.store(false, Ordering::Relaxed);
-        return None;
-    }
-    if fwd != 0 || right != 0 {
-        MOVING.store(true, Ordering::Relaxed);
-        FACING_CAMERA.store(false, Ordering::Relaxed);
-        // Facing yaw grows leftward; forward is −Z. Away from the camera is its yaw, right of it
-        // is a quarter turn less.
-        let target = cam_yaw + (-(right as f32)).atan2(fwd as f32);
-        return Some(Steer {
-            face_yaw: turn_toward(face_yaw, target, dt),
-            run: true,
-        });
-    }
-    if MOVING.swap(false, Ordering::Relaxed) && in_combat {
-        FACING_CAMERA.store(true, Ordering::Relaxed);
-    }
-    if !FACING_CAMERA.load(Ordering::Relaxed) {
-        return None;
-    }
-    if wrap(cam_yaw - face_yaw).abs() < DONE {
-        FACING_CAMERA.store(false, Ordering::Relaxed);
-    }
     Some(Steer {
-        face_yaw: turn_toward(face_yaw, cam_yaw, dt),
-        run: false,
+        face_yaw: Some(face_yaw + left.clamp(-budget, budget)),
     })
 }

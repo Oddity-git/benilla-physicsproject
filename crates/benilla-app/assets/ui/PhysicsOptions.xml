@@ -85,10 +85,8 @@
             .. "sinking and the legs bending to reach. Lowest turns it off."
 
         BENILLA_TOOLTIP_OMNI_MOVEMENT =
-            "The movement keys run in their direction from the camera: S turns you around and runs "
-            .. "toward the camera instead of backpedalling, A and D run sideways. Letting go in "
-            .. "combat turns you to face where the camera looks. Holding the right mouse button "
-            .. "steers as usual."
+            "S (or a gamepad stick pulled down) turns you around and runs instead of backpedalling. "
+            .. "Holding the right mouse button backpedals as usual."
 
         BENILLA_TOOLTIP_BLOOD_STAINS =
             "How big the blood stains bleeding hits leave on the body are. Lowest turns them off. "
@@ -362,7 +360,7 @@
                     <Anchor point="TOPRIGHT" relativeTo="$parentRowFootPlanting" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                 </Anchors>
                 <Scripts><OnLoad>
-                    BenillaOptionsRow_OnLoad(this, "omniMovement", "Omni-Directional Movement",
+                    BenillaOptionsRow_OnLoad(this, "omniMovement", "Turn Around on Back",
                         "BENILLA_TOOLTIP_OMNI_MOVEMENT")
                 </OnLoad></Scripts>
             </Frame>
