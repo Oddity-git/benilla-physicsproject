@@ -188,7 +188,28 @@ fn sync_bags(
     units: Query<BagUnit, With<Ragdoll>>,
     marks: Query<&LootBag>,
     mut bags: ResMut<Bags>,
+    mut seen: Local<EntityHashMap<(bool, u32)>>,
 ) {
+    // `WOW_MOVE_TRACE_TAGS=bag`: each ragdoll's loot and skin flags as they change.
+    if benilla_assets::trace::enabled_for("bag") {
+        seen.retain(|unit, _| units.contains(*unit));
+        for (unit, store, ..) in &units {
+            let now = (store.0.unit_lootable(), store.0.unit_flags());
+            if seen.insert(unit, now) != Some(now) {
+                benilla_assets::trace::line(
+                    "bag",
+                    &format!(
+                        "{unit} dead={} lootable={} skinnable={} flags={:#x} dyn={:#x}",
+                        store.0.unit_is_dead(),
+                        now.0,
+                        now.1 & UNIT_FLAG_SKINNABLE != 0,
+                        now.1,
+                        store.0.unit_dynamic_flags()
+                    ),
+                );
+            }
+        }
+    }
     bags.0.retain(|unit, root| {
         let want = units
             .get(*unit)

@@ -101,8 +101,16 @@ fn on_release_response(
     mut loot: ResMut<LootState>,
     mut latch: ResMut<LootLatch>,
     mut dead: super::DeadUnitDeselect,
+    commands: Res<NetCommands>,
 ) {
     if let SessionEvent::LootReleaseResponse { guid, result } = ev {
+        // Fork: the server's release can land in the same frame as the removal that emptied the
+        // window, before the feed's last-row auto-close; that close still owes its
+        // `CMSG_LOOT_RELEASE`, without which cMaNGOS never marks the corpse looted or skinnable.
+        if result != 0 && latch.0 == Some(guid) && loot.take_auto_release() {
+            dead.after_close(super::close_interaction(&mut loot, &mut latch, Some(&commands)));
+            return;
+        }
         dead.after_close(loot_release_response(guid, result, &mut loot, &mut latch));
     }
 }
