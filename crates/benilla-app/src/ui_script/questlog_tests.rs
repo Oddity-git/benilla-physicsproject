@@ -102,6 +102,66 @@ fn shipped_questlog_frame_loads_clean() {
     load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
 }
 
+/// The collapse-all button folds in place: `CollapseQuestHeader(0)` signals `QUEST_LOG_UPDATE`
+/// inside the click (`0x4ded30`), so `QuestLog_Update` has hidden the quest rows by its next line.
+#[test]
+fn the_collapse_all_button_repaints_the_list_in_place() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    for f in [
+        "Interface\\FrameXML\\GlobalStrings.lua",
+        "Interface\\FrameXML\\Fonts.xml",
+        r"Interface\FrameXML\BasicControls.xml",
+        r"Interface\FrameXML\LocaleProperties.lua",
+        r"Interface\FrameXML\UIParent.xml",
+        r"Interface\FrameXML\MoneyFrame.lua",
+        r"Interface\FrameXML\MoneyFrame.xml",
+        "Interface\\FrameXML\\GameTooltip.xml",
+        r"Interface\FrameXML\UIPanelTemplates.lua",
+        r"Interface\FrameXML\UIPanelTemplates.xml",
+        "Interface\\FrameXML\\CharacterFrameTemplates.xml",
+        r"Interface\FrameXML\StaticPopup.xml",
+        r"Interface\FrameXML\MainMenuBarMicroButtons.xml",
+        "Interface\\FrameXML\\ItemButtonTemplate.xml",
+        "Interface\\FrameXML\\QuestFrame.xml",
+        "Interface\\FrameXML\\QuestLogFrame.xml",
+        "Interface\\FrameXML\\MerchantFrame.xml",
+        "ScrollTemplates.xml",
+    ] {
+        load_xml(&s, f);
+    }
+    let mut log = eight_entries();
+    log.entries.truncate(2);
+    log.num_quests = 2;
+    log.entries.insert(
+        0,
+        QuestLogEntryView {
+            title: "Elwynn Forest".into(),
+            is_header: true,
+            ..Default::default()
+        },
+    );
+    s.set_quest_log(log);
+    s.run("ToggleQuestLog()").unwrap();
+    assert!(s
+        .eval::<bool>("return QuestLogTitle2:IsShown() == 1")
+        .unwrap());
+    let shown: bool = s
+        .eval(
+            "this = QuestLogCollapseAllButton QuestLogCollapseAllButton_OnClick() \
+             return QuestLogTitle2:IsShown() == 1",
+        )
+        .unwrap();
+    assert!(!shown, "the folded quests left the list inside the click");
+    assert_eq!(
+        s.eval::<i64>("return GetNumQuestLogEntries()").unwrap(),
+        1,
+        "and stay folded: the selection kept its quest, so QuestLog_Update reopened no header"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
 /// Open, read the list and the detail, wheel the list, abandon through the confirm, close.
 #[test]
 fn shipped_questlog_frame_drives_end_to_end() {
@@ -1052,6 +1112,7 @@ fn wheel_over_the_detail_pane_changes_vertical_scroll() {
     s.resolve();
     answer_measures(&mut s);
     s.resolve(); // the measures reach the scroll range and the bar
+    s.tick(0.016); // the marked range is recomputed in the frame's update
 
     s.resolve();
     let quads = s.extract();
@@ -1109,7 +1170,7 @@ fn selection_change_resets_detail_scroll_but_a_quest_log_update_refresh_does_not
     s.resolve();
     answer_measures(&mut s);
     s.resolve(); // the measures reach the scroll range and the bar
-    s.resolve(); // the range reads resolved rects
+    s.tick(0.016); // the marked range is recomputed in the frame's update
 
     // Scroll through the bar, as the wheel does: a reselect snaps back with the bar's
     // `SetValue(0)`, which changes nothing on a bar already at 0.
@@ -1262,7 +1323,7 @@ fn popup_children_inherit_the_dialog_stratum() {
     let backdrop_z = quads
         .iter()
         .find_map(|q| match &q.content {
-            QuadContent::Backdrop { path, .. } if path.contains("UI-DialogBox-Background") => {
+            QuadContent::Texture { path: Some(p), .. } if p.contains("UI-DialogBox-Background") => {
                 Some(q.z)
             }
             _ => None,
@@ -1692,4 +1753,116 @@ fn the_stock_title_width_cap_bites_and_is_sticky_per_row_button() {
         (width(&mut s, "QuestLogTitle1NormalText") - capped).abs() < 0.5,
         "the capped box survives the row going untagged (the ref's own 275 reset never fires)"
     );
+}
+
+// ── The group-mates count ──
+
+/// A party member held with `ids` in their quest-log window, named `name`.
+fn mate_on(guid: u64, name: &str, ids: &[u32]) -> benilla_ui::script::UnitState {
+    let mut quest_log = [[0; 3]; 20];
+    for (slot, &id) in quest_log.iter_mut().zip(ids) {
+        *slot = [id, 0, 0];
+    }
+    benilla_ui::script::UnitState {
+        exists: true,
+        has_object: true,
+        is_player: true,
+        guid,
+        name: Some(name.into()),
+        quest_log,
+        ..Default::default()
+    }
+}
+
+/// Each quest row counts the party members on it as `[n]` (`QuestLogFrame.lua:168-183`), through
+/// `IsUnitOnQuest(questIndex, "partyN")`; the row tooltip names them (`:515-541`), and a mate's
+/// `UNIT_QUEST_LOG_CHANGED` recounts (`:69-72`).
+#[test]
+fn quest_rows_count_the_party_members_on_each_quest() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    load_xml(&s, "Interface\\FrameXML\\GlobalStrings.lua");
+    load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
+    load_xml(&s, r"Interface\FrameXML\BasicControls.xml");
+    load_xml(&s, r"Interface\FrameXML\LocaleProperties.lua");
+    load_xml(&s, r"Interface\FrameXML\UIParent.xml");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.lua");
+    load_xml(&s, r"Interface\FrameXML\MoneyFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\GameTooltip.xml");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.lua");
+    load_xml(&s, r"Interface\FrameXML\UIPanelTemplates.xml");
+    load_xml(&s, "Interface\\FrameXML\\CharacterFrameTemplates.xml");
+    load_xml(&s, r"Interface\FrameXML\StaticPopup.xml");
+    load_xml(&s, r"Interface\FrameXML\MainMenuBarMicroButtons.xml");
+    load_xml(&s, "Interface\\FrameXML\\ItemButtonTemplate.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\QuestLogFrame.xml");
+    load_xml(&s, "Interface\\FrameXML\\MerchantFrame.xml");
+    load_xml(&s, "ScrollTemplates.xml"); // our scroll kits
+
+    s.set_quest_log(eight_entries());
+    s.set_party(party(2));
+    s.set_unit("party1", Some(mate_on(0x300, "Mate0", &[1, 3])));
+    s.set_unit("party2", Some(mate_on(0x301, "Mate1", &[1])));
+    s.run("ToggleQuestLog()").unwrap();
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+
+    let mates = |s: &mut UiScript, row: u32| {
+        s.eval::<String>(&format!(
+            "return QuestLogTitle{row}GroupMates:GetText() or ''"
+        ))
+        .unwrap()
+    };
+    assert_eq!(mates(&mut s, 1), "[2]", "both mates are on quest 1");
+    assert_eq!(mates(&mut s, 2), "", "nobody is on quest 2");
+    assert_eq!(mates(&mut s, 3), "[1]", "party1 is on quest 3");
+
+    // The row tooltip, as `QuestLogTitleButton_OnEnter` builds it for row 1, then row 2.
+    let line = |s: &mut UiScript, n: u32| {
+        s.eval::<String>(&format!("return GameTooltipTextLeft{n}:GetText() or ''"))
+            .unwrap()
+    };
+    s.run("this = QuestLogTitle1 QuestLog_UpdatePartyInfoTooltip()")
+        .unwrap();
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    assert_eq!(line(&mut s, 1), "Quest 1");
+    assert!(s
+        .eval::<bool>(
+            "return GameTooltipTextLeft2:GetText() == \
+             HIGHLIGHT_FONT_COLOR_CODE..PARTY_QUEST_STATUS_ON..FONT_COLOR_CODE_CLOSE"
+        )
+        .unwrap());
+    assert!(line(&mut s, 3).contains("Mate0"), "{}", line(&mut s, 3));
+    assert!(line(&mut s, 4).contains("Mate1"), "{}", line(&mut s, 4));
+    s.run("this = QuestLogTitle2 QuestLog_UpdatePartyInfoTooltip()")
+        .unwrap();
+    assert!(s
+        .eval::<bool>(
+            "return GameTooltipTextLeft2:GetText() == \
+             HIGHLIGHT_FONT_COLOR_CODE..PARTY_QUEST_STATUS_NONE..FONT_COLOR_CODE_CLOSE"
+        )
+        .unwrap());
+
+    // party2 takes quest 3: their quest-log event recounts the open log.
+    s.set_unit("party2", Some(mate_on(0x301, "Mate1", &[1, 3])));
+    s.fire_event(
+        "UNIT_QUEST_LOG_CHANGED",
+        vec![benilla_ui::script::ScriptValue::Str("party2".into())],
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    assert_eq!(mates(&mut s, 3), "[2]");
+
+    // Out of range, a mate counts for nothing, whatever their last window held (`0x468460` finds
+    // no object).
+    s.set_unit(
+        "party1",
+        Some(benilla_ui::script::UnitState {
+            has_object: false,
+            ..mate_on(0x300, "Mate0", &[1, 3])
+        }),
+    );
+    s.run("QuestLog_Update()").unwrap();
+    assert_eq!(mates(&mut s, 1), "[1]");
+    assert_eq!(mates(&mut s, 3), "[1]");
 }

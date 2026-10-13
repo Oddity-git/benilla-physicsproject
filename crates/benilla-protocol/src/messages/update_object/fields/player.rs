@@ -8,6 +8,15 @@ impl ObjectFields {
     pub fn object_entry(&self) -> Option<u32> {
         self.get_u32(3)
     }
+    /// `ITEM_FIELD_OWNER` (field 6): the item's owner, which the client's lock watchers compare
+    /// with the active player.
+    pub fn item_owner(&self) -> Option<u64> {
+        self.get_guid(6)
+    }
+    /// `OBJECT_FIELD_TYPE & TYPEMASK_ITEM`: an item, a bag included.
+    pub fn is_item(&self) -> bool {
+        self.get_u32(FIELD_OBJECT_TYPE).unwrap_or(0) & 0x2 != 0
+    }
     /// `ITEM_FIELD_STACK_COUNT`: an item object's stack size.
     pub fn item_stack_count(&self) -> Option<u32> {
         self.get_u32(FIELD_ITEM_STACK_COUNT)
@@ -200,6 +209,17 @@ impl ObjectFields {
             counters,
             state: (count_state >> 24) as u8,
             timer,
+        })
+    }
+    /// The whole `PLAYER_QUEST_LOG` window, `[id, count-state, timer]` per slot as the wire left
+    /// it, 0 where absent: a group mate's carries the ids alone, the one dword per slot vmangos
+    /// flags `GROUP_ONLY` (`UpdateFields_1_12_1.h:128-129`).
+    pub fn player_quest_log_window(&self) -> [[u32; 3]; PLAYER_QUEST_LOG_SLOTS as usize] {
+        std::array::from_fn(|slot| {
+            std::array::from_fn(|k| {
+                self.get_u32(FIELD_PLAYER_QUEST_LOG_1_1 + 3 * slot as u16 + k as u16)
+                    .unwrap_or(0)
+            })
         })
     }
     /// `PLAYER_EXPLORED_ZONES_1 + i`: bitset dword `i`; bit `n` is `AreaTable` explore flag `n`.

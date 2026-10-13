@@ -145,7 +145,7 @@ fn probe_minimap_widget(mut widget: ResMut<MinimapWidget>, windows: Query<&Windo
     let min = Vec2::new(win.width() - side - margin, margin);
     widget.0 = Some(MinimapSlot {
         rect: Rect::from_corners(min, min + Vec2::splat(side)),
-        z: u64::MAX / 2,
+        z: u128::MAX / 2,
         zoom: 3,
         inside_zoom: 3,
         alpha: 1.0,
@@ -199,7 +199,7 @@ impl Default for MinimapZoom {
 /// One extracted Minimap widget: its rect (y-down logical px), paint key and live state.
 pub(crate) struct MinimapSlot {
     pub(crate) rect: Rect,
-    pub(crate) z: u64,
+    pub(crate) z: u128,
     /// The outdoor zoom index; `inside_zoom` is the indoor one, picked by WMO containment.
     pub(crate) zoom: u8,
     pub(crate) inside_zoom: u8,
@@ -351,7 +351,6 @@ fn emit_minimap(
         unit_pos,
         window,
         mut blip_hover,
-        ui_scale,
         group,
         tracked,
         self_store,
@@ -621,7 +620,7 @@ fn emit_minimap(
         }
         let win = window.iter().next();
         let cursor = win.and_then(|w| w.cursor_position());
-        let seam = win.map_or(1.0, |w| crate::ui_script::seam_scale(w.height(), ui_scale.0));
+        let seam = win.map_or(1.0, |w| crate::ui_script::seam_scale(w.height()));
         // The pan origin snapped to a half-logical-pixel grid: every blip offset and rim bearing
         // derives from `wx`/`wy`, so the layer steps together instead of rewriting the batch mesh
         // every frame while walking. Blip world positions stay exact.
@@ -637,11 +636,6 @@ fn emit_minimap(
             wy: (wy / q).round() * q,
             wz: wow[2],
             cursor,
-            // The cursor in UI space (y-up, ÷ the seam scale): the tooltip anchor resolves in
-            // 768-virtual units, not window px.
-            cursor_ui: cursor
-                .zip(win)
-                .map(|(c, w)| Vec2::new(c.x / seam, (w.height() - c.y) / seam)),
             seam,
         }
     });
@@ -907,8 +901,8 @@ impl Plugin for MinimapPlugin {
                         .run_if(crate::ui_script::ingame_ui_up),
                     // Before the script tick, so GameTimeFrame reads this frame's minute.
                     feed_game_time.in_set(crate::ui_script::UiFeed),
-                    // After the world-mouseover drive (UnitFeed): a same-frame world-hover→blip
-                    // transition must end with the blip tooltip shown, not the fade.
+                    // In the feed, off the hover the last walk left; after the world drive only so
+                    // the two VM writers keep one order.
                     blips::drive_blip_tooltip
                         .after(crate::ui_unit::UnitFeed)
                         .in_set(crate::ui_script::UiFeed),

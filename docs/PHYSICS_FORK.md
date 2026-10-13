@@ -103,8 +103,9 @@ the install, and keep local state in `benilla-config/`.
 
 ## 4. Repository layout
 
-- **Upstream base:** commit `2e82d34c` (`v0.2.0-116`, between releases). The first fork commit is `6ead3cdf` ("Ragdoll step 1").
-  `git diff 2e82d34 HEAD` shows everything the fork changed.
+- **Upstream base:** upstream `main` at `5338675f` (merged 2026-10-13); before that `2e82d34c`
+  (`v0.2.0-116`). The first fork commit is `6ead3cdf` ("Ragdoll step 1").
+  `git diff up/main HEAD` (with `up` fetched to the merged commit) shows everything the fork changed.
 - **Fork code:** `crates/benilla-app/src/ragdoll/`, about 5,500 lines in 16 files.
 - **Fork options page:** `crates/benilla-app/assets/ui/PhysicsOptions.xml`.
 - **Outside those two:** 23 files, +766/−118 lines, nearly all marked `Fork:`.
@@ -170,9 +171,10 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
   pipelines. This fixed a crash near water that ragdolls exposed. It is a real bug fix, not a
   feature.
 
-**Only merge upstream releases.** Mathieu follows benilla's tagged releases, never its `main`:
-the next merge is the first release tag after v0.2.0 (`git fetch up --tags`, then
-`git merge <tag>`), and no upstream commit between tags is pulled in.
+**Merging upstream.** Mathieu's standing preference is benilla's tagged releases (`git fetch up
+--tags`, then `git merge <tag>`), but he asked for upstream `main` on 2026-10-13 and it was merged
+(`git merge up/main`; conflicts were only the Cargo feature lists, both kept, and `README.md`,
+kept ours). Merge whatever he names; ask if he names neither.
 
 **When merging upstream:** keep each hook a one- or two-line change. If upstream moved the code,
 re-apply the hook in the new place and keep the `Fork:` comment.

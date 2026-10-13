@@ -1,6 +1,7 @@
 //! The capture UI fixtures: each arm seeds one window's synthetic but realistic state.
 
 use super::*;
+use benilla_protocol::messages::trainer_spell_state;
 
 /// The `vplates` fixture's wolf, the reference screenshot's subject (vmangos `creature_template`
 /// 69 "Timber Wolf": level 2, faction template 32, display 604), at the scenario's look point.
@@ -23,6 +24,66 @@ const CHEST_GUID: u64 = (0xF110u64 << 48) | 0x744;
 /// 45°), so `front` shows the lit side and `rear` the unlit one.
 const SUBJECT_YAW: f32 = 2.36;
 
+/// One trainer fixture's canned seed: the trainer's identity, its `SMSG_TRAINER_LIST` type, its
+/// greeting, the character's hearthstone bind area, and the wire rows
+/// `(spell, state, copper cost, required level)`.
+struct TrainerSeed {
+    name: &'static str,
+    subname: &'static str,
+    trainer_type: u32,
+    greeting: &'static str,
+    bind: u32,
+    rows: &'static [(u32, u8, u32, u8)],
+}
+
+/// Llane Beshere (entry 911), Northshire's warrior trainer: the rank-1 learn wrappers a vmangos
+/// trainer lists (`1605` teaches Heroic Strike 78 and so on), so each row's name and rank mirror
+/// the ability while its description is the taught spell's own text.
+const TRAINER_WARRIOR: TrainerSeed = TrainerSeed {
+    name: "Llane Beshere",
+    subname: "Warrior Trainer",
+    trainer_type: 0,
+    greeting: "I can train you in the ways of the warrior.",
+    bind: 9, // Northshire Valley, where this character's hearthstone is
+    rows: &[
+        (1605, trainer_spell_state::GREEN, 10, 1), // Heroic Strike Rank 1
+        (1738, trainer_spell_state::GREEN, 100, 4), // Charge Rank 1
+        (1423, trainer_spell_state::GREEN, 100, 4), // Rend Rank 1
+        (6674, trainer_spell_state::GREEN, 200, 6), // Battle Shout Rank 1
+        (1716, trainer_spell_state::GREEN, 300, 8), // Hamstring Rank 1
+        (3128, trainer_spell_state::GREEN, 200, 8), // Parry
+    ],
+};
+
+/// A shaman trainer's Astral Recall (wrapper 1352 teaches 556). One service only: the stock
+/// window's `ClassTrainer_SelectFirstLearnableSkill` selects row 2, so the row the shot is about
+/// must be the first service of the first group.
+const TRAINER_SHAMAN: TrainerSeed = TrainerSeed {
+    name: "Sian'tsu",
+    subname: "Shaman Trainer",
+    trainer_type: 0,
+    greeting: "The spirits are strong within you, shaman.",
+    bind: 362, // Razor Hill, a Durotar hearthstone
+    rows: &[(1352, trainer_spell_state::GREEN, 4000, 30)],
+};
+
+/// Bengus Deepforge, Ironforge's blacksmithing trainer, with the two row shapes a profession
+/// trainer lists: the profession-learn wrapper (2020 teaches 2018, whose own text the row shows)
+/// and a recipe (7820 teaches 7818, whose text is the description of the Silver Rod it makes).
+/// The learn row sorts into group 1 (`Effect` 44 `SKILL_STEP`) ahead of the recipe's group 2
+/// (`0x4d77b6`), so the stock window's row-2 selection lands on it.
+const TRAINER_BLACKSMITH: TrainerSeed = TrainerSeed {
+    name: "Bengus Deepforge",
+    subname: "Blacksmithing Trainer",
+    trainer_type: 2, // a tradeskill trainer
+    greeting: "The forge shapes what the mine provides.",
+    bind: 1537, // Ironforge
+    rows: &[
+        (2020, trainer_spell_state::GREEN, 9, 5), // Apprentice Blacksmith
+        (7820, trainer_spell_state::GREEN, 90, 0), // Silver Rod
+    ],
+};
+
 /// Seeds the fixture window's state once the scene is resident; the real feeds push it into the VM
 /// during the settle window as live wire data would. Icons resolve through the offline
 /// `ItemDisplayCatalog`, and names go straight into the caches.
@@ -35,9 +96,14 @@ pub(super) fn seed_ui_fixture(
     mut quest: ResMut<crate::ui_quest::QuestGiver>,
     mut quest_log: ResMut<crate::ui_quest_log::QuestLog>,
     mut loot: ResMut<crate::ui_loot::LootState>,
+    mut trainer: ResMut<crate::ui_trainer::TrainerOpen>,
     // One param under Bevy's 16-param cap: item objects are entities in the index, spawned as
-    // the wire does.
-    store: (ResMut<crate::items::Items>, ResMut<crate::net::GuidIndex>),
+    // the wire does; the hearthstone bind (`SMSG_BINDPOINTUPDATE`) rides along for the `$z` token.
+    store: (
+        ResMut<crate::items::Items>,
+        ResMut<crate::net::GuidIndex>,
+        ResMut<crate::net::HomeBind>,
+    ),
     mut names: ResMut<crate::names::NameCache>,
     icons: Option<Res<crate::entities::ItemDisplays>>,
     mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
@@ -51,7 +117,7 @@ pub(super) fn seed_ui_fixture(
         ResMut<crate::loading_screen::LoadingScreen>,
     ),
 ) {
-    let (mut items, mut index) = store;
+    let (mut items, mut index, mut home_bind) = store;
     // A glue-screen capture has no world scenario, and no glue screen opens a UI fixture.
     let Some(scenario) = ctx.scenario else {
         return;
@@ -205,6 +271,62 @@ pub(super) fn seed_ui_fixture(
                     ..Default::default()
                 });
             }
+        }
+        UiFixture::Trainer(list) => {
+            // The seed's rows are the wire list: its copper costs, level gates and the states the
+            // server computed, in wire order.
+            use benilla_protocol::messages::TrainerSpell;
+            let seed = match list {
+                TrainerList::Warrior => &TRAINER_WARRIOR,
+                TrainerList::Shaman => &TRAINER_SHAMAN,
+                TrainerList::Blacksmith => &TRAINER_BLACKSMITH,
+            };
+            names.insert_creature(
+                NPC_ENTRY,
+                Some(crate::names::CreatureRecord {
+                    name: seed.name.into(),
+                    subname: Some(seed.subname.into()),
+                    creature_type: 7,
+                    pet_family: 0,
+                    rank: 0,
+                    type_flags: 0,
+                    civilian: false,
+                    racial_leader: false,
+                    display_id: 0,
+                }),
+            );
+            home_bind.0 = Some(seed.bind);
+            let Some(script) = script.as_mut() else {
+                return;
+            };
+            // The window's title and portrait read `UnitName("npc")`; no session seats it here.
+            script.set_unit(
+                "npc",
+                Some(benilla_ui::script::UnitState {
+                    exists: true,
+                    name: Some(seed.name.into()),
+                    level: 12,
+                    ..Default::default()
+                }),
+            );
+            // A purse large enough for every cost above, so the money frame renders white.
+            script.set_money(10_000);
+            let services: Vec<TrainerSpell> = seed
+                .rows
+                .iter()
+                .map(|&(spell, state, cost, req_level)| TrainerSpell {
+                    spell,
+                    state,
+                    cost,
+                    can_learn_primary_prof: false,
+                    is_primary_prof_first_rank: false,
+                    req_level,
+                    req_skill: 0,
+                    req_skill_value: 0,
+                    req_spells: [0; 3],
+                })
+                .collect();
+            trainer.open(NPC_GUID, seed.trainer_type, services, seed.greeting.into());
         }
         UiFixture::Gossip => {
             names.insert_creature(
@@ -767,6 +889,8 @@ pub(super) fn seed_ui_fixture(
                 "mouseover",
                 Some(benilla_ui::script::UnitState {
                     exists: true,
+                    // A unit is found by its guid; the builder hides for guid 0 (`0x52a04e`).
+                    guid: 0xF130_0000_0044_0001,
                     name: Some("Stormwind Guard".into()),
                     health: 38,
                     max_health: 50,
@@ -794,6 +918,7 @@ pub(super) fn seed_ui_fixture(
                 "mouseover",
                 Some(benilla_ui::script::UnitState {
                     exists: true,
+                    guid: 0x0000_0000_0000_0B0B,
                     is_player: true,
                     name: Some("Bob".into()),
                     level: 60,
@@ -894,8 +1019,8 @@ pub(super) fn seed_ui_fixture(
             bow.inventory_type = 15;
             items.insert_template(93_013, Some(bow));
             let mut arrows = template("Rough Arrow", 0);
-            arrows.class = 6; // projectile: the ammo slot's icon and bag-summed count (200)
-            arrows.inventory_type = 24; // INVTYPE_AMMO: the equip drains' SET_AMMO fork
+            arrows.class = 6; // projectile: the ammo icon, the bag-summed count (200), SET_AMMO
+            arrows.inventory_type = 24; // INVTYPE_AMMO
             arrows.display_info_id = DISP_STONE;
             items.insert_template(93_012, Some(arrows));
 
@@ -1236,15 +1361,23 @@ pub(super) fn seed_ui_fixture(
                 warn!("capture: ui-chat-tabhover select failed: {e}");
             }
             script.resolve();
+            // Each in the root's units the cursor is fed in: the frame's own times its scale.
             let expr = match mode.as_str() {
-                "2" | "3" => "return ChatFrame2Tab:GetCenter()",
+                "2" | "3" => {
+                    "local x, y = ChatFrame2Tab:GetCenter() \
+                        local k = ChatFrame2Tab:GetEffectiveScale() return x * k, y * k"
+                }
                 "0" => {
-                    "return (ChatFrame2:GetLeft() + ChatFrame2:GetRight()) / 2, \
-                        (ChatFrame2:GetBottom() + ChatFrame2:GetTop()) / 2"
+                    "local k = ChatFrame2:GetEffectiveScale() \
+                        return (ChatFrame2:GetLeft() + ChatFrame2:GetRight()) / 2 * k, \
+                        (ChatFrame2:GetBottom() + ChatFrame2:GetTop()) / 2 * k"
                 }
                 // 9: park far away, so the dock conceals itself.
                 "9" => "return 2000, 2000",
-                _ => "return ChatFrame1Tab:GetCenter()",
+                _ => {
+                    "local x, y = ChatFrame1Tab:GetCenter() \
+                        local k = ChatFrame1Tab:GetEffectiveScale() return x * k, y * k"
+                }
             };
             let centre: Result<(f32, f32), _> = script.eval(expr);
             match centre {
@@ -1444,16 +1577,22 @@ fn seed_cooldown_filmstrip(
         slots.insert(
             slot,
             benilla_ui::script::ContainerSlot {
+                use_fork: Default::default(),
+                item_class: None,
                 petition: None,
                 durability: None,
                 duration_ms: None,
                 bar_placeable: true,
+                consumable: false,
                 texture: texture.clone(),
                 count: 1,
                 quality: Some(1),
+                inventory_type: 0,
+                bonding: 0,
+                use_spell: 0,
                 item_id: 6948,
                 link: Some("|cffffffff|Hitem:6948|h[Hearthstone]|h|r".into()),
-                locked: false,
+                guid: 0,
                 equip_slots: Vec::new(),
                 cooldown: Some(((now_ms - fraction * span_ms) as i64, span_ms as u32, true)),
                 readable: false,
@@ -1496,16 +1635,22 @@ fn seed_bag_window(
     };
     let slot = |disp: u32, count: u32, id: u32, name: &str, quality: u32| {
         benilla_ui::script::ContainerSlot {
+            use_fork: Default::default(),
+            item_class: None,
             petition: None,
             durability: None,
             duration_ms: None,
             bar_placeable: true,
+            consumable: false,
             texture: icon(disp),
             count,
             quality: Some(quality),
+            inventory_type: 0,
+            bonding: 0,
+            use_spell: 0,
             item_id: id,
             link: Some(format!("|cffffffff|Hitem:{id}|h[{name}]|h|r")),
-            locked: false,
+            guid: 0,
             equip_slots: Vec::new(),
             cooldown: None,
             readable: false,
@@ -1582,16 +1727,22 @@ fn seed_equipped_bags(
     };
     let slot =
         |disp: u32, count: u32, name: &str, quality: u32| benilla_ui::script::ContainerSlot {
+            use_fork: Default::default(),
+            item_class: None,
             petition: None,
             durability: None,
             duration_ms: None,
             bar_placeable: true,
+            consumable: false,
             texture: icon(disp),
             count,
             quality: Some(quality),
+            inventory_type: 0,
+            bonding: 0,
+            use_spell: 0,
             item_id: 0,
             link: Some(format!("|cffffffff|Hitem:0|h[{name}]|h|r")),
-            locked: false,
+            guid: 0,
             equip_slots: Vec::new(),
             cooldown: None,
             readable: false,
