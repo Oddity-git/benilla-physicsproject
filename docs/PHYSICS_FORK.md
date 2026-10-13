@@ -403,6 +403,13 @@ The sack fades in `DROP_HEIGHT 1.2` yd (× its size) above the spot over `FADE_I
 for `FALL 0.35` s, squashes `SQUASH 0.2` and bounces twice (`BOUNCES`: 0.15 yd for 0.22 s, 0.04 yd
 for 0.12 s) in `drop_bags`, drawn, not simulated; the fade is the meshes' `MeshTag` alpha
 (the plain fallback bag has none and just drops). Mathieu asked for it instead of popping in.
+**Skinning.** Once the corpse is looted and `UNIT_FLAG_SKINNABLE` (0x0400_0000) is set, the sack
+is swapped for a hide on the same spot (`wants`: sack while lootable, hide while skinnable), with
+the same drop and the same corpse pick, so skinning works where the server keeps the corpse.
+Mathieu found that a corpse whose sack he had looted could not then be skinned with WowPad's
+interact. The hide model is the shortest `World\…\*.m2` whose name holds `pelt`, `\hide`,
+`_hide`, `bearskin` or `rug` (logged `ragdoll skinning hide: using …`), scaled to
+`HIDE_RADIUS 0.45` yd across from its bound; a flat leather disc stands in without one.
 
 ### `gore.rs`
 All blood colours and textures come from the stock `UnitBlood` tables. Violence 1 is green,

@@ -3,6 +3,10 @@
 //! sack points at the corpse. The sack is a model from the install, found once by name; a plain
 //! brown blob stands in when the install has none. The sack fades in a little above the spot,
 //! drops onto it and bounces twice, a drawn fall rather than a simulated one.
+//!
+//! Once the corpse is looted and the server marks it skinnable, a hide takes the sack's place on
+//! the same spot and points at the corpse the same way, so it can be skinned where the server
+//! keeps it, wherever the body lies. It goes once the corpse is skinned.
 
 use bevy::ecs::entity::EntityHashMap;
 use bevy::prelude::*;
@@ -19,6 +23,15 @@ use crate::net::{Guid, NetEntity, ObjectStore};
 use crate::player::CameraControl;
 use crate::target::{Hovered, PickOcclusion};
 use crate::ui_script::PointerOverUi;
+
+/// `UNIT_FLAG_SKINNABLE`: the server set it when the corpse's loot is gone.
+const UNIT_FLAG_SKINNABLE: u32 = 0x0400_0000;
+/// A hide's model: any `.m2` under `World` named like a hide or pelt, the shortest name.
+const HIDE_WORDS: &[&str] = &["pelt", "\\hide", "_hide", "bearskin", "rug"];
+/// A hide's radius on the ground (yd, times the corpse's size), whatever its model's own size.
+const HIDE_RADIUS: f32 = 0.45;
+/// The plain hide's colour, a lighter leather than the plain sack's.
+const HIDE_COLOUR: (f32, f32, f32) = (0.55, 0.4, 0.26);
 
 /// Sack models tried first, by path; then any `.m2` under `World\Generic` named like a sack.
 const SACK_MODELS: &[&str] = &[
@@ -55,9 +68,13 @@ pub(super) fn plugin(app: &mut App) {
         .add_systems(Update, pick_bags.in_set(crate::target::UnitPickOverride));
 }
 
-/// The sack model, looked up once: `None` until searched, then the handle if the install has one.
+/// The sack and hide models, each looked up once: `None` until searched, then the handle if the
+/// install has one.
 #[derive(Resource, Default)]
-struct SackArt(Option<Option<Handle<M2Model>>>);
+struct SackArt {
+    sack: Option<Option<Handle<M2Model>>>,
+    hide: Option<Option<Handle<M2Model>>>,
+}
 
 /// Each lootable ragdoll's sack root.
 #[derive(Resource, Default)]
@@ -74,34 +91,43 @@ struct LootBag {
     /// Where it lands, and when it started to fall.
     spot: Vec3,
     born: Option<f32>,
+    /// A hide on a skinnable corpse, not a sack.
+    hide: bool,
 }
 
-/// Searches the patch chain for a sack model, once, on the first lootable ragdoll.
+/// Searches the patch chain for the sack and hide models, once each, on the first ragdoll that
+/// needs one.
 fn find_sack_model(
     mut art: ResMut<SackArt>,
-    bags: Res<Bags>,
+    bags: Query<&LootBag>,
     assets: Option<Res<WorldAssets>>,
     server: Res<AssetServer>,
 ) {
-    if art.0.is_some() || bags.0.is_empty() {
+    let want_sack = art.sack.is_none() && bags.iter().any(|b| !b.hide);
+    let want_hide = art.hide.is_none() && bags.iter().any(|b| b.hide);
+    if !want_sack && !want_hide {
         return;
     }
     let Some(assets) = assets else {
         return;
     };
-    let path = {
-        let Ok(chain) = assets.chain.lock() else {
-            return;
-        };
-        SACK_MODELS
+    let Ok(chain) = assets.chain.lock() else {
+        return;
+    };
+    let listed = || -> Vec<String> {
+        chain
+            .list()
+            .map(|names| names.into_iter().map(|e| e.name).collect())
+            .unwrap_or_default()
+    };
+    if want_sack {
+        let path = SACK_MODELS
             .iter()
             .map(|p| p.to_string())
             .find(|p| chain.contains(p))
             .or_else(|| {
-                let names = chain.list().ok()?;
-                names
+                listed()
                     .into_iter()
-                    .map(|e| e.name)
                     .filter(|n| {
                         let l = n.to_ascii_lowercase();
                         l.starts_with("world\\generic")
@@ -109,13 +135,29 @@ fn find_sack_model(
                             && (l.contains("lootbag") || l.contains("\\sack"))
                     })
                     .min_by_key(|n| n.len())
-            })
-    };
-    match &path {
-        Some(p) => info!("ragdoll loot bag: using {p}"),
-        None => info!("ragdoll loot bag: no sack model in the install, using a plain bag"),
+            });
+        match &path {
+            Some(p) => info!("ragdoll loot bag: using {p}"),
+            None => info!("ragdoll loot bag: no sack model in the install, using a plain bag"),
+        }
+        art.sack = Some(path.map(|p| server.load::<M2Model>(m2_url(&p))));
     }
-    art.0 = Some(path.map(|p| server.load::<M2Model>(m2_url(&p))));
+    if want_hide {
+        let path = listed()
+            .into_iter()
+            .filter(|n| {
+                let l = n.to_ascii_lowercase();
+                l.starts_with("world\\")
+                    && l.ends_with(".m2")
+                    && HIDE_WORDS.iter().any(|w| l.contains(w))
+            })
+            .min_by_key(|n| n.len());
+        match &path {
+            Some(p) => info!("ragdoll skinning hide: using {p}"),
+            None => info!("ragdoll skinning hide: no hide model in the install, using a plain one"),
+        }
+        art.hide = Some(path.map(|p| server.load::<M2Model>(m2_url(&p))));
+    }
 }
 
 /// What [`sync_bags`] reads of a ragdolled unit.
@@ -127,11 +169,48 @@ type BagUnit = (
     Option<&'static ModelBound>,
 );
 
-/// Gives each lootable ragdoll a sack on its unit's spot, sized by the unit, and takes the sack
-/// away once the corpse is looted, stands up or is gone.
-fn sync_bags(mut commands: Commands, units: Query<BagUnit, With<Ragdoll>>, mut bags: ResMut<Bags>) {
+/// Whether a corpse wants a sack (lootable), a hide (skinnable once looted) or nothing.
+fn wants(store: &ObjectStore) -> Option<bool> {
+    if store.0.unit_lootable() {
+        Some(false)
+    } else if store.0.unit_flags() & UNIT_FLAG_SKINNABLE != 0 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Gives each lootable ragdoll a sack on its unit's spot, sized by the unit, swaps it for a hide
+/// once the corpse is looted and skinnable, and takes it away once the corpse is done with, stands
+/// up or is gone.
+fn sync_bags(
+    mut commands: Commands,
+    units: Query<BagUnit, With<Ragdoll>>,
+    marks: Query<&LootBag>,
+    mut bags: ResMut<Bags>,
+) {
+    bags.0.retain(|unit, root| {
+        let want = units
+            .get(*unit)
+            .ok()
+            .and_then(|(_, store, ..)| wants(store));
+        let have = marks.get(*root).map(|b| b.hide).ok();
+        let keep = want.is_some() && want == have;
+        if !keep {
+            if let Ok(mut e) = commands.get_entity(*root) {
+                e.despawn();
+            }
+            if let Ok(mut e) = commands.get_entity(*unit) {
+                e.remove::<crate::creature_anim::LootSparkleOn>();
+            }
+        }
+        keep
+    });
     for (unit, store, tf, net, bound) in &units {
-        if !store.0.unit_lootable() || bags.0.contains_key(&unit) {
+        let Some(hide) = wants(store) else {
+            continue;
+        };
+        if bags.0.contains_key(&unit) {
             continue;
         }
         let height = bound.map_or(0.0, |b| 2.0 * b.0.half_extents.y) * net.scale;
@@ -144,13 +223,18 @@ fn sync_bags(mut commands: Commands, units: Query<BagUnit, With<Ragdoll>>, mut b
         let (_, rot, at) = tf.to_scale_rotation_translation();
         let root = commands
             .spawn((
-                Name::new("ragdoll loot bag"),
+                Name::new(if hide {
+                    "ragdoll skinning hide"
+                } else {
+                    "ragdoll loot bag"
+                }),
                 LootBag {
                     scale,
                     size,
                     built: false,
                     spot: at,
                     born: None,
+                    hide,
                 },
                 Transform::from_translation(at + Vec3::Y * DROP_HEIGHT * size)
                     .with_rotation(rot)
@@ -158,35 +242,23 @@ fn sync_bags(mut commands: Commands, units: Query<BagUnit, With<Ragdoll>>, mut b
                 Visibility::default(),
             ))
             .id();
-        // The loot sparkle hangs here, unscaled by the sack, instead of on the body.
-        let sparkle = commands
-            .spawn((
-                Name::new("loot bag sparkle"),
-                Transform::from_scale(Vec3::splat(1.0 / scale)),
-                Visibility::default(),
-                crate::entities::VisualAttached,
-            ))
-            .id();
-        commands.entity(root).add_child(sparkle);
-        commands
-            .entity(unit)
-            .insert(crate::creature_anim::LootSparkleOn(sparkle));
+        if !hide {
+            // The loot sparkle hangs here, unscaled by the sack, instead of on the body.
+            let sparkle = commands
+                .spawn((
+                    Name::new("loot bag sparkle"),
+                    Transform::from_scale(Vec3::splat(1.0 / scale)),
+                    Visibility::default(),
+                    crate::entities::VisualAttached,
+                ))
+                .id();
+            commands.entity(root).add_child(sparkle);
+            commands
+                .entity(unit)
+                .insert(crate::creature_anim::LootSparkleOn(sparkle));
+        }
         bags.0.insert(unit, root);
     }
-    bags.0.retain(|unit, root| {
-        let keep = units
-            .get(*unit)
-            .is_ok_and(|(_, store, ..)| store.0.unit_lootable());
-        if !keep {
-            if let Ok(mut e) = commands.get_entity(*root) {
-                e.despawn();
-            }
-            if let Ok(mut e) = commands.get_entity(*unit) {
-                e.remove::<crate::creature_anim::LootSparkleOn>();
-            }
-        }
-        keep
-    });
 }
 
 /// Fills each new sack with the model's meshes once it has loaded, or the plain bag without one.
@@ -201,14 +273,16 @@ fn build_bags(
     mut mats: benilla_world::model_render::M2BatchMaterials,
     mut plain: ResMut<Assets<StandardMaterial>>,
     mut plain_art: Local<Option<(Handle<Mesh>, Handle<StandardMaterial>)>>,
+    mut plain_hide: Local<Option<Handle<StandardMaterial>>>,
 ) {
-    let Some(found) = &art.0 else {
-        return;
-    };
     for (root, mut bag) in &mut roots {
         if bag.built {
             continue;
         }
+        let found = if bag.hide { &art.hide } else { &art.sack };
+        let Some(found) = found else {
+            continue; // not searched yet
+        };
         match found {
             Some(handle) => {
                 let Some(model) = m2s.get(handle) else {
@@ -216,6 +290,13 @@ fn build_bags(
                 };
                 if !mats.ready() {
                     continue;
+                }
+                // A hide model is any size: scaled to lie [`HIDE_RADIUS`] across.
+                if bag.hide {
+                    let radius = model.bounds.as_ref().map_or(0.0, |b| b.sphere_radius);
+                    if radius > 1e-3 {
+                        bag.scale = HIDE_RADIUS * bag.size / radius;
+                    }
                 }
                 forms.ensure_now_rigged(handle, &model.submeshes, &mut mesh_assets);
                 let stat = forms.slices(handle).stat;
@@ -248,14 +329,33 @@ fn build_bags(
                         )
                     })
                     .clone();
-                // Sized in yards inside the sack's scaled root, filling the click sphere.
+                // Sized in yards inside the sack's scaled root, filling the click sphere; a hide
+                // lies flat.
                 let r = 0.8 * PICK_RADIUS * bag.size / bag.scale;
+                let (material, shape, centre) = if bag.hide {
+                    let leather = plain_hide
+                        .get_or_insert_with(|| {
+                            let (r, g, b) = HIDE_COLOUR;
+                            plain.add(StandardMaterial {
+                                base_color: Color::srgb(r, g, b),
+                                unlit: true,
+                                ..default()
+                            })
+                        })
+                        .clone();
+                    (leather, Vec3::new(r, 0.08 * r, 0.8 * r), 0.05 * r)
+                } else {
+                    (
+                        material,
+                        Vec3::new(r, 0.8 * r, r),
+                        PICK_CENTRE * bag.size / bag.scale,
+                    )
+                };
                 let child = commands
                     .spawn((
                         Mesh3d(mesh),
                         MeshMaterial3d(material),
-                        Transform::from_translation(Vec3::Y * PICK_CENTRE * bag.size / bag.scale)
-                            .with_scale(Vec3::new(r, 0.8 * r, r)),
+                        Transform::from_translation(Vec3::Y * centre).with_scale(shape),
                     ))
                     .id();
                 commands.entity(root).add_child(child);
