@@ -12,6 +12,9 @@ const MAX_BODIES: usize = 32;
 /// Walking down from the root, the hub is the first bone no single child of which holds this share
 /// of the limb length below it: the pelvis, where the spine and the legs part.
 const HUB_SHARE: f32 = 0.75;
+/// A profile whose bodies span less than this share of the skeleton's limb length rides mostly
+/// rigid, so the hub moves to where the chain starts ([`chain_start`]).
+const CHAIN_COVER: f32 = 0.4;
 /// A child of the hub this close to it (a share of the height), with a segment this short, is part
 /// of the hub, not a body of its own: a waist bone between the hub and the legs would wobble.
 const HUB_MERGE_NEAR: f32 = 0.05;
@@ -130,73 +133,94 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
             limb_below[p] += limb_below[i];
         }
     }
-    let hub = find_hub(&limb, &limb_below, &parent_of, n);
-    // The hub's ancestors ride it rigidly (the origin root, a bone above the pelvis): a body there
-    // would hang off the hub upside down.
-    let mut above_hub = vec![false; n];
-    let mut up = parent_of(hub);
-    while let Some(p) = up {
-        above_hub[p] = true;
-        up = parent_of(p);
-    }
-    let mut candidates: Vec<(usize, Vec3)> = (0..n)
-        .filter(|&i| i != hub && !above_hub[i])
-        .filter_map(|i| {
-            let seg = pivots[main_child[i]?] - pivots[i];
-            let merged = parent_of(i) == Some(hub)
-                && (pivots[i] - pivots[hub]).length() < HUB_MERGE_NEAR * height
-                && seg.length() < HUB_MERGE_SHORT * height;
-            if merged {
-                return None;
-            }
-            // A root bone at the model origin spans origin to pelvis: no limb.
-            let root_like = parent_of(i).is_none() && pivots[i].length() < 0.05 * height;
-            (seg.length() >= MIN_SEGMENT * height && !root_like).then_some((i, seg))
-        })
-        .collect();
-    if candidates.len() + 1 > MAX_BODIES {
-        candidates.sort_by(|a, b| b.1.length().total_cmp(&a.1.length()));
-        candidates.truncate(MAX_BODIES - 1);
-    }
-    if candidates.len() < 2 {
-        return None;
-    }
-    candidates.sort_by_key(|c| c.0);
-    // The hub always has a body, however short its own segment: everything hangs off it. A hub
-    // with no child to run to gets a short stub up.
-    let hub_seg = main_child[hub]
-        .map(|c| pivots[c] - pivots[hub])
-        .filter(|s| s.length() >= 0.5 * MIN_SEGMENT * height)
-        .unwrap_or(Vec3::Y * MIN_SEGMENT * height);
-    candidates.insert(0, (hub, hub_seg));
-
-    let mut body_of = vec![None; n];
-    let mut bodies = Vec::with_capacity(candidates.len());
-    for (i, seg) in candidates {
-        // The nearest ancestor with a body, else the hub (body 0): every body hangs off one tree.
-        let mut up = parent_of(i);
-        let mut parent = None;
+    let root_like = |i: usize| parent_of(i).is_none() && pivots[i].length() < 0.05 * height;
+    let build = |hub: usize| -> Option<Profile> {
+        // The hub's ancestors ride it rigidly (the origin root, a bone above the pelvis): a body there
+        // would hang off the hub upside down.
+        let mut above_hub = vec![false; n];
+        let mut up = parent_of(hub);
         while let Some(p) = up {
-            if let Some(b) = body_of[p] {
-                parent = Some(b);
-                break;
-            }
+            above_hub[p] = true;
             up = parent_of(p);
         }
-        if parent.is_none() && !bodies.is_empty() {
-            parent = Some(0);
+        let mut candidates: Vec<(usize, Vec3)> = (0..n)
+            .filter(|&i| i != hub && !above_hub[i])
+            .filter_map(|i| {
+                let seg = pivots[main_child[i]?] - pivots[i];
+                let merged = parent_of(i) == Some(hub)
+                    && (pivots[i] - pivots[hub]).length() < HUB_MERGE_NEAR * height
+                    && seg.length() < HUB_MERGE_SHORT * height;
+                if merged {
+                    return None;
+                }
+                // A root bone at the model origin spans origin to pelvis: no limb.
+                (seg.length() >= MIN_SEGMENT * height && !root_like(i)).then_some((i, seg))
+            })
+            .collect();
+        if candidates.len() + 1 > MAX_BODIES {
+            candidates.sort_by(|a, b| b.1.length().total_cmp(&a.1.length()));
+            candidates.truncate(MAX_BODIES - 1);
         }
-        body_of[i] = Some(bodies.len());
-        bodies.push(BodySpec {
-            bone: i as u16,
-            pivot: pivots[i],
-            segment: seg,
-            radius: (seg.length() * RADIUS_OF_SEGMENT)
-                .clamp(RADIUS_MIN * height, RADIUS_MAX * height),
-            parent,
-        });
+        if candidates.len() < 2 {
+            return None;
+        }
+        candidates.sort_by_key(|c| c.0);
+        // The hub always has a body, however short its own segment: everything hangs off it. A hub
+        // with no child to run to gets a short stub up.
+        let hub_seg = main_child[hub]
+            .map(|c| pivots[c] - pivots[hub])
+            .filter(|s| s.length() >= 0.5 * MIN_SEGMENT * height)
+            .unwrap_or(Vec3::Y * MIN_SEGMENT * height);
+        candidates.insert(0, (hub, hub_seg));
+
+        let mut body_of = vec![None; n];
+        let mut bodies = Vec::with_capacity(candidates.len());
+        for (i, seg) in candidates {
+            // The nearest ancestor with a body, else the hub (body 0): every body hangs off one tree.
+            let mut up = parent_of(i);
+            let mut parent = None;
+            while let Some(p) = up {
+                if let Some(b) = body_of[p] {
+                    parent = Some(b);
+                    break;
+                }
+                up = parent_of(p);
+            }
+            if parent.is_none() && !bodies.is_empty() {
+                parent = Some(0);
+            }
+            body_of[i] = Some(bodies.len());
+            bodies.push(BodySpec {
+                bone: i as u16,
+                pivot: pivots[i],
+                segment: seg,
+                radius: (seg.length() * RADIUS_OF_SEGMENT)
+                    .clamp(RADIUS_MIN * height, RADIUS_MAX * height),
+                parent,
+            });
+        }
+        Some(Profile { bodies, body_of })
+    };
+    let walked = build(find_hub(&limb, &limb_below, &parent_of, n));
+    // A chain (a snake, a lasher's vine) has no branch to stop at, so the walk runs to its tip and
+    // the whole chain rides that one body. When the walked profile covers too little of the limb
+    // length, the hub goes to where the chain starts instead and the chain hangs off it.
+    let total = (0..n)
+        .filter(|&i| parent_of(i).is_none())
+        .map(|i| limb_below[i])
+        .fold(0.0, f32::max);
+    let covered = |p: &Profile| p.bodies.iter().map(|b| b.segment.length()).sum::<f32>();
+    if walked
+        .as_ref()
+        .is_some_and(|p| covered(p) >= CHAIN_COVER * total)
+    {
+        return walked;
     }
-    Some(Profile { bodies, body_of })
+    let chained = build(chain_start(&limb, &limb_below, &parent_of, &root_like, n));
+    match (walked, chained) {
+        (Some(w), Some(c)) if covered(&c) <= covered(&w) => Some(w),
+        (w, c) => c.or(w),
+    }
 }
 
 /// The head's own body, from the model's head key bone, when it has none: the neck and head are
@@ -253,6 +277,31 @@ pub(super) fn add_head(profile: &mut Profile, binds: &[Vec3], parents: &[i16], h
         radius: (segment.length() * HEAD_RADIUS).clamp(RADIUS_MIN * height, RADIUS_MAX * height),
         parent: Some(parent),
     });
+}
+
+/// Where a chain starts: from the root with the most limb length, down the child with the most,
+/// to the first bone that is a limb itself (not the origin root).
+fn chain_start(
+    limb: &[f32],
+    limb_below: &[f32],
+    parent_of: &impl Fn(usize) -> Option<usize>,
+    root_like: &impl Fn(usize) -> bool,
+    n: usize,
+) -> usize {
+    let mut at = (0..n)
+        .filter(|&i| parent_of(i).is_none())
+        .max_by(|&a, &b| limb_below[a].total_cmp(&limb_below[b]))
+        .unwrap_or(0);
+    while limb[at] <= 0.0 || root_like(at) {
+        let next = (at + 1..n)
+            .filter(|&c| parent_of(c) == Some(at))
+            .max_by(|&a, &b| limb_below[a].total_cmp(&limb_below[b]));
+        match next {
+            Some(c) => at = c,
+            None => break,
+        }
+    }
+    at
 }
 
 /// The hub: from the root with the most limb length, step into the child that holds at least

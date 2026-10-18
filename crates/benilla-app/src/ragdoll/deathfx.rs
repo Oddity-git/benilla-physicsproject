@@ -1,6 +1,7 @@
 //! Fork: what a killing blow leaves on the body as it falls, behind the Physics page's Death
 //! Effects box (`deathEffects`, on by default).
 //!
+//! - A severed limb's cut bursts and jets blood (`gore`'s arteries).
 //! - A melee kill gushes blood upward from the corpse for a moment (`gore::gush`, so the Blood
 //!   option gates it like any blood).
 //! - A fire kill burns: Immolate's own burning model rides the body for a few seconds, embers rise
@@ -152,7 +153,7 @@ fn soft_puff() -> Image {
 }
 
 /// The box.
-fn enabled(cvars: Option<&crate::cvars::Cvars>) -> bool {
+pub(super) fn enabled(cvars: Option<&crate::cvars::Cvars>) -> bool {
     cvars.and_then(|c| c.flag("deathEffects")).unwrap_or(true)
 }
 

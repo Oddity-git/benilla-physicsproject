@@ -22,7 +22,7 @@ fidelity to the 1.12.1 reference client. This fork deliberately adds features 1.
 | Death push and lift scaled by the killing blow | `blow`, `life` | `ragdollPush`, `ragdollLift`, `ragdollSpellPush` |
 | Melee kills wait for the swing to land | `life` | `ragdollMeleeDelay` |
 | How stiffly ragdoll joints hold | `life` | `ragdollStiffness` |
-| Death effects: melee gush, fire burn and smoke, frost shards | `deathfx`, `gore` | `deathEffects` |
+| Death effects: melee gush, cut geysers and artery jets, fire burn and smoke, frost shards | `deathfx`, `gore` | `deathEffects` |
 | Players shove corpses | `pusher` | always |
 | Loot sack where the server's corpse is | `lootbag` | always |
 | Flung ragdolls stay drawn | `bounds` | always |
@@ -348,6 +348,9 @@ added here.
   are at most `MAX_BODIES` (32).
 - The **hub** is the pelvis-like bone where the limbs split (`find_hub`, `HUB_SHARE 0.75`).
   Nearby or short bones merge into it.
+- A chain (a snake, a lasher's vine) has no branch, so that walk runs to its tip. When the walked
+  profile's bodies span less than `CHAIN_COVER 0.4` of the limb length, the hub moves to
+  `chain_start` (the first real limb bone down from the root) and the chain hangs off it.
 - The capsule radius is `RADIUS_OF_SEGMENT` × the segment length, clamped to 0.03–0.1.
 - Bones without a body ride their nearest bodied ancestor. Bones outside the tree ride the hub.
 
@@ -526,6 +529,12 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   `Mesh3d` moved to `ParkedMesh`. `build_limb_copies` takes the mesh from either, or a bloodied
   unit's limb copied nothing and vanished. A parked cape (the cloth cloak draws it) is skipped.
 - `heal` undoes this when a unit revives.
+- `refit_rebuilt` (first in the PosePost chain): a ragdoll whose `RigPose` bone count changed (a
+  model rebuilt with another skeleton, such as a Druid of the Fang leaving snake form as it dies)
+  drops its bodies and `Ragdoll`, heals its cuts and gets `SeenAlive` back, so it falls again on the
+  new rig.
+- A dead unit whose profile is `None` logs `ragdoll: unit … (display …) has too few limbs`; each
+  fall's layout line carries the display id too.
 
 ### `deathfx.rs` (death effects)
 - On `Added<Ragdoll>` (not a knockdown, `Ragdoll::knocked`) with a `LastHit` within
@@ -533,6 +542,15 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   - **Melee or physical** (`None`, `Some(0)`): `gore::gush` puts `Gushing` on the unit, and
     `gore::gush_corpses` spurts droplets up from the hub body for `GUSH 1.2` s in `GUSH_PULSE 0.3`
     pulses (`GUSH_SPEED 2.5–4.5`, leaning `GUSH_LEAN 0.35`), weakening as it goes. Blood gated.
+  - **Any cut** (`gore::bleed_cuts`, whatever the school): a geyser of `GEYSER_DROPS 70` (× Gore
+    Amount, at least half) thrown up at `GEYSER_SPEED 5–10` yd/s, then an `Artery` entity per face:
+    the stump jets for `ARTERY 4` s, the piece for `ARTERY_PIECE 1.2` s. `spray_arteries` throws
+    one droplet (× Gore Amount) every `ARTERY_EVERY 0.01` s during the first `ARTERY_SPURT 0.6` of
+    each `ARTERY_BEAT 0.5` s, along the face's live direction from `Dismembered::wounds` lifted
+    `ARTERY_LIFT 0.45`, cone `ARTERY_CONE 0.12`, at `ARTERY_SPEED 5–8.5` yd/s scaled by a pressure
+    that surges each beat and fades as √ of the time left. Jet droplets are `ARTERY_SIZE 1–2.4`×
+    the usual dot, and only `ARTERY_MARKS 0.3` of them splat on landing (`Droplet::marks`), so a
+    jet does not retire every older splat.
   - **Fire** (`Some(2)`): Immolate's (348) state kit as a persistent `SpellKitFx::Begin` under
     our own key `BURN_KEY` (class `AuraState`), reaped after `BURN 4` s; embers rise meanwhile,
     smoke starts halfway and goes on `SMOKE 5` s after, thinning.

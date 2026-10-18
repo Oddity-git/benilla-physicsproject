@@ -9,6 +9,8 @@
 //!   (`deathfx` starts it).
 //! - A severed limb wears a splat on each face of its cut, the stump's and the piece's, turned to
 //!   the eye and riding them.
+//! - With Death Effects on, a cut bursts in a geyser and both faces jet blood in heartbeat pulses,
+//!   the stump for a few seconds and the piece briefly, as in a samurai film.
 //!
 //! The splat art is `UnitBlood`'s ground-splat column, which 1.12.1 ships but never draws
 //! (`benilla_formats::blood`): through the same censored row as the spurt, so green blood at
@@ -124,6 +126,7 @@ pub(super) fn plugin(app: &mut App) {
                 bleed_cuts,
                 squirt_bleeds,
                 gush_corpses,
+                spray_arteries,
                 fly_droplets,
                 start_pools,
                 grow_pools,
@@ -258,6 +261,10 @@ struct Droplet {
     ground: f32,
     born: f32,
     blood: Blood,
+    /// Its dot's size against [`DROP_RADIUS`].
+    size: f32,
+    /// Whether it leaves a splat where it lands.
+    marks: bool,
 }
 
 /// A splat on the ground, projected once.
@@ -597,6 +604,8 @@ fn throw_droplet(
         ground,
         born: now,
         blood,
+        size: 1.0,
+        marks: true,
     });
 }
 
@@ -682,6 +691,118 @@ fn gush_corpses(
             let v = lean.normalize() * gore.range(GUSH_SPEED) * (0.5 + 0.5 * left);
             let b = Blood { texture, violence };
             throw_droplet(&mut gore, b, at, v, tf.translation.y, now);
+        }
+    }
+}
+
+/// A cut's geyser: this many droplets thrown at once, at this speed range (yd/s), leaning off
+/// straight up by up to this much.
+const GEYSER_DROPS: usize = 70;
+const GEYSER_SPEED: (f32, f32) = (5.0, 10.0);
+const GEYSER_LEAN: f32 = 0.3;
+/// How long a stump jets (s), and the severed piece.
+const ARTERY: f32 = 4.0;
+const ARTERY_PIECE: f32 = 1.2;
+/// A jet's heartbeat (s), spurting for this share of it, one droplet (times Gore Amount) every
+/// [`ARTERY_EVERY`] while it spurts, at this speed range (yd/s) at full pressure.
+const ARTERY_BEAT: f32 = 0.5;
+const ARTERY_SPURT: f32 = 0.6;
+const ARTERY_EVERY: f32 = 0.01;
+const ARTERY_SPEED: (f32, f32) = (5.0, 8.5);
+/// How tight the jet is, and how much it lifts above the cut's own direction.
+const ARTERY_CONE: f32 = 0.12;
+const ARTERY_LIFT: f32 = 0.45;
+/// A jet droplet's size against an ordinary one, and the share that leave a splat (the rest only
+/// fly, so a jet does not retire every older splat).
+const ARTERY_SIZE: (f32, f32) = (1.0, 2.4);
+const ARTERY_MARKS: f32 = 0.3;
+
+/// One face of a cut jetting blood: the stump's, or the severed piece's.
+#[derive(Component)]
+struct Artery {
+    unit: Entity,
+    bone: usize,
+    piece: bool,
+    start: f32,
+    len: f32,
+    next: f32,
+}
+
+/// Each artery jets from its face of the cut, wherever the body has gone, in heartbeat pulses
+/// that start strong and weaken until its time is up.
+#[allow(clippy::too_many_arguments)] // one Bevy system's resources
+fn spray_arteries(
+    mut commands: Commands,
+    mut arteries: Query<(Entity, &mut Artery)>,
+    units: Query<(&Transform, &NetEntity, &super::dismember::Dismembered)>,
+    creatures: Option<Res<Creatures>>,
+    blood: Option<Res<BloodTables>>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
+    server: Res<AssetServer>,
+    time: Res<Time>,
+    mut gore: ResMut<Gore>,
+) {
+    let now = time.elapsed_secs();
+    let violence = violence_level(cvars.as_deref());
+    let amount = gore_amount(cvars.as_deref());
+    for (e, mut artery) in &mut arteries {
+        let t = now - artery.start;
+        let unit = units.get(artery.unit).ok();
+        let faces = unit.and_then(|(.., cut)| cut.wounds(artery.bone));
+        let (Some((tf, net, _)), Some(faces)) = (unit, faces) else {
+            // Not posed yet: wait a moment, then give up.
+            if t > artery.len {
+                commands.entity(e).despawn();
+            }
+            continue;
+        };
+        if t > artery.len {
+            commands.entity(e).despawn();
+            continue;
+        }
+        let Some(blood) = blood.as_deref().filter(|_| violence > 0) else {
+            continue;
+        };
+        let beat = (t % ARTERY_BEAT) / ARTERY_BEAT;
+        if beat > ARTERY_SPURT || now < artery.next {
+            continue;
+        }
+        artery.next = now + ARTERY_EVERY;
+        let Some(id) = unit_blood_id(creatures.as_deref(), blood, net.display_id) else {
+            continue;
+        };
+        let splats = blood.0.splats(id, violence);
+        let (at, out) = if artery.piece {
+            faces.piece
+        } else {
+            faces.stump
+        };
+        // Each beat surges then sags; the whole jet weakens as the heart gives out.
+        let surge = 1.0 - beat / ARTERY_SPURT * 0.5;
+        let pressure = (1.0 - t / artery.len).sqrt() * surge;
+        for _ in 0..(amount.round() as usize).max(1) {
+            let Some(texture) = gore.pick_texture(&server, splats) else {
+                break; // bloodless
+            };
+            let jitter = Vec3::new(
+                gore.range((-ARTERY_CONE, ARTERY_CONE)),
+                gore.range((-ARTERY_CONE, ARTERY_CONE)),
+                gore.range((-ARTERY_CONE, ARTERY_CONE)),
+            );
+            let dir =
+                (out.normalize_or(Vec3::Y) + Vec3::Y * ARTERY_LIFT + jitter).normalize_or(Vec3::Y);
+            let v = dir * gore.range(ARTERY_SPEED) * (0.25 + 0.75 * pressure);
+            let size = gore.range(ARTERY_SIZE);
+            let marks = gore.rand() < ARTERY_MARKS;
+            gore.drops.push(Droplet {
+                at,
+                velocity: v,
+                ground: tf.translation.y,
+                born: now,
+                blood: Blood { texture, violence },
+                size,
+                marks,
+            });
         }
     }
 }
@@ -775,10 +896,26 @@ fn bleed_cuts(
         return;
     };
     let now = time.elapsed_secs();
+    let geysers = super::deathfx::enabled(cvars.as_deref());
     for cut in cuts.read() {
         let Ok((tf, net, bound)) = units.get(cut.unit) else {
             continue;
         };
+        if geysers {
+            for (piece, len) in [(false, ARTERY), (true, ARTERY_PIECE)] {
+                commands.spawn((
+                    Name::new("artery"),
+                    Artery {
+                        unit: cut.unit,
+                        bone: cut.bone,
+                        piece,
+                        start: now,
+                        len,
+                        next: now,
+                    },
+                ));
+            }
+        }
         let Some(id) = unit_blood_id(creatures.as_deref(), &blood, net.display_id) else {
             continue;
         };
@@ -820,6 +957,30 @@ fn bleed_cuts(
                 * fast;
             let b = Blood { texture, violence };
             throw_droplet(&mut gore, b, cut.at, v, ground, now);
+        }
+        // The geyser: a column thrown high off the cut as it parts.
+        let burst = if geysers { GEYSER_DROPS as f32 } else { 0.0 };
+        for _ in 0..(burst * amount.max(0.5)).round() as usize {
+            let Some(texture) = gore.pick_texture(&server, splats) else {
+                break;
+            };
+            let lean = Vec3::new(
+                gore.range((-GEYSER_LEAN, GEYSER_LEAN)),
+                1.0,
+                gore.range((-GEYSER_LEAN, GEYSER_LEAN)),
+            );
+            let v = (lean + cut.away * 0.3).normalize_or(Vec3::Y) * gore.range(GEYSER_SPEED);
+            let size = gore.range(ARTERY_SIZE);
+            let marks = gore.rand() < ARTERY_MARKS;
+            gore.drops.push(Droplet {
+                at: cut.at,
+                velocity: v,
+                ground,
+                born: now,
+                blood: Blood { texture, violence },
+                size,
+                marks,
+            });
         }
         let count = (gore.range(CUT_SPLATS) * amount).round() as usize;
         for _ in 0..count {
@@ -940,7 +1101,7 @@ fn fly_droplets(
         drop.velocity *= 1.0 - (DROP_DRAG * dt).min(1.0);
         drop.at += drop.velocity * dt;
         let landed = drop.at.y <= drop.ground;
-        if landed {
+        if landed && drop.marks {
             let half = gore.range(DROP_SPLAT);
             let at = drop.at.with_y(drop.ground);
             let across = drop.velocity.with_y(0.0);
@@ -1284,8 +1445,8 @@ fn push_droplets(draw: &mut WorldEffectDraw, cam: Entity, cam_tf: &GlobalTransfo
             .try_normalize()
             .unwrap_or_else(|| *cam_tf.up());
         let across = view.cross(along).normalize_or(*cam_tf.right());
-        let a = along * DROP_RADIUS * (1.0 + speed * DROP_STRETCH);
-        let b = across * DROP_RADIUS;
+        let a = along * DROP_RADIUS * drop.size * (1.0 + speed * DROP_STRETCH);
+        let b = across * DROP_RADIUS * drop.size;
         let colour = droplet_colour(gore, &drop.blood);
         let color = [colour[0], colour[1], colour[2], 1.0];
         let corner = |p: Vec3, uv: [f32; 2]| EffectVertex {

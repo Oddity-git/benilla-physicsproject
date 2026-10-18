@@ -92,6 +92,7 @@ pub(super) fn plugin(app: &mut App) {
         .add_systems(
             PostUpdate,
             (
+                refit_rebuilt,
                 drive_bones_from_bodies,
                 super::dismember::pose_limbs,
                 knocked_to_death,
@@ -343,6 +344,11 @@ fn start_ragdolls(
             commands.entity(unit).try_remove::<SeenAlive>();
         }
         let Some(mut profile) = build_profile(&rig.binds, &rig.parents) else {
+            info!(
+                "ragdoll: unit {unit} (display {:?}) has too few limbs to ragdoll ({} bones)",
+                net.display_id,
+                rig.binds.len()
+            );
             continue;
         };
         // The head's key bone gets a body of its own, so the head can come off.
@@ -605,7 +611,8 @@ fn start_ragdolls(
             })
             .collect();
         info!(
-            "ragdoll: unit {unit} falls with {} bodies (scale {scale:.2}): {}",
+            "ragdoll: unit {unit} (display {:?}) falls with {} bodies (scale {scale:.2}): {}",
+            net.display_id,
             spawned.len(),
             layout.join(" ")
         );
@@ -823,6 +830,39 @@ fn cleanup(
         if let Some(ids) = bodies.0.remove(&unit) {
             despawn_bodies(&mut commands, &ids, &joints);
         }
+    }
+}
+
+/// A ragdoll whose model was rebuilt with another skeleton (a druid's form dropping as it dies)
+/// lets go of its bodies, which fit the old bones, and falls again on the new model.
+fn refit_rebuilt(
+    mut commands: Commands,
+    rags: Query<(Entity, &Ragdoll, &RigPose)>,
+    joints: Query<(Entity, &SphericalJoint)>,
+    mut bodies: ResMut<RagdollBodies>,
+) {
+    for (unit, rag, rig) in &rags {
+        if rig.locals.len() == rag.rest.len() {
+            continue;
+        }
+        info!(
+            "ragdoll: unit {unit} changed model ({} bones to {}), falling again",
+            rag.rest.len(),
+            rig.locals.len()
+        );
+        if let Some(ids) = bodies.0.remove(&unit) {
+            despawn_bodies(&mut commands, &ids, &joints);
+        }
+        commands
+            .entity(unit)
+            .try_remove::<(
+                Ragdoll,
+                crate::blob_shadow::NoBlobShadow,
+                super::frost::Frozen,
+                super::shock::Shocked,
+            )>()
+            .try_insert(SeenAlive);
+        super::dismember::heal(&mut commands, unit);
     }
 }
 
