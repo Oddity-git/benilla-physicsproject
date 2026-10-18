@@ -282,8 +282,8 @@ impl Cvars {
         self.row(name).map(|r| r.value.as_str())
     }
 
-    /// The applied value as the record's float ([`CvarChanged::num`]).
-    #[cfg(test)]
+    /// The applied value as the record's float ([`CvarChanged::num`]). Fork: not test-only, the
+    /// ragdoll's own settings read it.
     pub(crate) fn num(&self, name: &str) -> Option<f32> {
         self.get(name).map(record_float)
     }
