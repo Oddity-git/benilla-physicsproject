@@ -252,11 +252,11 @@ fn track_unit_motion(
         match spot {
             Some(mut s) => s.0 = tf.translation(),
             None => {
-                commands.entity(e).insert(LastSpot(tf.translation()));
+                commands.entity(e).try_insert(LastSpot(tf.translation()));
             }
         }
         if !seen && !dead {
-            commands.entity(e).insert(SeenAlive);
+            commands.entity(e).try_insert(SeenAlive);
         }
     }
 }
@@ -315,7 +315,7 @@ fn start_ragdolls(
         let dead = store.0.unit_is_dead();
         if !living_kind || (!dead && knock.is_none()) {
             if knock.is_some() {
-                commands.entity(unit).remove::<KnockDown>();
+                commands.entity(unit).try_remove::<KnockDown>();
             }
             continue;
         }
@@ -328,19 +328,19 @@ fn start_ragdolls(
                 .clamp(0.0, MAX_MELEE_DELAY);
             if blow.is_some_and(|b| b.school.is_none() && now - b.at < delay) {
                 if !awaiting {
-                    commands.entity(unit).insert(AwaitingBlow);
+                    commands.entity(unit).try_insert(AwaitingBlow);
                 }
                 continue;
             }
             if awaiting {
-                commands.entity(unit).remove::<AwaitingBlow>();
+                commands.entity(unit).try_remove::<AwaitingBlow>();
             }
         }
         // A knockdown is spent whether or not it falls; death wins over it.
         let knock = knock.copied().filter(|_| !dead);
-        commands.entity(unit).remove::<(KnockDown, GettingUp)>();
+        commands.entity(unit).try_remove::<(KnockDown, GettingUp)>();
         if dead {
-            commands.entity(unit).remove::<SeenAlive>();
+            commands.entity(unit).try_remove::<SeenAlive>();
         }
         let Some(mut profile) = build_profile(&rig.binds, &rig.parents) else {
             continue;
@@ -580,7 +580,7 @@ fn start_ragdolls(
                     ignore.overlapping.push(spawned[j]);
                 }
             }
-            commands.entity(spawned[k]).insert(ignore);
+            commands.entity(spawned[k]).try_insert(ignore);
         }
         let hub = profile.bodies[0].bone as usize;
         let anchors = match rig.model.get(hub) {
@@ -628,23 +628,23 @@ fn start_ragdolls(
             info!("ragdoll: unit {unit} loses bones {roots:?}");
             commands
                 .entity(unit)
-                .insert(super::dismember::Dismembered::new(&rig.parents, &roots));
+                .try_insert(super::dismember::Dismembered::new(&rig.parents, &roots));
         }
         bodies.0.insert(unit, spawned);
         commands
             .entity(unit)
-            .insert(crate::blob_shadow::NoBlobShadow);
+            .try_insert(crate::blob_shadow::NoBlobShadow);
         if frozen {
-            commands.entity(unit).insert(super::frost::Frozen);
+            commands.entity(unit).try_insert(super::frost::Frozen);
         }
         if shocked {
             commands
                 .entity(unit)
-                .insert(super::shock::Shocked::new(now));
+                .try_insert(super::shock::Shocked::new(now));
         }
         // Knocked down again mid-rise, it still returns to the pose it first fell from.
         let rest = rising.map_or_else(|| rig.locals.clone(), |r| r.rest.clone());
-        commands.entity(unit).insert(Ragdoll {
+        commands.entity(unit).try_insert(Ragdoll {
             profile,
             born: now,
             awake_since: now,
@@ -800,7 +800,7 @@ fn cleanup(
                 rig.locals[..n].copy_from_slice(&rag.rest[..n]);
                 rig.pose_dirty = true;
             }
-            commands.entity(unit).remove::<(
+            commands.entity(unit).try_remove::<(
                 Ragdoll,
                 crate::blob_shadow::NoBlobShadow,
                 crate::creature_anim::LootSparkleOn,
@@ -831,7 +831,7 @@ fn knocked_to_death(mut commands: Commands, mut rags: Query<(Entity, &ObjectStor
     for (unit, store, mut rag) in &mut rags {
         if rag.getting_up.is_some() && store.0.unit_is_dead() {
             rag.getting_up = None;
-            commands.entity(unit).remove::<SeenAlive>();
+            commands.entity(unit).try_remove::<SeenAlive>();
         }
     }
 }
@@ -858,8 +858,8 @@ fn get_up(
         }
         commands
             .entity(unit)
-            .remove::<(Ragdoll, crate::blob_shadow::NoBlobShadow)>()
-            .insert(GettingUp {
+            .try_remove::<(Ragdoll, crate::blob_shadow::NoBlobShadow)>()
+            .try_insert(GettingUp {
                 from: rig.locals.clone(),
                 rest: rest.clone(),
                 start: now,
@@ -885,7 +885,7 @@ fn blend_getting_up(
     for (unit, up, rig) in &mut rigs {
         let t = ((now - up.start) / GET_UP_SECS).clamp(0.0, 1.0);
         if t >= 1.0 {
-            commands.entity(unit).remove::<GettingUp>();
+            commands.entity(unit).try_remove::<GettingUp>();
             continue;
         }
         let t = t * t * (3.0 - 2.0 * t);

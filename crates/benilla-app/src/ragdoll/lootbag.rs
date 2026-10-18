@@ -276,7 +276,7 @@ fn sync_bags(
             commands.entity(root).add_child(sparkle);
             commands
                 .entity(unit)
-                .insert(crate::creature_anim::LootSparkleOn(sparkle));
+                .try_insert(crate::creature_anim::LootSparkleOn(sparkle));
         }
         bags.0.insert(unit, root);
     }

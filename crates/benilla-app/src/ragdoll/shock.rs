@@ -81,7 +81,7 @@ fn note_shock_debuffs(
                 .or_insert_with(|| spells.catalog.get(id).is_some_and(|s| is_shock(&s.name)))
         });
         if carries {
-            commands.entity(unit).insert(ShockDebuff(now));
+            commands.entity(unit).try_insert(ShockDebuff(now));
         }
     }
 }
@@ -133,7 +133,7 @@ fn jolt_shocked(
     let now = time.elapsed_secs();
     for (unit, mut shock) in &mut shocked {
         let Some(strength) = shock.strength(now) else {
-            commands.entity(unit).remove::<Shocked>();
+            commands.entity(unit).try_remove::<Shocked>();
             continue;
         };
         if now < shock.next {

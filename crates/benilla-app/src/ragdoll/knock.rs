@@ -77,7 +77,7 @@ fn game_knockdowns(
                     .try_normalize()
             })
             .unwrap_or(back);
-        commands.entity(ev.entity).insert(KnockDown {
+        commands.entity(ev.entity).try_insert(KnockDown {
             away: away * KNOCKDOWN_PUSH,
             lift: KNOCKDOWN_LIFT,
             hold: KNOCKDOWN_HOLD,
@@ -142,7 +142,7 @@ fn kick(
     {
         return;
     }
-    commands.entity(target).insert(KickLanding {
+    commands.entity(target).try_insert(KickLanding {
         from: me,
         at: time.elapsed_secs() + KICK_DELAY,
     });
@@ -162,7 +162,7 @@ fn land_kicks(
         }
         // Already down (or dead and fallen): the kick finds nothing standing.
         if down {
-            commands.entity(target).remove::<KickLanding>();
+            commands.entity(target).try_remove::<KickLanding>();
             continue;
         }
         let away = frames
@@ -176,8 +176,8 @@ fn land_kicks(
             .unwrap_or(tf.rotation() * Vec3::Z);
         commands
             .entity(target)
-            .remove::<KickLanding>()
-            .insert(KnockDown {
+            .try_remove::<KickLanding>()
+            .try_insert(KnockDown {
                 away: away * KICK_PUSH,
                 lift: KICK_LIFT,
                 hold: KICK_HOLD,

@@ -100,7 +100,7 @@ fn jostle_stowed(
             if amount <= 0.0 {
                 if springs.remove(&root).is_some() {
                     *transform = Transform::from_translation(offset);
-                    commands.entity(root).remove::<RiderTilt>();
+                    commands.entity(root).try_remove::<RiderTilt>();
                 }
                 continue;
             }
@@ -158,7 +158,7 @@ fn jostle_stowed(
             match rider_tilt.as_deref_mut() {
                 Some(RiderTilt(now)) => *now = placed,
                 None if rider => {
-                    commands.entity(root).insert(RiderTilt(placed));
+                    commands.entity(root).try_insert(RiderTilt(placed));
                 }
                 None => {}
             }

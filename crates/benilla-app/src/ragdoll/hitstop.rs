@@ -177,7 +177,7 @@ fn hold_stops(
     let now = time.elapsed_secs();
     for (unit, mut stop, mut rig) in &mut units {
         if now >= stop.until {
-            commands.entity(unit).remove::<HitStop>();
+            commands.entity(unit).try_remove::<HitStop>();
             continue;
         }
         match &stop.pose {

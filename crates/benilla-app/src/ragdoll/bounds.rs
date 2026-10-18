@@ -47,7 +47,7 @@ fn fit_bounds(
         if !ragdoll {
             if fitted {
                 world_unit.bound = Some(model_box);
-                commands.entity(unit).remove::<Fitted>();
+                commands.entity(unit).try_remove::<Fitted>();
             }
             continue;
         }
@@ -69,7 +69,7 @@ fn fit_bounds(
             world_unit.bound = Some(fit);
         }
         if !fitted {
-            commands.entity(unit).insert(Fitted);
+            commands.entity(unit).try_insert(Fitted);
         }
     }
 }

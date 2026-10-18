@@ -645,7 +645,7 @@ fn gush_corpses(
     let amount = gore_amount(cvars.as_deref());
     for (unit, tf, net, mut gushing) in &mut units {
         if now - gushing.start > GUSH {
-            commands.entity(unit).remove::<Gushing>();
+            commands.entity(unit).try_remove::<Gushing>();
             continue;
         }
         let Some(blood) = blood.as_deref().filter(|_| violence > 0) else {
@@ -714,7 +714,7 @@ fn squirt_bleeds(
     let amount = gore_amount(cvars.as_deref());
     for (unit, tf, net, store, bound, mut bleeding) in &mut units {
         if now > bleeding.until || store.0.unit_is_dead() {
-            commands.entity(unit).remove::<Bleeding>();
+            commands.entity(unit).try_remove::<Bleeding>();
             continue;
         }
         let Some(blood) = blood.as_deref().filter(|_| violence > 0) else {
@@ -989,7 +989,7 @@ fn start_pools(
 ) {
     for (unit, store) in &fresh {
         if store.0.unit_is_dead() {
-            commands.entity(unit).insert((
+            commands.entity(unit).try_insert((
                 Bled,
                 PoolDue {
                     at: time.elapsed_secs() + POOL_DELAY,
@@ -998,7 +998,7 @@ fn start_pools(
         }
     }
     for unit in &risen {
-        commands.entity(unit).remove::<Bled>();
+        commands.entity(unit).try_remove::<Bled>();
     }
 }
 
@@ -1039,7 +1039,7 @@ fn grow_pools(
         if now < pool_due.at {
             continue;
         }
-        commands.entity(unit).remove::<PoolDue>();
+        commands.entity(unit).try_remove::<PoolDue>();
         let Some(blood) = blood.as_deref().filter(|_| violence > 0) else {
             continue;
         };

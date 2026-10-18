@@ -199,7 +199,7 @@ fn start_effects(
                 } else {
                     warn!("death effects: no burning model (Immolate's state kit) for unit {unit}");
                 }
-                commands.entity(unit).insert(DeathFx {
+                commands.entity(unit).try_insert(DeathFx {
                     kind: Kind::Fire,
                     start: now,
                     next: now,
@@ -236,7 +236,7 @@ fn start_effects(
                         });
                     }
                 }
-                commands.entity(unit).insert(DeathFx {
+                commands.entity(unit).try_insert(DeathFx {
                     kind: Kind::Frost,
                     start: now,
                     next: now,
@@ -288,7 +288,7 @@ fn run_effects(
             });
         }
         if over || !on {
-            commands.entity(unit).remove::<DeathFx>();
+            commands.entity(unit).try_remove::<DeathFx>();
             continue;
         }
         if now < death.next {

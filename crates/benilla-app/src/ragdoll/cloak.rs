@@ -698,7 +698,7 @@ fn simulate_cloths(
             cloth.last_step = STEP;
             if !cloth.started {
                 for piece in &cloth.pieces {
-                    commands.entity(piece.copy).insert(ClothCopy);
+                    commands.entity(piece.copy).try_insert(ClothCopy);
                 }
             }
             cloth.started = true;
