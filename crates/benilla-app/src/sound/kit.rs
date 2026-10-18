@@ -829,7 +829,7 @@ impl SoundKits {
         if let Some(d) = self.cache.get(&key) {
             return Ok(d.clone());
         }
-        // The chain, then an addon's loose file ([`benilla_assets::read_chain_or_loose`]):
+        // An addon's loose file, then the chain ([`benilla_assets::read_loose_or_chain`]):
         // `PlaySoundFile` is by path, and addon audio lives on disk, never in an MPQ.
         let bytes = assets
             .read_file_or_loose(path)
@@ -1031,7 +1031,7 @@ pub(super) fn plugin(app: &mut App) {
             ),
         )
         .add_systems(
-            OnExit(crate::char_select::ClientState::InWorld),
+            OnExit(crate::client_state::ClientState::InWorld),
             stop_all_channels,
         );
 }

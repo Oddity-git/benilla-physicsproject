@@ -10,6 +10,7 @@ use crate::items::Items;
 use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects, SelfPlayer};
 
 use super::{slot_guid, wire_pos, ITEM_CLASS_PROJECTILE};
+use crate::query_cache::Ask;
 
 /// The one auto-equip sender (`AutoEquipCursorItem`, `0x5e1480`, past its question). A
 /// projectile, the template class `0x5d9f30` reads (`0x5e16ff`, `0x5e1704`), loads by entry with
@@ -28,7 +29,8 @@ pub(crate) fn send_auto_equip(
 ) {
     let ammo = guid.and_then(|guid| {
         let entry = objects.object(guid)?.object_entry()?;
-        let t = items.template(entry, guid, commands)?;
+        // The class getter only reads (`0x5d9f30`).
+        let t = items.template(entry, guid, Ask::Read)?;
         (t.class == ITEM_CLASS_PROJECTILE).then_some((guid, entry))
     });
     if let Some((guid, entry)) = ammo {
@@ -152,11 +154,11 @@ pub(crate) struct ScriptItemUse<'w, 's> {
 }
 
 impl ScriptItemUse<'_, '_> {
-    /// `UseInventoryItem(id)`, a doll right-click, sent through [`super::send_item_use`], as the
-    /// reference's doll click reaches the same `CGItem::Use` a bag click does (`0x4c7af0`): a worn
-    /// quest-starter offers its quest. The call refused a locked item. Ids outside 1..=19 are
-    /// refused.
-    pub(crate) fn use_inventory_item(&mut self, script: &mut UiScript, id: u32) {
+    /// `UseInventoryItem(id, onSelf)`, a doll right-click, sent through [`super::send_item_use`],
+    /// as the reference's doll click reaches the same `CGItem::Use` a bag click does
+    /// (`0x4c7af0`): a worn quest-starter offers its quest. `on_self` binds the player in place of
+    /// the selection (`0x4c8e48`). The call refused a locked item. Ids outside 1..=19 are refused.
+    pub(crate) fn use_inventory_item(&mut self, script: &mut UiScript, id: u32, on_self: bool) {
         let Self {
             self_q,
             targeting,
@@ -176,7 +178,8 @@ impl ScriptItemUse<'_, '_> {
             .and_then(|store| slot_guid(&store.0, EQUIPMENT_BAG, slot, &ladder.objects))
             .and_then(|guid| {
                 let entry = ladder.objects.object(guid)?.object_entry()?;
-                let t = ladder.items.template(entry, guid, &ladder.commands)?;
+                // The use only reads (`0x5d8d57`).
+                let t = ladder.items.template(entry, guid, Ask::Read)?;
                 Some((
                     Some(guid),
                     t.start_quest,
@@ -200,7 +203,7 @@ impl ScriptItemUse<'_, '_> {
                 on_object: None,
                 is_charter,
             },
-            &targeting.context(),
+            &targeting.context().self_bound(on_self),
             ladder,
             script,
             gate,
@@ -230,6 +233,8 @@ impl ScriptItemUse<'_, '_> {
             guid: item_guid,
             arm,
             asks,
+            on_self,
+            ..
         } = call;
         // A bind-on-equip equip the call asked about is filed whatever the slot holds now: the
         // reference raised the question inside the call (`0x5e16c6`), the item is on the cursor,
@@ -301,7 +306,8 @@ impl ScriptItemUse<'_, '_> {
         // `None` while the template is in flight, which the call read as a plain use.
         let clicked = ladder.objects.object(item_guid).and_then(|obj| {
             let entry = obj.object_entry()?;
-            let t = ladder.items.template(entry, item_guid, &ladder.commands)?;
+            // The click only reads (`0x4fa3aa`).
+            let t = ladder.items.template(entry, item_guid, Ask::Read)?;
             Some(Clicked {
                 guid: item_guid,
                 entry,
@@ -365,7 +371,7 @@ impl ScriptItemUse<'_, '_> {
                         on_object: None,
                         is_charter: c.is_charter,
                     },
-                    &targeting.context(),
+                    &targeting.context().self_bound(on_self),
                     ladder,
                     script,
                     gate,
@@ -375,27 +381,25 @@ impl ScriptItemUse<'_, '_> {
             }
             // The reader, with no packet (`0x4e32e0`); a re-click closes it.
             (UseFork::Read, Some(c)) => {
-                if item_text.toggle_closed(c.guid) {
+                if item_text.read_pages(c.guid) {
                     debug!("ui_items: re-click closes the book {:#x}", c.guid);
                 } else {
                     debug!(
                         "ui_items: read book {:#x} (page {}, lua bag {bag} slot {slot})",
                         c.guid, c.page_text
                     );
-                    item_text.open_pages(c.guid);
                 }
             }
             // vmangos's `CMSG_READ_ITEM` wants a template `PageText`, so a letter's text comes by
             // item-text query.
             (UseFork::Letter, Some(c)) => {
-                if item_text.toggle_closed(c.guid) {
+                if item_text.read_letter(c.guid, c.item_text_id) {
                     debug!("ui_items: re-click closes the letter {:#x}", c.guid);
                 } else {
                     debug!(
                         "ui_items: read letter {:#x} (text {}, lua bag {bag} slot {slot})",
                         c.guid, c.item_text_id
                     );
-                    item_text.open_letter(c.guid, c.item_text_id);
                 }
             }
             // The server answers with a loot window on the item (`SpellHandler.cpp:227`). The send
@@ -438,7 +442,7 @@ impl ScriptItemUse<'_, '_> {
                         on_object: None,
                         is_charter: clicked.is_some_and(|c| c.is_charter),
                     },
-                    &targeting.context(),
+                    &targeting.context().self_bound(on_self),
                     ladder,
                     script,
                     gate,
@@ -676,7 +680,7 @@ pub(crate) fn send_container_move(
             let slot0 = u8::try_from(item_slot.saturating_sub(1)).unwrap_or(0);
             let guid = store.and_then(|s| slot_guid(&s.0, item_bag, slot0, objects));
             if let Some(guid) = guid {
-                if gate.equip_binds(script, objects, items, commands, guid) {
+                if gate.equip_binds(script, objects, items, guid) {
                     gate.defer_equip(
                         script,
                         crate::ui_bind_confirm::PendingEquip::Swap {
@@ -865,7 +869,7 @@ mod tests {
         let t = app
             .world()
             .resource::<Items>()
-            .template(CLAM_ENTRY, CLAM, app.world().resource::<NetCommands>())
+            .template(CLAM_ENTRY, CLAM, Ask::Read)
             .cloned()
             .expect("the clam's template");
         let slot = benilla_ui::script::ContainerSlot {
@@ -1327,8 +1331,13 @@ mod tests {
                 .run_system_once(
                     |mut script: NonSendMut<UiScript>, mut items: ScriptItemUse| {
                         crate::script_calls::in_call_order(&mut script, |script, call| {
-                            if let benilla_ui::script::ScriptCall::UseInventoryItem(id) = call {
-                                items.use_inventory_item(script, id);
+                            if let benilla_ui::script::ScriptCall::UseInventoryItem {
+                                slot: id,
+                                on_self,
+                                ..
+                            } = call
+                            {
+                                items.use_inventory_item(script, id, on_self);
                             }
                         });
                     },
@@ -1669,7 +1678,7 @@ pub(super) fn drain_bind_confirm_answers(
                         if let Some(display_id) = objects
                             .object(guid)
                             .and_then(|o| o.object_entry())
-                            .and_then(|entry| items.template(entry, guid, &commands))
+                            .and_then(|entry| items.template(entry, guid, Ask::Read))
                             .map(|t| t.display_info_id)
                         {
                             equip_sound.write(crate::sound::AutoEquipSound { display_id });
@@ -1693,9 +1702,11 @@ pub(super) fn drain_bind_on_use_confirms(
     let Some(mut script) = script else {
         return;
     };
-    if script.take_bind_on_use_confirms() == 0 {
+    // The first accept spends the pending use, whatever the protected-action gate said; the cast
+    // inside it asks tag 2 (`0x5d92c1` → `0x6e4bc1`).
+    let Some(may_cast) = script.take_bind_on_use_casts().first().copied() else {
         return;
-    }
+    };
     let Some(it) = gate.on_use.0.take() else {
         return;
     };
@@ -1707,6 +1718,7 @@ pub(super) fn drain_bind_on_use_confirms(
         "ui_items: bind-on-use confirmed for wire {}/{}",
         it.bag_index, it.slot
     );
+    ladder.permit(may_cast);
     super::send_item_use(
         it,
         &targeting.context(),
@@ -1716,6 +1728,7 @@ pub(super) fn drain_bind_on_use_confirms(
         true,
         &mut ui_errors,
     );
+    ladder.permit(true);
 }
 
 #[cfg(test)]
@@ -1760,6 +1773,7 @@ mod bind_confirm_tests {
                 duration_ms: None,
                 petition: None,
                 already_bound: false,
+                occupied_seats: None,
                 bonding: 2,
                 use_spell: 0,
                 bar_placeable: true,
@@ -1776,8 +1790,12 @@ mod bind_confirm_tests {
                 cooldown: None,
                 readable: false,
                 creator: None,
+                gift_creator: None,
+                creator_guid: 0,
+                gift_creator_guid: 0,
                 flags: 0,
                 enchants: Vec::new(),
+                spell_0: false,
             },
         );
         ContainerState {
@@ -2299,15 +2317,12 @@ mod bind_confirm_tests {
         );
     }
 
-    /// Right-clicks a bind-on-use item in a bag (the use arm, `0x5d8d00`, event 290);
-    /// `no_use_spell` drops its on-use spell, since four of `0x5d91d3`'s five predecessors are
-    /// failed spell lookups and the reference still asks.
-    fn right_click_a_bind_on_use_item(
-        no_use_spell: bool,
-    ) -> (App, crossbeam_channel::Receiver<ClientCommand>) {
+    /// An app with what the bag's use arm reads, the cast ladder's included.
+    fn use_arm_app() -> (App, crossbeam_channel::Receiver<ClientCommand>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
-        app.add_message::<crate::sound::AutoEquipSound>()
+        app.init_resource::<crate::spell::ScriptCastPermit>()
+            .add_message::<crate::sound::AutoEquipSound>()
             .add_message::<crate::creature_anim::SheathRequest>()
             .init_resource::<crate::ui_merchant::MerchantOpen>()
             .init_resource::<crate::ui_bank::BankOpen>()
@@ -2335,6 +2350,76 @@ mod bind_confirm_tests {
             .init_resource::<Items>()
             .init_resource::<crate::net::GuidIndex>()
             .insert_resource(NetCommands(tx));
+        (app, rx)
+    }
+
+    /// `UseContainerItem(bag, slot, onSelf)` (`0x4fa17d`): a set flag makes the player's guid the
+    /// use's target (`0x4fa186`, `0x468550`) in place of the selection `[0xb4e2d8]`.
+    #[test]
+    fn use_container_item_on_self_targets_the_player() {
+        const ME: u64 = 0x0000_0000_0000_0007;
+        const FRIEND: u64 = 0x0000_0000_0000_0009;
+        let target = |chunk: &str| {
+            let (mut app, rx) = use_arm_app();
+            app.world_mut().resource_mut::<crate::net::SelfGuid>().0 = Some(ME);
+            app.world_mut()
+                .resource_mut::<crate::target::Selection>()
+                .guid = Some(FRIEND);
+            app.world_mut().spawn((
+                SelfPlayer,
+                ObjectStore(ObjectFields::from_pairs(&[
+                    (F_PACK_SLOT_1, AXE_GUID as u32),
+                    (F_PACK_SLOT_1 + 1, (AXE_GUID >> 32) as u32),
+                ])),
+            ));
+            crate::items::test_spawn_item(
+                app.world_mut(),
+                AXE_GUID,
+                ObjectFields::from_pairs(&[(F_OBJECT_ENTRY, FLURRY_AXE)]),
+                false,
+            );
+            let mut template = crate::items::test_template("A Bandage");
+            template.inventory_type = 0;
+            template.use_spell = Some(benilla_protocol::messages::ItemUseSpell {
+                spell_id: 4321,
+                cooldown_ms: -1,
+                category: 0,
+                category_cooldown_ms: -1,
+            });
+            app.world_mut()
+                .resource_mut::<Items>()
+                .insert_template(FLURRY_AXE, Some(template));
+            let mut script = UiScript::new().unwrap();
+            script.set_container(0, Some(bag_with_the_axe(1)));
+            script.run(chunk).unwrap();
+            app.insert_non_send_resource(script);
+            run_container_clicks(app.world_mut());
+            rx.try_iter()
+                .find_map(|c| match c {
+                    ClientCommand::UseItem { target, .. } => Some(target),
+                    _ => None,
+                })
+                .expect(chunk)
+        };
+        use benilla_protocol::messages::UseItemTarget;
+        assert_eq!(
+            target("UseContainerItem(0, 1)"),
+            UseItemTarget::Unit(FRIEND)
+        );
+        assert_eq!(
+            target("UseContainerItem(0, 1, nil)"),
+            UseItemTarget::Unit(FRIEND)
+        );
+        assert_eq!(target("UseContainerItem(0, 1, 1)"), UseItemTarget::Unit(ME));
+    }
+
+    /// Right-clicks a bind-on-use item in a bag (the use arm, `0x5d8d00`, event 290);
+    /// `no_use_spell` drops its on-use spell, since four of `0x5d91d3`'s five predecessors are
+    /// failed spell lookups and the reference still asks.
+    fn right_click_a_bind_on_use_item(
+        no_use_spell: bool,
+    ) -> (App, crossbeam_channel::Receiver<ClientCommand>) {
+        let (mut app, rx) = use_arm_app();
         app.world_mut().spawn((
             SelfPlayer,
             ObjectStore(ObjectFields::from_pairs(&[
@@ -2505,6 +2590,37 @@ mod bind_confirm_tests {
         let script = app.world().non_send_resource::<UiScript>();
         assert_eq!(script.cursor_item().map(|i| i.guid), Some(AXE_GUID));
         assert!(script.item_locked(AXE_GUID), "still locked, still held");
+    }
+
+    /// `ConfirmBindOnUse` spends its pending use whatever the protected-action gate says
+    /// (`0x5d92c6`-`0x5d92cc` after `CGItem::Use`), but the cast inside asks tag 2: a macro's
+    /// accept outside an input event sends nothing, and the pending use is gone for the next.
+    #[test]
+    fn a_refused_bind_on_use_confirm_spends_the_pending_use_and_sends_nothing() {
+        benilla_formats::wow_data_or_skip!();
+        let (mut app, rx) = right_click_a_bind_on_use_item(false);
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .tick(0.01);
+        assert!(shown(&mut app, "USE_BIND"));
+        let _ = rx.try_iter().count();
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run(r#"RunScript("ConfirmBindOnUse()")"#)
+            .unwrap();
+        app.world_mut()
+            .run_system_once(drain_bind_on_use_confirms)
+            .unwrap();
+        let sent: Vec<String> = rx.try_iter().map(|c| format!("{c:?}")).collect();
+        assert_eq!(sent, Vec::<String>::new(), "the cast is refused");
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("ConfirmBindOnUse()")
+            .unwrap();
+        app.world_mut()
+            .run_system_once(drain_bind_on_use_confirms)
+            .unwrap();
+        assert_eq!(rx.try_iter().count(), 0, "the pending use was spent");
     }
 
     /// The confirm's re-issue goes through `CGItem::Use` (`0x5d92c1`), which refuses an item

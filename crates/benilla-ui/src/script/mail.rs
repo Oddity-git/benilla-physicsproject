@@ -161,6 +161,14 @@ impl super::UiScript {
         self.model_mut().mail = state;
     }
 
+    /// The close core zeroed the mailbox (`0x4acd8f`): the verbs find none from here, ahead of
+    /// the snapshot the next feed pushes.
+    pub fn mail_closed(&mut self) {
+        if let Some(mail) = self.model_mut().mail.as_mut() {
+            mail.open = false;
+        }
+    }
+
     /// Take the `CheckInbox` flag; the app answers it with `CMSG_GET_MAIL_LIST`.
     pub fn take_mail_check_inbox(&mut self) -> bool {
         std::mem::take(&mut self.model_mut().mail_check_inbox)
@@ -622,7 +630,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     return Ok(());
                 };
                 if let Err(refusal) = verb.sends(&model, &row) {
-                    model.ui_errors.extend(refusal);
+                    if let Some(key) = refusal {
+                        model.push_ui_error(key);
+                    }
                     return Ok(());
                 }
                 match verb {
@@ -688,7 +698,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                         .and_then(|c| c.slots.get(&item.slot))
                         .is_some_and(|s| s.guid == item.guid);
                     if !held {
-                        model.ui_errors.push("ERR_ITEM_NOT_FOUND");
+                        model.push_ui_error("ERR_ITEM_NOT_FOUND");
                         model.mail_send_item = None;
                         model.raise("MAIL_SEND_INFO_UPDATE", Vec::new());
                         return;
@@ -725,7 +735,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             )? as u32;
             Ok(super::tick::verb(lua, |model| {
                 if u64::from(n) > model.money {
-                    model.ui_errors.push("ERR_NOT_ENOUGH_MONEY");
+                    model.push_ui_error("ERR_NOT_ENOUGH_MONEY");
                     return Value::Nil;
                 }
                 // The write (`0x4adc39`), then the signal (`0x4adc44`).

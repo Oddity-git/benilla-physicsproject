@@ -2,16 +2,15 @@
 
 use mlua::{Lua, Table, Value, Variadic};
 
-use crate::layout::{Anchor, Anchors, Point};
-use crate::script::binding_abi::optional_string;
+use crate::script::binding_abi::{optional_string, string_arg};
 use crate::script::object::frame_handle_of;
 use crate::script::region::region_handle_of;
 use crate::script::Model;
-use crate::widget::{KindState, TooltipAnchor, TOOLTIP_LINE_GAP, TOOLTIP_PAD};
+use crate::widget::{KindState, TooltipAnchor};
 
 use super::{
     append_line, clear, color_num, parse_line_color, parse_line_tail, set_owner_core, set_shown,
-    text_of, tip_mut, with_tip, wrap_arg, write_cell, REG_TOOLTIP_METHODS,
+    text_of, with_tip, wrap_arg, REG_TOOLTIP_METHODS,
 };
 
 pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
@@ -115,7 +114,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                     "Usage: SetText(\"text\" [, color])".into(),
                 ));
             }
-            let text = text_of(args.first());
+            let text = text_of(lua, args.first());
             let [r, g, b, _] = parse_line_color(lua, args.get(1), args.get(2), args.get(3));
             // The alpha is its own `lua_isnumber` gate (`0x531ddc`'s neighbour at idx 6), so a
             // numeric string counts.
@@ -127,30 +126,41 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
-    // AppendText(text) (`0x531e30`): appends to line 1's left cell in place, keeping its colour,
-    // and does nothing with no lines, as the reference's body does (`0x5305b0`, line 1 at
-    // `0x5305cc`). The bag tooltips hang a keybinding on their SetText title with it
-    // (ContainerFrame.xml:198, MainMenuBarBagButtons.lua:91).
+    // AppendText(text) (`0x531e30`): a `lua_isstring` value (`0x531ebc`), a number as its
+    // `%.14g` text, else `Usage: AppendText("text")` (`0x8551a8`). Its helper (`0x5305b0`) does
+    // nothing with no lines (`0x5305c4`); otherwise it prints line 1's left text and the argument
+    // through `%s%s` (`0x82e424`) into 256 bytes, an empty or unset text printing as `(null)`
+    // (`0x5305d4`-`0x5305dd`, the CRT's NULL `%s`), and the result cut at 255 bytes (`0x64a865`).
+    // That goes to the cell's `SetText` alone (`0x53060e`), its colour and shown bit untouched,
+    // and the tooltip is sized again (`0x530615`). The bag tooltips hang a keybinding on their
+    // SetText title with it (ContainerFrame.xml:198, MainMenuBarBagButtons.lua:91).
     m.set(
         "AppendText",
         lua.create_function(|lua, (this, text): (Table, Value)| {
             let h = frame_handle_of(lua, &this)?;
-            let extra = text_of(Some(&text));
+            let extra = string_arg(lua, text, r#"Usage: AppendText("text")"#)?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             let lh = match model.arena.frame(h).map(|f| &f.kind_state) {
                 Some(KindState::Tooltip(t)) if t.num_lines > 0 => t.left_lines[0],
                 Some(KindState::Tooltip(_)) => return Ok(()),
                 _ => return Err(mlua::Error::runtime("not a GameTooltip")),
             };
-            let (current, color) = match model.region_data.get(&lh) {
-                Some(d) => (
-                    d.text.clone().unwrap_or_default(),
-                    d.vertex_color.unwrap_or([1.0, 1.0, 1.0, 1.0]),
-                ),
-                None => (String::new(), [1.0, 1.0, 1.0, 1.0]),
-            };
-            write_cell(&mut model, lh, &(current + &extra), color);
-            super::owe_relayout(&mut model, h);
+            let current = model
+                .region_data
+                .get(&lh)
+                .and_then(|d| d.text.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "(null)".to_string());
+            let mut joined = current + &extra;
+            // A cut inside a UTF-8 sequence drops its partial bytes, which the reference's decoder
+            // reads as one malformed code point (`0x41aab0`) that neither draws nor measures.
+            let mut cut = joined.len().min(255);
+            while !joined.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            joined.truncate(cut);
+            super::set_cell_text(&mut model, lh, &joined);
+            super::size_tooltip(&mut model, h);
             Ok(())
         })?,
     )?;
@@ -159,7 +169,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     m.set(
         "AddLine",
         lua.create_function(|lua, (this, args): (Table, Variadic<Value>)| {
-            let text = text_of(args.first());
+            let text = text_of(lua, args.first());
             let (color, wrap) = parse_line_tail(lua, &args[1.min(args.len())..]);
             append_line(lua, &this, (text, color), None, wrap)
         })?,
@@ -172,14 +182,12 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             |lua, (this, tl, tr, cl): (Table, Value, Value, Variadic<Value>)| {
                 let left_color = parse_line_color(lua, cl.first(), cl.get(1), cl.get(2));
                 let right_color = parse_line_color(lua, cl.get(3), cl.get(4), cl.get(5));
-                let right = text_of(Some(&tr));
-                // The line core (`0x530270`) clears the flag when the right text is non-empty
-                // (`0x530284`), so only a double line with an empty right side can wrap.
-                let wrap = right.is_empty() && wrap_arg(cl.get(6));
+                let right = text_of(lua, Some(&tr));
+                let wrap = wrap_arg(cl.get(6));
                 append_line(
                     lua,
                     &this,
-                    (text_of(Some(&tl)), left_color),
+                    (text_of(lua, Some(&tl)), left_color),
                     Some((right, right_color)),
                     wrap,
                 )
@@ -198,79 +206,39 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "NumLines",
         lua.create_function(|lua, this: Table| with_tip(lua, &this, |t| t.num_lines as i64))?,
     )?;
-    // AddFontStrings(left, right) (`0x530c40`): adopts two caller-made FontStrings as the next
-    // line pair, placed like an engine-grown pair but keeping the caller's fonts.
+    // AddFontStrings(left, right) (`0x530c40`): the caller's FontStrings become the next line
+    // pair and raise the line limit by one (`0x529940`), keeping the caller's fonts.
     m.set(
         "AddFontStrings",
         lua.create_function(|lua, (this, left, right): (Table, Table, Table)| {
-            let h = frame_handle_of(lua, &this)?;
             let lh = region_handle_of(lua, &left)?;
             let rh = region_handle_of(lua, &right)?;
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            let frame_id = model.frame_id(h);
-            let prev_left = match model.arena.frame(h).map(|f| &f.kind_state) {
-                Some(KindState::Tooltip(t)) => t.left_lines.last().copied(),
-                _ => return Err(mlua::Error::runtime("not a GameTooltip")),
-            };
-            let anchor = match prev_left {
-                None => Anchor::new(
-                    Point::TopLeft,
-                    frame_id,
-                    Point::TopLeft,
-                    TOOLTIP_PAD,
-                    -TOOLTIP_PAD,
-                ),
-                Some(prev) => {
-                    let prev_id = model.region_id(prev);
-                    Anchor::new(
-                        Point::TopLeft,
-                        prev_id,
-                        Point::BottomLeft,
-                        0.0,
-                        -TOOLTIP_LINE_GAP,
-                    )
-                }
-            };
-            let left_id = model.region_id(lh);
-            let (left_drew, right_drew) = (model.region_draws(lh), model.region_draws(rh));
-            {
-                let d = model.region_data.entry(lh).or_default();
-                d.hidden = true;
-                d.justify.set_h(crate::script::JustifyH::Left);
-                d.anchors = Anchors::from([anchor]);
-            }
-            {
-                let d = model.region_data.entry(rh).or_default();
-                d.hidden = true;
-                d.justify.set_h(crate::script::JustifyH::Right);
-                d.anchors =
-                    Anchors::from([Anchor::new(Point::Right, left_id, Point::Right, 0.0, 0.0)]);
-            }
-            model.note_region_draw(lh, left_drew);
-            model.note_region_draw(rh, right_drew);
-            // Two line rows, their points set with the invalidate flag.
-            model.invalidate_region(lh, true);
-            model.invalidate_region(rh, true);
-            let t = tip_mut(&mut model, h)?;
-            t.left_lines.push(lh);
-            t.right_lines.push(rh);
-            Ok(())
+            super::add_font_strings(lua, &this, lh, rh)
         })?,
     )?;
-    // SetMinimumWidth(w): a floor on the auto-sized width (`SetTooltipMoney` passes the money
-    // row's, GameTooltip.lua:91).
+    // SetMinimumWidth(width) (`0x530e50`): the sizer's floor (`SetTooltipMoney` passes the money
+    // row's, GameTooltip.lua:91), stored as given (`0x530f05`) and read at the next sizing. A
+    // width `lua_isnumber` refuses raises the usage error (`0x530edc`, `0x8550a0`).
     m.set(
         "SetMinimumWidth",
-        lua.create_function(|lua, (this, w): (Table, f32)| {
-            with_tip(lua, &this, |t| t.min_width = w.max(0.0))
+        lua.create_function(|lua, (this, w): (Table, Value)| {
+            let Some(w) = lua.coerce_number(w).ok().flatten() else {
+                return Err(mlua::Error::RuntimeError(
+                    "Usage: SetMinimumWidth(width)".into(),
+                ));
+            };
+            with_tip(lua, &this, |t| t.min_width = w as f32)
         })?,
     )?;
-    // SetPadding(w): extra auto-size width that survives a content clear (ItemRefTooltip's 16
-    // keeps its close button off the text, ItemRef.xml:40).
+    // SetPadding(width) (`0x530f10`): extra plate width that survives a clear (ItemRefTooltip's 16
+    // keeps its close button off the text, ItemRef.xml:40), read by `lua_tonumber` with no type
+    // test, so a non-number is 0 (`0x530fa0`), stored as given (`0x530630`) and read at the next
+    // sizing.
     m.set(
         "SetPadding",
-        lua.create_function(|lua, (this, w): (Table, f32)| {
-            with_tip(lua, &this, |t| t.padding = w.max(0.0))
+        lua.create_function(|lua, (this, w): (Table, Value)| {
+            let w = lua.coerce_number(w).ok().flatten().unwrap_or(0.0);
+            with_tip(lua, &this, |t| t.padding = w as f32)
         })?,
     )?;
     // FadeOut() (`0x531f00`): the fade request ([`super::fade_out`]).

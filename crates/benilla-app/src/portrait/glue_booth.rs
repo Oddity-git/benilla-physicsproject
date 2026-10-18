@@ -6,20 +6,16 @@
 
 use benilla_assets::M2Model;
 use bevy::camera::visibility::RenderLayers;
-use bevy::camera::PerspectiveProjection;
+use bevy::camera::{OrthographicProjection, PerspectiveProjection};
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
 use bevy::window::PrimaryWindow;
 
 use crate::entities::Creatures;
-use benilla_assets::m2_url;
 use benilla_assets::materials::WowModelMaterial;
 
 use super::booth::{redress_booth_batches, set_grip, BoothBatch, BoothRig};
-use super::framing::{
-    attachment_point, diag_to_vert, glue_box_aspect, glue_box_physical, glue_scene_framing,
-    stock_pane_view, ArtExtent, GLUE_AUTHORED_ASPECT, PORTRAIT_ASPECT,
-};
+use super::framing::{attachment_point, diag_to_vert, stock_pane_view, PORTRAIT_ASPECT};
 use super::{
     aim, body_frame, new_target_image, spawn_booth_effects, spawn_booth_model, Booth,
     BoothBillboardSpec, BoothCam, BoothEffects, BoothInstance, BoothLight, BoothMotion, BoothPart,
@@ -124,86 +120,70 @@ impl GlueLook {
     }
 }
 
-/// Which glue background scene shows, by its model's token, `UI_<token>`: the login screen's main
-/// menu (`AccountLogin.xml`'s `ModelFFX`) or a race's stage.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum GlueScene {
-    MainMenu,
-    Human,
-    Orc,
-    Dwarf,
-    NightElf,
-    Scourge,
-    Tauren,
+/// The glue background scene's file, the pane's own: the path its last `SetModel` gave it
+/// (`SetCharSelectBackground` and `SetCharCustomizeBackground` reach the same slot, `0x472128`,
+/// `0x4707c8`), whatever it names. The identity is the model cache's key: the name with its
+/// extension at the last dot folded to `.m2` and its case folded (`tolower` `0x40f92b`, `SStrCmpI`,
+/// `0x706b35`-`0x706b8a`), its separators as written, so `/` and `\` spell two keys.
+#[derive(Clone, Debug)]
+pub(crate) struct GlueSceneFile {
+    path: String,
+    url: std::sync::Arc<str>,
+    key: std::sync::Arc<str>,
 }
 
-impl GlueScene {
-    const ALL: [GlueScene; 7] = [
-        GlueScene::MainMenu,
-        GlueScene::Human,
-        GlueScene::Orc,
-        GlueScene::Dwarf,
-        GlueScene::NightElf,
-        GlueScene::Scourge,
-        GlueScene::Tauren,
-    ];
+impl PartialEq for GlueSceneFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
 
-    /// The model-name token, `Interface\Glues\Models\UI_<token>\UI_<token>.mdx`.
-    pub(crate) fn token(self) -> &'static str {
-        match self {
-            GlueScene::MainMenu => "MainMenu",
-            GlueScene::Human => "Human",
-            GlueScene::Orc => "Orc",
-            GlueScene::Dwarf => "Dwarf",
-            GlueScene::NightElf => "NightElf",
-            GlueScene::Scourge => "Scourge",
-            GlueScene::Tauren => "Tauren",
+impl GlueSceneFile {
+    /// The scene file `path` names: `0x76cce0` creates a model frame's model with flags 5
+    /// (`0x76ccf5`), whose 4 bit lets the `.m2` and its textures open loose. A refused name keys
+    /// as the error cube it stands.
+    pub(crate) fn new(path: &str) -> Self {
+        let key = benilla_formats::m2_file_name(path)
+            .or_else(|| benilla_formats::m2_file_name(benilla_assets::ERROR_CUBE))
+            .unwrap_or_default();
+        Self {
+            path: path.to_string(),
+            url: benilla_assets::m2_url_on(benilla_assets::MPQ_LOOSE_SOURCE, path).into(),
+            key: key.into(),
         }
     }
 
-    /// A race's stage, `GlueParent.lua`'s `SetBackgroundModel` remap: Gnome stands in Dwarf's,
-    /// Troll in Orc's.
-    pub(crate) fn of_race(race: u8) -> Self {
-        match race {
-            2 | 8 => GlueScene::Orc,
-            3 | 7 => GlueScene::Dwarf,
-            4 => GlueScene::NightElf,
-            5 => GlueScene::Scourge,
-            6 => GlueScene::Tauren,
-            _ => GlueScene::Human,
-        }
+    /// The path as the pane holds it.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
     }
 
-    /// The scene a model path names, by its file stem (`UI_<token>`, any case, any extension);
-    /// `None` for a file that is none of the shipped scenes.
-    pub(crate) fn from_model_path(path: &str) -> Option<Self> {
-        let file = path.rsplit(['\\', '/']).next()?;
-        let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
-        let token = stem.get(..3).filter(|p| p.eq_ignore_ascii_case("UI_"))?;
-        let token = &stem[token.len()..];
-        Self::ALL
-            .into_iter()
-            .find(|s| s.token().eq_ignore_ascii_case(token))
+    /// The URL the scene loads from.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
     }
+}
 
-    /// The fog the stock files give the scene, near 0: the race rows are `GlueParent.lua`'s
-    /// `CharModelFogInfo`; the main menu's is `AccountLogin.xml`'s `<FogColor>` and `fogFar`.
-    pub(crate) fn stock_fog(self) -> SceneFog {
-        let (rgb, far) = match self {
-            GlueScene::MainMenu => ([0.25, 0.06, 0.015], 1200.0),
-            GlueScene::Orc => ([0.5, 0.5, 0.5], 270.0),
-            GlueScene::Dwarf => ([0.85, 0.88, 1.0], 500.0),
-            GlueScene::NightElf => ([0.25, 0.22, 0.55], 611.0),
-            GlueScene::Scourge => ([0.0, 0.22, 0.22], 26.0),
-            GlueScene::Tauren => ([1.0, 0.61, 0.42], 153.0),
-            GlueScene::Human => ([0.8, 0.65, 0.73], 222.0),
-        };
+/// The `WOW_CREATE_TEST` harness's stage for `race`: `GlueParent.lua`'s `SetBackgroundModel`
+/// remap (Gnome in Dwarf's, Troll in Orc's) and its `CharModelFogInfo` row, near 0.
+fn stock_scene(race: u8) -> (GlueSceneFile, SceneFog) {
+    let (token, rgb, far) = match race {
+        2 | 8 => ("Orc", [0.5, 0.5, 0.5], 270.0),
+        3 | 7 => ("Dwarf", [0.85, 0.88, 1.0], 500.0),
+        4 => ("NightElf", [0.25, 0.22, 0.55], 611.0),
+        5 => ("Scourge", [0.0, 0.22, 0.22], 26.0),
+        6 => ("Tauren", [1.0, 0.61, 0.42], 153.0),
+        _ => ("Human", [0.8, 0.65, 0.73], 222.0),
+    };
+    let path = format!("Interface\\Glues\\Models\\UI_{token}\\UI_{token}.mdx");
+    (
+        GlueSceneFile::new(&path),
         SceneFog {
             rgb,
             near: 0.0,
             far,
-        }
-    }
+        },
+    )
 }
 
 /// A scene's fog: the colour and the span the fog fill callback (`0x76d680`) reads off the pane.
@@ -221,12 +201,12 @@ pub(crate) struct SceneFog {
 /// none once `SetCharSelectBackground` put the select screen's in its place (`0x472150`).
 #[derive(Resource)]
 pub(crate) struct GluePreview {
-    pub(crate) scene: Option<GlueScene>,
+    pub(crate) scene: Option<GlueSceneFile>,
     pub(crate) look: Option<GlueLook>,
     pub(crate) yaw: f32,
     pub(crate) fog: Option<SceneFog>,
     /// The stock screens' pane the scene fills, `[left, right, top, bottom]` as window fractions
-    /// from the top-left ([`super::framing::stock_pane_view`]); `None` frames the native way.
+    /// from the top-left ([`super::framing::stock_pane_view`]); `None` frames at the window.
     pub(crate) pane: Option<[f32; 4]>,
     /// The stage's instance: a change starts the scene over, as each `SetModel` makes a new
     /// instance (`0x76cce0`), the same file included. The stock feeder numbers each (pane,
@@ -243,6 +223,30 @@ pub(crate) struct GluePreview {
     /// `ModelFFX` keeps its model and scene and advances its clock only in its `OnUpdate`
     /// (`0x76d7f0`), which the visible-frame pump (`0x765650`) calls ([`pace_glue_clock`]).
     pub(crate) hidden: bool,
+    /// The pane's root inputs, which place the scene on the orthographic leg a file with no
+    /// camera takes ([`ortho_scene_rig`]).
+    pub(crate) root: SceneRoot,
+}
+
+/// A scene pane's root inputs (`0x76d1a0`): `SetModelScale`, the frame's effective scale,
+/// `SetPosition` in layout units and `SetFacing` in radians.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct SceneRoot {
+    pub(crate) model_scale: f32,
+    pub(crate) layout_scale: f32,
+    pub(crate) position: Vec3,
+    pub(crate) facing: f32,
+}
+
+impl Default for SceneRoot {
+    fn default() -> Self {
+        Self {
+            model_scale: 1.0,
+            layout_scale: 1.0,
+            position: Vec3::ZERO,
+            facing: 0.0,
+        }
+    }
 }
 
 impl Default for GluePreview {
@@ -257,6 +261,7 @@ impl Default for GluePreview {
             shown: 0,
             hidden: false,
             live: Vec::new(),
+            root: SceneRoot::default(),
         }
     }
 }
@@ -265,10 +270,10 @@ impl GluePreview {
     /// The create screen's stage: the race's scene, fogged as the create screen fogs it, with the
     /// dialled look standing in it.
     pub(crate) fn show_create(&mut self, race: u8, look: CreateLook) {
-        let scene = GlueScene::of_race(race);
+        let (scene, fog) = stock_scene(race);
         self.scene = Some(scene);
         self.look = Some(GlueLook::Create(look));
-        self.fog = Some(scene.stock_fog());
+        self.fog = Some(fog);
     }
 }
 
@@ -278,19 +283,11 @@ impl GluePreview {
 #[derive(Resource)]
 pub(crate) struct CreateScene {
     root: Entity,
-    token: Option<&'static str>,
+    file: Option<GlueSceneFile>,
     handle: Option<Handle<M2Model>>,
     spawned: bool,
     /// The authored camera 0, captured at spawn.
     cam: Option<benilla_assets::PortraitCamera>,
-    /// The shipped scene's art extent ([`benilla_formats::shipped_glue_art_extent`]): caps how far
-    /// [`glue_scene_framing`] opens upward on a narrow window. `None` with no scene.
-    art: Option<ArtExtent>,
-    /// `Some(aspect)` while the window is wider than [`super::framing::GLUE_BOX_ASPECT`] under the
-    /// native screens: the camera renders into a centred viewport of this aspect
-    /// ([`pillarbox_glue_scene`]); a stock pane is its own viewport. Set from the window, not the
-    /// scene, so the chrome's canvas never moves on a race change.
-    viewport_aspect: Option<f32>,
     /// The character's stage spot, scene attachment 0 in Bevy model space (`ZERO` with no scene);
     /// the body seats on attachment 0 at select too (`0x473039`).
     char_spot: Vec3,
@@ -343,10 +340,9 @@ pub(crate) struct CreateScene {
 /// keep the values they stopped at.
 struct ParkedScene {
     root: Entity,
-    token: &'static str,
+    file: GlueSceneFile,
     handle: Handle<M2Model>,
     cam: Option<benilla_assets::PortraitCamera>,
-    art: Option<ArtExtent>,
     char_spot: Vec3,
     char_facing: Quat,
     char_scale: f32,
@@ -362,12 +358,10 @@ impl CreateScene {
     fn empty(root: Entity, pet_root: Entity) -> Self {
         CreateScene {
             root,
-            token: None,
+            file: None,
             handle: None,
             spawned: false,
             cam: None,
-            art: None,
-            viewport_aspect: None,
             char_spot: Vec3::ZERO,
             char_facing: Quat::IDENTITY,
             char_scale: 1.0,
@@ -392,7 +386,7 @@ impl CreateScene {
     /// Step off the standing scene for stage `next`: park it while its pane still holds it
     /// (`live`), else strip its root; then stand `next` back up if it is parked, returning whether
     /// it was, so the caller lights it instead of spawning. `children` lists an entity's children,
-    /// for the emitters to freeze and thaw. Token and handle stay for the caller to set on a
+    /// for the emitters to freeze and thaw. File and handle stay for the caller to set on a
     /// spawn; a resumed scene brings its own.
     fn leave_for(
         &mut self,
@@ -408,15 +402,14 @@ impl CreateScene {
             .position(|p| p.stage == next)
             .map(|i| self.parked.remove(i));
         let parks = self.spawned && self.stage != next && live.contains(&self.stage);
-        match (parks, self.token, self.handle.clone()) {
-            (true, Some(token), Some(handle)) => {
+        match (parks, self.file.clone(), self.handle.clone()) {
+            (true, Some(file), Some(handle)) => {
                 hold_scene(commands, self.root, true, children);
                 self.parked.push(ParkedScene {
                     root: self.root,
-                    token,
+                    file,
                     handle,
                     cam: self.cam,
-                    art: self.art,
                     char_spot: self.char_spot,
                     char_facing: self.char_facing,
                     char_scale: self.char_scale,
@@ -440,8 +433,6 @@ impl CreateScene {
         }
         self.spawned = false;
         self.cam = None;
-        self.art = None;
-        // `viewport_aspect` stays: the frame is the window's, not the stage's.
         self.char_spot = Vec3::ZERO;
         let Some(p) = returning else {
             // A new instance's clock starts from 0, as the widget scene's constructor zeroes it
@@ -452,10 +443,9 @@ impl CreateScene {
         };
         hold_scene(commands, p.root, false, children);
         self.root = p.root;
-        self.token = Some(p.token);
+        self.file = Some(p.file);
         self.handle = Some(p.handle);
         self.cam = p.cam;
-        self.art = p.art;
         self.char_spot = p.char_spot;
         self.char_facing = p.char_facing;
         self.char_scale = p.char_scale;
@@ -474,19 +464,17 @@ impl CreateScene {
     fn stand_down(&mut self, commands: &mut Commands) -> bool {
         self.evict(commands, &[]);
         self.variants.clear();
-        if self.token.is_none() {
+        if self.file.is_none() {
             return false;
         }
         commands.entity(self.root).despawn_related::<Children>();
         self.dropped.push(self.root);
         // Strip the rig state (pose buffer, player, palette slot): the root outlives its bakes.
         super::clear_booth_rig(commands, self.root);
-        self.token = None;
+        self.file = None;
         self.handle = None;
         self.spawned = false;
         self.cam = None;
-        self.art = None;
-        self.viewport_aspect = None;
         self.char_spot = Vec3::ZERO;
         self.char_facing = Quat::IDENTITY;
         self.char_scale = 1.0;
@@ -546,8 +534,8 @@ fn hold_scene(
 /// wrong stage; the reference's `SelectCharacter` loads both in one blocking call. The loads start
 /// on the click; only the commit waits.
 struct PendingSwap {
-    /// The requested scene token (`UI_<token>`).
-    token: &'static str,
+    /// The requested scene file.
+    file: GlueSceneFile,
     /// Its model, loading since the click.
     handle: Handle<M2Model>,
     /// `Time<Real>` at the click, for [`GLUE_SWAP_HOLD_SECS`].
@@ -700,6 +688,7 @@ pub(crate) struct PreviewEffects {
     pub(crate) bone: u16,
     pub(crate) offset: Vec3,
     pub(crate) emitters: Vec<benilla_assets::ModelEmitter>,
+    pub(crate) rig: Option<super::EffectRig>,
 }
 
 /// The select screen's ghost treatment of the body, applied by the reference at `0x4727f0` for a
@@ -798,27 +787,8 @@ pub(super) fn spawn_glue_booth(
     ));
     booths.0.insert(
         GLUE_SLOT.to_string(),
-        Booth {
-            layer: layer.clone(),
-            root,
-            target: image,
-            baked: None,
-            baked_guid: None,
-            snap: None,
-            shown: false,
-            show_rev: 0,
-            // `gate_booth_cameras` keeps the glue camera live while a scene shows.
-            wake: 0,
-            live: false,
-            pending: Vec::new(),
-            pending_since: None,
-            pipes_settling: false,
-            pipes_since: None,
-            aspect: 1.0,
-            rigged: false,
-            parked: false,
-            turn: super::Turn::default(),
-        },
+        // `gate_booth_cameras` keeps the glue camera live while a scene shows.
+        Booth::new(layer.clone(), root, image),
     );
     // The background scene's own root; the character root yaws, this one never does.
     let scene_root = commands.spawn(stage_root(&layer)).id();
@@ -886,8 +856,9 @@ fn glue_ffx(
     }
 }
 
-/// Drive the background scene ([`CreateScene`]): load and spawn the race's `UI_*` model, size the
-/// target to the window, seat the character, and hold the booth camera on the scene's camera 0.
+/// Drive the background scene ([`CreateScene`]): load and spawn the pane's file, size the target
+/// to the window, seat the character, and hold the booth camera on the scene's camera 0, or with
+/// none on the orthographic leg.
 #[allow(clippy::type_complexity)]
 pub(super) fn sync_glue_scene(
     mut commands: Commands,
@@ -940,7 +911,7 @@ pub(super) fn sync_glue_scene(
         return;
     };
     let children = |e: Entity| kids.get(e).map(|c| c.to_vec()).unwrap_or_default();
-    let Some(which) = preview.scene else {
+    let Some(which) = preview.scene.as_ref() else {
         // Off the glue screens: tear the scene down, free the model, square target back.
         if scene.stand_down(&mut commands) {
             resize_target(&mut images, &booth.target, GLUE_SIZE, GLUE_SIZE);
@@ -951,8 +922,8 @@ pub(super) fn sync_glue_scene(
         return;
     };
 
-    // The frame box is set from the window alone, before a token resolves, so the chrome's canvas
-    // ([`crate::glue::GlueCanvas`]) neither moves with the race nor flickers during a swap.
+    // The target is the window's, before the file resolves; a pane is a viewport inside it
+    // ([`pillarbox_glue_scene`]).
     if let Ok(w) = window.single() {
         resize_target(
             &mut images,
@@ -960,38 +931,31 @@ pub(super) fn sync_glue_scene(
             w.physical_width().max(1),
             w.physical_height().max(1),
         );
-        // A stock pane is its own frame ([`pillarbox_glue_scene`]).
-        let box_aspect =
-            glue_box_aspect(w.width() / w.height().max(1.0)).filter(|_| preview.pane.is_none());
-        if scene.viewport_aspect != box_aspect {
-            scene.viewport_aspect = box_aspect;
-        }
     }
 
     scene.evict(&mut commands, &preview.live);
-    let token = which.token();
+    let name = which.path();
     let fog = preview.fog;
     // The ghost light fork (`0x472150`, [`ghost_rig`]), shared by the scene, character and pet.
     let ghost = matches!(
         preview.look,
         Some(GlueLook::Select(l)) if l.flags & benilla_protocol::CHARACTER_FLAG_GHOST != 0
     );
-    if scene.token == Some(token) {
+    let standing_now = scene.file.as_ref() == Some(which);
+    if standing_now {
         // The requested stage is already standing: no swap pends.
         scene.pending = None;
     }
     // A parked scene that stands again ([`CreateScene::leave_for`]).
     let mut resumed = false;
-    if scene.token != Some(token) {
+    if !standing_now {
         // The pair swaps together or not at all ([`PendingSwap`]).
         let now = real.elapsed_secs();
         let pending = match scene.pending.take() {
-            Some(p) if p.token == token => p,
+            Some(p) if p.file == *which => p,
             _ => PendingSwap {
-                token,
-                handle: asset_server.load(m2_url(&format!(
-                    "Interface\\Glues\\Models\\UI_{token}\\UI_{token}.mdx"
-                ))),
+                file: which.clone(),
+                handle: asset_server.load(which.url().to_string()),
                 since: now,
             },
         };
@@ -1007,7 +971,7 @@ pub(super) fn sync_glue_scene(
         }
         if standing && waited >= GLUE_SWAP_HOLD_SECS {
             warn!(
-                "glue scene: UI_{token} swapping after {waited:.1}s without its pair (art \
+                "glue scene: {name} swapping after {waited:.1}s without its pair (art \
                  {art_ready}, body {body_ready}) — the bound is GLUE_SWAP_HOLD_SECS"
             );
         }
@@ -1020,7 +984,7 @@ pub(super) fn sync_glue_scene(
             &children,
         );
         if !resumed {
-            scene.token = Some(token);
+            scene.file = Some(pending.file);
             scene.handle = Some(pending.handle);
         }
     } else if scene.spawned && scene.stage != preview.stage {
@@ -1085,7 +1049,7 @@ pub(super) fn sync_glue_scene(
         scene.pet_baked = None;
         scene.rev += 1;
         info!(
-            "glue scene: UI_{token} resumed at {} ms on its own clock",
+            "glue scene: {name} resumed at {} ms on its own clock",
             scene.clock_ms
         );
         apply_yaw(
@@ -1135,7 +1099,7 @@ pub(super) fn sync_glue_scene(
         scene.ghost = ghost;
         let dc = blob.probe_dc();
         info!(
-            "create scene: UI_{token} rig — ambient {:?}, {} point light(s), probe dc ({:.2},{:.2},{:.2})",
+            "create scene: {name} rig — ambient {:?}, {} point light(s), probe dc ({:.2},{:.2},{:.2})",
             rig.ambient,
             blob.point_count(),
             dc[0],
@@ -1213,7 +1177,7 @@ pub(super) fn sync_glue_scene(
             })
             .collect();
         info!(
-            "create scene: UI_{token} material lane — {} of {} batches animate (UV/tint registered)",
+            "create scene: {name} material lane — {} of {} batches animate (UV/tint registered)",
             scene_parts.iter().filter(|p| p.mat_anim).count(),
             scene_parts.len(),
         );
@@ -1246,32 +1210,13 @@ pub(super) fn sync_glue_scene(
         );
         if emitters > 0 {
             info!(
-                "create scene: UI_{token} — {emitters} particle emitter(s) up \
+                "create scene: {name} — {emitters} particle emitter(s) up \
                  ({fx_frames} on a billboard frame)"
             );
         }
         scene_rig.finish(&mut commands);
         scene.spawned = true;
         scene.cam = model.camera0;
-        scene.art = benilla_formats::shipped_glue_art_extent(token);
-        if let (Some(art), Some(cam)) = (scene.art, model.camera0.as_ref()) {
-            let t0 = benilla_formats::authored_half_height(cam.fov);
-            // Where the frame's edge lands on this stage's art.
-            let frame = super::framing::GLUE_BOX_ASPECT * super::framing::glue_zoom_floor(cam.fov);
-            info!(
-                "create scene: UI_{token} art extent — half_w {:.4} (widens to {:.2}:1), half_h {:.4} \
-                 (opens to 1:{:.2}); the frame ends at {frame:.4} — {}",
-                art.half_w,
-                art.half_w / t0,
-                art.half_h,
-                art.half_h / (t0 * GLUE_AUTHORED_ASPECT),
-                if frame <= art.half_w.max(t0 * GLUE_AUTHORED_ASPECT) {
-                    "inside the art"
-                } else {
-                    "PAST the art (void at the frame's edges)"
-                },
-            );
-        }
         scene.char_spot = stage;
         scene.char_facing = stage_facing;
         scene.char_scale = stage_scale;
@@ -1289,7 +1234,7 @@ pub(super) fn sync_glue_scene(
         scene.pet_baked = None;
         scene.rev += 1; // the character re-lights onto the scene rig (sync_glue_booth's key)
         info!(
-            "create scene: UI_{token} up — {} submeshes, camera {} stage {:?} facing {:.2}° \
+            "create scene: {name} up — {} submeshes, camera {} stage {:?} facing {:.2}° \
              scale {:.3}",
             model.submeshes.len(),
             scene.cam.is_some(),
@@ -1307,23 +1252,20 @@ pub(super) fn sync_glue_scene(
             preview.yaw,
         );
     }
-    // The authored camera owns the booth camera while the scene shows, every frame.
+    // The installed camera owns the booth camera while the scene shows, every frame: the file's
+    // camera 0, or with none the orthographic leg (`0x76ceeb` installs no camera, `0x76ce80(NULL)`),
+    // never the last scene's aim.
+    let w = window.single().ok();
+    let pane = w
+        .zip(preview.pane)
+        .and_then(|(w, pane)| stock_pane_view(w.physical_width(), w.physical_height(), pane));
     if let Some(cam) = scene.cam {
-        let aspect = window
-            .single()
-            .map(|w| w.width() / w.height().max(1.0))
-            .unwrap_or(4.0 / 3.0);
+        let aspect = w.map_or(4.0 / 3.0, |w| w.width() / w.height().max(1.0));
         let fwd = (cam.target - cam.eye).normalize_or_zero();
         let up = Quat::from_axis_angle(fwd, cam.roll) * Vec3::Y;
-        // The record fov is diagonal. A stock pane converts it at the pane's own aspect, as the
-        // reference does; the native screens' [`glue_scene_framing`] holds the authored 4:3 view
-        // box instead (the Deviation is stated there). Far is kept generous (27.8 authored on Orc).
-        let pane = window
-            .single()
-            .ok()
-            .zip(preview.pane)
-            .and_then(|(w, pane)| stock_pane_view(w.physical_width(), w.physical_height(), pane));
-        let vert_fov = scene_vert_fov(cam.fov, aspect, scene.art, pane);
+        // The record fov is diagonal, converted at the pane's own aspect as the reference does.
+        // Far is kept generous (27.8 authored on Orc).
+        let vert_fov = scene_vert_fov(cam.fov, aspect, pane);
         let rig = (
             Transform::from_translation(cam.eye).looking_at(cam.target, up),
             Projection::from(PerspectiveProjection {
@@ -1334,28 +1276,69 @@ pub(super) fn sync_glue_scene(
             }),
         );
         aim(&mut cams, GLUE_SLOT, &rig);
+    } else if let Some(w) = w.filter(|_| scene.spawned) {
+        let window_px = UVec2::new(w.physical_width(), w.physical_height()).max(UVec2::ONE);
+        // The projection spans the pane's raw rectangle, unclamped and unrounded, which the
+        // clamped viewport then squashes (`modelview#viewport-and-clamp`).
+        let rect = preview
+            .pane
+            .map(|[l, r, t, b]| window_px.as_vec2() * Vec2::new(r - l, b - t))
+            .filter(|size| size.min_element() > 0.0)
+            .unwrap_or(window_px.as_vec2());
+        aim(
+            &mut cams,
+            GLUE_SLOT,
+            &ortho_scene_rig(window_px, rect, preview.root),
+        );
     }
 }
 
-/// The scene camera's vertical opening for its record's diagonal `fov`: at a stock pane's own
-/// aspect by the reference's law (`0x5c3cc0`), else the native screens' [`glue_scene_framing`]
-/// for the window.
-fn scene_vert_fov(
-    fov: f32,
-    window_aspect: f32,
-    art: Option<ArtExtent>,
-    pane: Option<super::framing::PaneView>,
-) -> f32 {
-    match pane {
-        Some(view) => diag_to_vert(fov, view.aspect),
-        None => glue_scene_framing(fov, window_aspect, art),
-    }
+/// The orthographic leg of a scene pane with no camera, as a camera in the scene's own model
+/// space over a `rect`-pixel pane of a `window`-pixel screen. The paint projects the pane's
+/// rectangle with model (0, 0) at its bottom-left, +X right, +Y up and +Z toward the viewer, depth
+/// ±500 layout units about a view at z 0 (`0x7ad7f0`, `0x5c3d90`), through the root `T(layoutScale · position) ·
+/// R(facing, +Z) · S(G48 · 5/3 · modelScale · layoutScale)` (`0x76d1a0`): one model unit is
+/// `5/3 · modelScale · layoutScale` screen heights, one layout unit `√(a²+1)` of them.
+fn ortho_scene_rig(window: UVec2, rect: Vec2, root: SceneRoot) -> (Transform, Projection) {
+    use benilla_assets::coords::wow_to_bevy;
+    let h = window.y as f32;
+    let diag = (window.x as f32 / h).hypot(1.0);
+    let px_per_unit = (5.0 / 3.0 * root.model_scale * root.layout_scale * h).max(f32::EPSILON);
+    let px_per_layout = diag * h;
+    let pos = root.position * root.layout_scale * px_per_layout;
+    let depth = 500.0 * px_per_layout;
+    let (sin, cos) = (-root.facing).sin_cos();
+    let unturn = |v: Vec2| Vec2::new(cos * v.x - sin * v.y, sin * v.x + cos * v.y);
+    let centre = unturn((rect * 0.5 - pos.truncate()) / px_per_unit);
+    let eye = [centre.x, centre.y, -pos.z / px_per_unit];
+    let up = unturn(Vec2::Y);
+    (
+        Transform::from_translation(wow_to_bevy(eye)).looking_to(
+            wow_to_bevy([0.0, 0.0, -1.0]),
+            wow_to_bevy([up.x, up.y, 0.0]),
+        ),
+        Projection::Orthographic(OrthographicProjection {
+            near: -depth / px_per_unit,
+            far: depth / px_per_unit,
+            scaling_mode: bevy::camera::ScalingMode::Fixed {
+                width: rect.x / px_per_unit,
+                height: rect.y / px_per_unit,
+            },
+            ..OrthographicProjection::default_3d()
+        }),
+    )
 }
 
-/// Set the glue booth camera's viewport: a stock pane's rect ([`stock_pane_view`]), else the
-/// native pillarbox to [`CreateScene::viewport_aspect`], black either side; writes only on change.
+/// The scene camera's vertical opening for its record's diagonal `fov` by the reference's law
+/// (`0x5c3cc0`): at a stock pane's own aspect, else, with no pane laid out, the window's, as a
+/// fullscreen `ModelFFX` fills it (`0x76d42d`).
+fn scene_vert_fov(fov: f32, window_aspect: f32, pane: Option<super::framing::PaneView>) -> f32 {
+    diag_to_vert(fov, pane.map_or(window_aspect, |view| view.aspect))
+}
+
+/// Set the glue booth camera's viewport: a stock pane's rect ([`stock_pane_view`]), else the whole
+/// window; writes only on change.
 pub(super) fn pillarbox_glue_scene(
-    scene: Res<CreateScene>,
     preview: Res<GluePreview>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut cams: Query<(&BoothCam, &mut Camera)>,
@@ -1364,23 +1347,13 @@ pub(super) fn pillarbox_glue_scene(
         return;
     };
     let full_h = w.physical_height().max(1);
-    let viewport = match preview.pane {
-        Some(pane) => {
-            stock_pane_view(w.physical_width(), full_h, pane).map(|view| bevy::camera::Viewport {
-                physical_position: view.position,
-                physical_size: view.size,
-                ..default()
-            })
-        }
-        // The same arithmetic the chrome's canvas insets by ([`glue_box_physical`]).
-        None => glue_box_physical(w.physical_width(), full_h, scene.viewport_aspect).map(
-            |(x, box_w)| bevy::camera::Viewport {
-                physical_position: UVec2::new(x, 0),
-                physical_size: UVec2::new(box_w, full_h),
-                ..default()
-            },
-        ),
-    };
+    let viewport = preview.pane.and_then(|pane| {
+        stock_pane_view(w.physical_width(), full_h, pane).map(|view| bevy::camera::Viewport {
+            physical_position: view.position,
+            physical_size: view.size,
+            ..default()
+        })
+    });
     for (booth, mut cam) in cams.iter_mut() {
         if booth.0 != GLUE_SLOT {
             continue;
@@ -1540,7 +1513,7 @@ pub(super) fn sync_glue_booth(
     // stage matching the request means this bake may show ([`PendingSwap`]).
     let staged = scene
         .as_deref()
-        .is_none_or(|s| s.token == preview.scene.map(GlueScene::token));
+        .is_none_or(|s| s.file.as_ref() == preview.scene.as_ref());
     let rebake = staged && (last_rev != bake.revision || last_scene != scene_rev);
     let reyaw = last_yaw != preview.yaw;
     if !rebake && !reyaw {
@@ -1718,6 +1691,7 @@ pub(super) fn sync_glue_booth(
                 bone: fx.bone,
                 offset: fx.offset,
                 emitters: fx.emitters.clone(),
+                rig: fx.rig.clone(),
             })
             .collect();
         let hung = Hung::of(
@@ -1859,7 +1833,7 @@ pub(super) fn sync_glue_booth(
         // bake's aspect, as it shows only for the frames before the scene's camera takes over.
         let (t, _) = body_frame(&anchors, 1.0);
         let record_fov = anchors
-            .pane_camera
+            .raw_camera(1)
             .map_or(super::framing::PANE_FIXED_FOV, |c| c.fov);
         if !scene.as_deref().is_some_and(|s| s.spawned) {
             aim(
@@ -2280,33 +2254,28 @@ mod tests {
                 "{w}x{h}: {}",
                 view.aspect
             );
-            let vert = scene_vert_fov(fov, a, None, Some(view));
+            let vert = scene_vert_fov(fov, a, Some(view));
             let law = fov / (want * want + 1.0).sqrt();
             assert!((vert - law).abs() < 1e-3, "{w}x{h}: {vert} vs {law}");
         }
-        // Not the native screens' held box: at 16:10 that opens wider than the law.
-        let native = scene_vert_fov(fov, 1.6, None, None);
-        assert!((native - fov / (1.6f32 * 1.6 + 1.0).sqrt()).abs() > 1e-2);
+        // With no pane, the window's own aspect by the same law.
+        let window = scene_vert_fov(fov, 1.6, None);
+        assert!((window - fov / (1.6f32 * 1.6 + 1.0).sqrt()).abs() < 1e-3);
     }
 
-    /// The booth camera's viewport is the stock pane's rect, no pillarbox inside it; the native
-    /// screens keep their pillarbox past [`super::super::framing::GLUE_BOX_ASPECT`].
+    /// The booth camera's viewport is the stock pane's rect, no pillarbox inside it, and with no
+    /// pane the whole window.
     #[test]
-    fn the_viewport_is_the_stock_pane_and_the_native_box_otherwise() {
+    fn the_viewport_is_the_stock_pane_or_the_window() {
         for stock in [true, false] {
             for (w, h) in WINDOWS {
                 let a = w as f32 / h as f32;
                 let mut app = App::new();
-                let root = app.world_mut().spawn_empty().id();
-                let pet = app.world_mut().spawn_empty().id();
-                let mut scene = CreateScene::empty(root, pet);
-                scene.viewport_aspect = glue_box_aspect(a).filter(|_| !stock);
                 let preview = GluePreview {
                     pane: stock.then(|| glue_parent(a)),
                     ..GluePreview::default()
                 };
-                app.insert_resource(scene)
-                    .insert_resource(preview)
+                app.insert_resource(preview)
                     .add_systems(Update, pillarbox_glue_scene);
                 app.world_mut().spawn((
                     Window {
@@ -2331,8 +2300,7 @@ mod tests {
                     let view = super::super::framing::stock_pane_view(w, h, glue_parent(a));
                     view.map(|v| (v.position, v.size))
                 } else {
-                    glue_box_physical(w, h, glue_box_aspect(a))
-                        .map(|(x, bw)| (UVec2::new(x, 0), UVec2::new(bw, h)))
+                    None
                 };
                 assert_eq!(vp, want, "stock {stock} {w}x{h}");
                 if stock && a <= 16.0 / 9.0 {
@@ -2357,7 +2325,7 @@ mod tests {
             .add_systems(Update, sync_glue_ffx);
         let mut ghost = benilla_protocol::Character {
             flags: benilla_protocol::CHARACTER_FLAG_GHOST,
-            ..crate::char_select::test_character(1, "Boo")
+            ..crate::glue_session::roster::test_character(1, "Boo")
         };
         let set = |app: &mut App, look: Option<GlueLook>, show: bool| {
             {
@@ -2391,30 +2359,103 @@ mod tests {
         assert_eq!(set(&mut app, Some(living), true), GlueFfx::SelectLiving);
     }
 
-    /// A scene is its model's token, from the path the glue screens give the pane in any case or
-    /// extension; `SetBackgroundModel`'s race remap lands on the same scenes.
+    /// A scene is the pane's own file, loaded loose-aware (`0x76ccf5`, flags 5): a path under any
+    /// folder keeps its own URL, and a case or extension spelling of one file is one scene.
     #[test]
-    fn a_scene_is_named_by_its_models_token() {
-        for scene in GlueScene::ALL {
-            let token = scene.token();
-            let path = format!("Interface\\Glues\\Models\\UI_{token}\\UI_{token}.mdx");
-            assert_eq!(GlueScene::from_model_path(&path), Some(scene), "{path}");
-        }
+    fn a_scene_is_the_panes_own_file() {
+        let custom = GlueSceneFile::new("Interface\\Glues\\Models\\Custom\\UI_Orc.mdx");
         assert_eq!(
-            GlueScene::from_model_path("interface/glues/models/ui_nightelf/UI_NIGHTELF.M2"),
-            Some(GlueScene::NightElf)
+            custom.url(),
+            "mpq-loose://interface/glues/models/custom/ui_orc.m2"
         );
-        for odd in [
-            "",
-            "UI_",
-            "UI_Gnome.mdx",
-            "Interface\\Glues\\Models\\Orc.mdx",
-        ] {
-            assert_eq!(GlueScene::from_model_path(odd), None, "{odd}");
-        }
-        assert_eq!(GlueScene::of_race(8), GlueScene::Orc);
-        assert_eq!(GlueScene::of_race(7), GlueScene::Dwarf);
-        assert_eq!(GlueScene::of_race(1), GlueScene::Human);
+        assert_ne!(custom, stock_scene(2).0, "not the stock UI_Orc");
+        // Case and extension fold; the separators do not.
+        let night_elf = "Interface\\Glues\\Models\\UI_NightElf\\UI_NightElf.MDX";
+        assert_eq!(
+            GlueSceneFile::new(night_elf),
+            GlueSceneFile::new("interface\\glues\\models\\ui_nightelf\\ui_nightelf.m2"),
+        );
+        assert_ne!(
+            GlueSceneFile::new(night_elf),
+            GlueSceneFile::new("interface/glues/models/ui_nightelf/ui_nightelf.m2"),
+        );
+        assert_eq!(
+            GlueSceneFile::new("Interface\\Glues\\Models\\UI_Gnome\\UI_Gnome.mdx").path(),
+            "Interface\\Glues\\Models\\UI_Gnome\\UI_Gnome.mdx"
+        );
+        assert_eq!(
+            stock_scene(8).0.url(),
+            "mpq-loose://interface/glues/models/ui_orc/ui_orc.m2"
+        );
+        assert_eq!(stock_scene(7).0, stock_scene(3).0, "a gnome in Dwarf's");
+        // A file the cache refuses stands the error cube, off the archives (`0x70737f`).
+        assert_eq!(
+            GlueSceneFile::new("Interface\\Glues\\Models\\UI_Orc\\UI_Orc.blp").url(),
+            "mpq://spells/errorcube.m2"
+        );
+    }
+
+    /// Clip-space XY of a Bevy-space point through an orthographic rig.
+    fn ortho_ndc(rig: &(Transform, Projection), rect: Vec2, p: Vec3) -> Vec2 {
+        use bevy::camera::CameraProjection;
+        let Projection::Orthographic(mut ortho) = rig.1.clone() else {
+            panic!("the orthographic leg");
+        };
+        ortho.update(rect.x, rect.y);
+        let clip = ortho.get_clip_from_view() * rig.0.to_matrix().inverse() * p.extend(1.0);
+        clip.truncate().truncate() / clip.w
+    }
+
+    /// A scene file with no camera takes the orthographic leg (`0x76ceeb` → `0x76ce80(NULL)`):
+    /// model (0, 0) at the pane's bottom-left, +X right, +Y up, one model unit `5/3 · modelScale
+    /// · layoutScale` screen heights, a position in layout units of `√(a²+1)` screen heights, and
+    /// the view at layout z 0 with depth ±500 layout units (`0x76d1a0`, `0x7ad7f0`).
+    #[test]
+    fn a_scene_with_no_camera_draws_on_the_orthographic_leg() {
+        use benilla_assets::coords::wow_to_bevy;
+        let near = |got: Vec2, want: Vec2| (got - want).abs().max_element() < 1e-4;
+        let window = UVec2::new(1024, 768);
+        let full = window.as_vec2();
+        let at = |rig: &(Transform, Projection), p: [f32; 3]| ortho_ndc(rig, full, wow_to_bevy(p));
+        let rig = ortho_scene_rig(window, full, SceneRoot::default());
+        assert!(near(at(&rig, [0.0; 3]), Vec2::new(-1.0, -1.0)));
+        // 768 px is 0.6 model units at scale 1; 1024 px is 0.8.
+        assert!(near(at(&rig, [0.8, 0.6, 0.0]), Vec2::new(1.0, 1.0)));
+        // A quarter turn puts +X up.
+        let turned = SceneRoot {
+            model_scale: 2.0,
+            facing: std::f32::consts::FRAC_PI_2,
+            ..default()
+        };
+        let rig = ortho_scene_rig(window, full, turned);
+        assert!(near(at(&rig, [0.3, 0.0, 0.0]), Vec2::new(-1.0, 1.0)));
+
+        // 16:9, a 600×400 pane, layout scale 0.8, model scale 1.5: a model unit is
+        // 5/3 · 1.5 · 0.8 · 1080 = 2160 px, a layout unit 1080 · √((16/9)² + 1) px.
+        let window = UVec2::new(1920, 1080);
+        let rect = Vec2::new(600.0, 400.0);
+        let root = SceneRoot {
+            model_scale: 1.5,
+            layout_scale: 0.8,
+            position: Vec3::new(0.05, 0.02, 0.1),
+            facing: 0.0,
+        };
+        let (px_per_unit, px_per_layout) = (2160.0, 1080.0 * (16.0f32 / 9.0).hypot(1.0));
+        let pos = root.position * root.layout_scale * px_per_layout / px_per_unit;
+        let rig = ortho_scene_rig(window, rect, root);
+        let at = |p: Vec3| ortho_ndc(&rig, rect, wow_to_bevy(p.to_array()));
+        assert!(near(at(-pos), Vec2::new(-1.0, -1.0)), "{}", at(-pos));
+        let corner = (rect / px_per_unit).extend(0.0) - pos;
+        assert!(near(at(corner), Vec2::new(1.0, 1.0)), "{}", at(corner));
+        // Layout z 0 is the view plane, and depth runs ±500 layout units about it.
+        let plane = Vec3::new(0.0, 0.0, -pos.z);
+        let view = rig.0.to_matrix().inverse() * wow_to_bevy(plane.to_array()).extend(1.0);
+        assert!(view.z.abs() < 1e-4, "{view}");
+        let Projection::Orthographic(o) = &rig.1 else {
+            unreachable!()
+        };
+        let depth = 500.0 * px_per_layout / px_per_unit;
+        assert!((o.near + depth).abs() < 1e-2 && (o.far - depth).abs() < 1e-2);
     }
 
     /// `petDisplayId == 0` is the client's whole gate: the server zeroes the triple for all but a
@@ -2712,6 +2753,7 @@ mod tests {
                 anim_id: 0,
                 seq_index: 0,
                 node: node(STAND_NODE),
+                blend_node: None,
                 looping: true,
                 duration: 2.0,
                 move_speed: 0.0,
@@ -2762,26 +2804,7 @@ mod tests {
 
     /// The glue booth over the character root `root`, as [`spawn_glue_booth`] stands it.
     fn glue_booth(root: Entity) -> Booth {
-        Booth {
-            layer: RenderLayers::layer(GLUE_LAYER),
-            root,
-            target: Handle::default(),
-            baked: None,
-            baked_guid: None,
-            snap: None,
-            shown: false,
-            show_rev: 0,
-            wake: 0,
-            live: false,
-            pending: Vec::new(),
-            pending_since: None,
-            pipes_settling: false,
-            pipes_since: None,
-            aspect: 1.0,
-            rigged: false,
-            parked: false,
-            turn: super::super::Turn::default(),
-        }
+        Booth::new(RenderLayers::layer(GLUE_LAYER), root, Handle::default())
     }
 
     fn booth_app() -> (App, Entity) {
@@ -3002,9 +3025,9 @@ mod tests {
     fn another_select_record_is_another_model() {
         let (mut app, root) = booth_app();
         let record = |guid| {
-            GlueLook::Select(SelectLook::from(&crate::char_select::test_character(
-                guid, "Rec",
-            )))
+            GlueLook::Select(SelectLook::from(
+                &crate::glue_session::roster::test_character(guid, "Rec"),
+            ))
         };
         bake(
             &mut app,
@@ -3217,7 +3240,7 @@ mod tests {
             e
         };
         let mut scene = CreateScene::empty(login, pet);
-        scene.token = Some("MainMenu");
+        scene.file = Some(GlueSceneFile::new("UI_MainMenu.mdx"));
         scene.handle = Some(Handle::default());
         scene.spawned = true;
         scene.stage = 1;
@@ -3279,15 +3302,20 @@ mod tests {
 
         // The select stage stands, then the return to login.
         let select = scene.root;
-        scene.token = Some("Orc");
+        scene.file = Some(GlueSceneFile::new("UI_Orc.mdx"));
         scene.spawned = true;
         scene.stage = 2;
         scene.clock_ms = 50;
         assert!(step(&mut world, &mut scene, &[1, 2], 1), "login resumes");
         assert_eq!(scene.root, login);
         assert_eq!(
-            (scene.token, scene.stage, scene.clock_ms, scene.spawned),
-            (Some("MainMenu"), 1, 1234, true),
+            (
+                scene.file.clone(),
+                scene.stage,
+                scene.clock_ms,
+                scene.spawned
+            ),
+            (Some(GlueSceneFile::new("UI_MainMenu.mdx")), 1, 1234, true),
             "on the clock it stopped at"
         );
         assert_eq!(
@@ -3331,7 +3359,7 @@ mod tests {
             resumed
         };
         let stand = |scene: &mut CreateScene, stage: u64, clock_ms: u64| {
-            scene.token = Some("Orc");
+            scene.file = Some(GlueSceneFile::new("UI_Orc.mdx"));
             scene.handle = Some(Handle::default());
             scene.spawned = true;
             scene.stage = stage;
@@ -3405,15 +3433,14 @@ mod tests {
         let parked_root = world.spawn(Transform::IDENTITY).id();
         let pet = world.spawn_empty().id();
         let mut scene = CreateScene::empty(standing, pet);
-        scene.token = Some("Orc");
+        scene.file = Some(GlueSceneFile::new("UI_Orc.mdx"));
         scene.handle = Some(Handle::default());
         scene.spawned = true;
         scene.parked.push(ParkedScene {
             root: parked_root,
-            token: "MainMenu",
+            file: GlueSceneFile::new("UI_MainMenu.mdx"),
             handle: Handle::default(),
             cam: None,
-            art: None,
             char_spot: Vec3::ZERO,
             char_facing: Quat::IDENTITY,
             char_scale: 1.0,
@@ -3431,7 +3458,7 @@ mod tests {
         queue.apply(&mut world);
         assert!(stood);
         assert!(scene.variants.is_empty(), "the twins go");
-        assert!(scene.parked.is_empty() && scene.token.is_none());
+        assert!(scene.parked.is_empty() && scene.file.is_none());
         assert_eq!(scene.dropped, vec![parked_root, standing]);
         assert!(world.get_entity(parked_root).is_err());
     }

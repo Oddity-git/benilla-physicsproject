@@ -938,6 +938,8 @@ mod tests {
         world.init_resource::<crate::net::Reputations>();
         world.init_resource::<crate::target::AssistAttack>();
         world.init_resource::<crate::target::Selection>();
+        world.init_resource::<crate::spell::SpellTargeting>();
+        world.init_resource::<crate::spell::CursorPicks>();
         world.init_resource::<bevy::ecs::message::Messages<crate::target::DeselectGuid>>();
         world.init_resource::<bevy::ecs::message::Messages<crate::player::StandStateRequest>>();
         world.init_resource::<crate::player::Player>();
@@ -1262,6 +1264,7 @@ mod tests {
         world.insert_resource(player);
         world.init_resource::<crate::ui_party::GroupState>();
         world.init_resource::<crate::items::Items>();
+        world.init_resource::<crate::ui_action::UiErrorKeys>();
         world.init_resource::<bevy::ecs::message::Messages<crate::sound::LootPickupSound>>();
     }
 

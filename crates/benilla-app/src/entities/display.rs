@@ -155,9 +155,10 @@ pub(crate) struct DisplayModel {
     pub(super) ground_radius_local: f32,
     /// The authored portrait camera the portrait booth frames through (`0x713540`).
     pub(super) portrait_camera: Option<benilla_assets::PortraitCamera>,
-    /// Camera-table index 1, the rig a `<PlayerModel>` widget renders through (`0x505890`); without
-    /// it the reference uses its fixed fallback camera.
-    pub(super) pane_camera: Option<benilla_assets::PortraitCamera>,
+    /// The camera table by raw index, each record at rest: index 1 is the rig a `<PlayerModel>`
+    /// widget renders through (`0x505890`), else the reference's fixed fallback camera, and
+    /// `SetCamera(n)` names any (`0x76cec0`).
+    pub(super) cameras: std::sync::Arc<[benilla_assets::PortraitCamera]>,
     /// A bow's `$WTT`/`$WTB` string anchors (`0x611ff0`), `[top, bottom]` as
     /// `(bone, model-local Bevy position)`.
     pub(super) string_anchors: Option<[(u16, Vec3); 2]>,
@@ -182,6 +183,25 @@ pub(crate) struct DisplayModel {
 }
 
 impl DisplayModel {
+    /// Whether an emitter rides a bone the idle poses: the Corrupted Ashbringer's glow bones carry
+    /// constant turns that set the plane of its XY quads.
+    pub(super) fn poses_emitters(&self) -> bool {
+        !self.skeleton.joints.is_empty()
+            && self.animations.is_some()
+            && self.emitters.iter().any(|e| e.billboard.is_none())
+    }
+
+    /// The skeleton and idle a booth poses this model's emitters with, if they need one.
+    pub(super) fn emitter_rig(&self) -> Option<crate::portrait::EffectRig> {
+        if !self.poses_emitters() {
+            return None;
+        }
+        Some(crate::portrait::EffectRig {
+            skeleton: self.skeleton.clone(),
+            animations: self.animations.clone()?,
+        })
+    }
+
     /// Whether a built part is welded to a billboard bone: it has no rigid placement (the reference
     /// blends it per vertex), so even the item lane must rig for it (seven shoulder models).
     pub(super) fn welds_billboard(&self) -> bool {
@@ -265,7 +285,7 @@ pub(crate) fn empty_shell() -> DisplayModel {
         swim_pivot_drop_local: 0.0,
         ground_radius_local: 0.0,
         portrait_camera: None,
-        pane_camera: None,
+        cameras: std::sync::Arc::new([]),
         bbox_z_local: 0.0,
         stand_box_z_local: 0.0,
         bake_center_local: Vec3::ZERO,
@@ -317,7 +337,7 @@ pub(super) fn build_parts(
     let mut swim_pivot_drop_local = 0.0;
     let mut ground_radius_local = 0.0;
     let mut portrait_camera = None;
-    let mut pane_camera = None;
+    let mut cameras: std::sync::Arc<[benilla_assets::PortraitCamera]> = std::sync::Arc::new([]);
     let mut bbox_z_local = 0.0;
     let mut stand_box_z_local = 0.0;
     let mut bake_center_local = Vec3::ZERO;
@@ -366,7 +386,7 @@ pub(super) fn build_parts(
             animations = model.animations.clone();
             first_seq_span = model.first_seq_span;
             portrait_camera = model.portrait_camera;
-            pane_camera = model.pane_camera;
+            cameras = model.cameras.iter().map(|c| c.still).collect();
             if gameobject {
                 collider = model.collision.as_ref().and_then(model_local_collider);
             }
@@ -494,7 +514,7 @@ pub(super) fn build_parts(
     dm.swim_pivot_drop_local = swim_pivot_drop_local;
     dm.ground_radius_local = ground_radius_local;
     dm.portrait_camera = portrait_camera;
-    dm.pane_camera = pane_camera;
+    dm.cameras = cameras;
     dm.bbox_z_local = bbox_z_local;
     dm.stand_box_z_local = stand_box_z_local;
     dm.bake_center_local = bake_center_local;

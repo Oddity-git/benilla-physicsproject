@@ -138,6 +138,59 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // GetTradeSkillItemStats(index) (`0x4fdec0`): one string per tooltip line of the item the recipe
+    // creates ([`super::itemstats`]), and zero values on any miss: an index outside the full row
+    // list, a header, a spell with no product, or a template not cached yet, which is asked for
+    // (`0x4fdf95`) so the next call finds it.
+    g.set(
+        "GetTradeSkillItemStats",
+        lua.create_function(|lua, index: Value| {
+            let index = number_arg(lua, index, "Usage: GetTradeSkillItemStats(index)")?;
+            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+            let product = usize::try_from(index)
+                .ok()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|n| rows(&model).get(n).cloned())
+                .and_then(|row| match row {
+                    Row::Header { .. } => None,
+                    Row::Entry(ei) => model.trade_skill.as_ref().map(|t| &t.recipes[ei]),
+                })
+                .map(|r| r.product_item);
+            let Some(product) = product else {
+                return Ok(MultiValue::new());
+            };
+            let Some(view) = model.item_templates.get(&product).cloned() else {
+                if product != 0 {
+                    model.item_stat_asks.insert(product);
+                }
+                return Ok(MultiValue::new());
+            };
+            let req = model.player_req.clone();
+            let player = model.unit("player").map(|u| (u.pvp_team, u.sex == 3));
+            let knows = view.required_spell != 0
+                && model
+                    .spellbook
+                    .slots
+                    .iter()
+                    .any(|s| s.spell_id == view.required_spell);
+            drop(model);
+            let facts = super::itemstats::PlayerFacts {
+                // A player whose level is unpushed declines to judge, as `item_refusal` does.
+                present: req.level != 0 || player.is_some(),
+                pvp_team: player.map_or(0, |p| p.0),
+                female: player.is_some_and(|p| p.1),
+                knows_required_spell: knows,
+            };
+            let get = |key: &str| crate::strings::global(lua, key).unwrap_or_default();
+            let lines = super::itemstats::item_stat_lines(&view, &req, facts, &get);
+            let mut out = Vec::with_capacity(lines.len());
+            for line in &lines {
+                out.push(Value::String(lua.create_string(line)?));
+            }
+            Ok(MultiValue::from_vec(out))
+        })?,
+    )?;
+
     // GetTradeSkillReagentItemLink(index, reagentIndex) (`0x4ff800`): always one value, the link
     // or nil; `reagentIndex` counts the non-empty reagent slots, and the usage error's
     // `GetTradeReagentSkillItemLink` is the reference's own typo.
@@ -265,12 +318,13 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // GetTradeSkillNumMade(index) (`0x4fdc50`): 1, 1 on a header or past the rows (`0x4fdd13`).
     g.set(
         "GetTradeSkillNumMade",
         lua.create_function(|lua, Idx(index): Idx| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let (min_made, max_made) =
-                recipe_at(&model, index).map_or((0, 0), |r| (r.min_made, r.max_made));
+                recipe_at(&model, index).map_or((1, 1), |r| (r.min_made, r.max_made));
             Ok(MultiValue::from_vec(vec![
                 Value::Integer(i64::from(min_made)),
                 Value::Integer(i64::from(max_made)),
@@ -278,18 +332,26 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // GetTradeSkillCooldown(index): nil when ready, which the stock Lua tests for truthiness
-    // (Blizzard_TradeSkillUI.lua:215).
+    // GetTradeSkillCooldown(index) (`0x4fda20`): the start plus the duration minus the clock,
+    // scaled by 0.001, read at the call; nil when ready, which the stock Lua tests for truthiness
+    // (Blizzard_TradeSkillUI.lua:215). A held cooldown has not started, so its whole duration is
+    // left.
     g.set(
         "GetTradeSkillCooldown",
         lua.create_function(|lua, Idx(index): Idx| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(
-                match recipe_at(&model, index).and_then(|r| r.cooldown_secs) {
-                    Some(secs) => Value::Integer(secs as i64),
-                    None => Value::Nil,
-                },
-            )
+            let left = recipe_at(&model, index)
+                .and_then(|r| r.cooldown)
+                .map(|(start_ms, duration_ms, enabled)| {
+                    let duration = f64::from(duration_ms) / 1000.0;
+                    if enabled {
+                        start_ms as f64 / 1000.0 + duration - model.now
+                    } else {
+                        duration
+                    }
+                })
+                .filter(|&left| left > 0.0);
+            Ok(left.map_or(Value::Nil, Value::Number))
         })?,
     )?;
 
@@ -378,6 +440,9 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             let count = count
                 .and_then(|v| lua.coerce_number(v).ok().flatten())
                 .map_or(1, |n| i64::from(super::super::binding_abi::ftol(n)));
+            // The cast is `TryCastSpell` (`0x500314` → `0x6e5a90`), behind the gate's tag 2
+            // (`0x6e4bc1`); the repeat is armed ahead of it (`0x500307`), so a refused call arms it.
+            let may_cast = crate::script::protected::gate(lua, crate::script::protected::Tag::CAST);
             crate::script::tick::verb(lua, |model| {
                 let Some((spell_id, avail)) =
                     recipe_at(model, index).map(|r| (r.spell_id, r.num_available))
@@ -392,7 +457,9 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                     model.trade_skill_repeat_count = n;
                     model.raise("UPDATE_TRADESKILL_RECAST", Vec::new());
                 }
-                model.trade_skill_dos.push((spell_id, n));
+                if may_cast {
+                    model.trade_skill_dos.push((spell_id, n));
+                }
             });
             Ok(())
         })?,
@@ -471,11 +538,15 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "GetTradeSkillInvSlots",
         lua.create_function(|lua, ()| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let bits = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                present_inv_slots(&model)
+            };
             let mut out = Vec::new();
             // A token (`0x84dd70`) missing from the string table answers "" rather than being
-            // dropped: the filter verbs index this list by position.
-            for bit in present_inv_slots(&model) {
+            // dropped: the filter verbs index this list by position. Each is a `_G` read whose
+            // `__index` may call any verb, so the Model is not borrowed.
+            for bit in bits {
                 let word = inv_slot_token(bit)
                     .and_then(|k| crate::strings::global(lua, k))
                     .unwrap_or_default();

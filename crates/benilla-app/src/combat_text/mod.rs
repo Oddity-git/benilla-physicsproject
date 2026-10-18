@@ -259,9 +259,12 @@ pub(crate) fn float_combat_text(
                 path: font.as_ref().and_then(|f| f.0.as_deref()),
                 height: Some(target_px),
                 outline: Outline::None,
+                monochrome: false,
                 spacing: 0.0, // one line
                 shadow_x: 0.0,
                 alpha_gradient: None,
+                non_space_wrap: false,
+                max_lines: 0,
             },
             // A world overlay with its own seat; the UI grid does not apply.
             crate::ui_text::TextSeat::Exact,

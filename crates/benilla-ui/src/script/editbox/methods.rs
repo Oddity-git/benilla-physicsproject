@@ -3,6 +3,7 @@
 
 use mlua::{Lua, Table, Value};
 
+use crate::script::binding_abi;
 use crate::script::object::frame_handle_of;
 use crate::widget::EditBoxState;
 
@@ -137,42 +138,42 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
     m.set(
-        // `SetMaxBytes` (`0x798f30`) has `SetMaxLetters`'s exact count gate (`0x798fbc`) and raw
-        // coercion, but its no-limit value is -1 (`0x799012`; the ctor writes -1 at `0x7799df`):
-        // a non-positive argument is unlimited, a positive one caps the bytes.
+        // `SetMaxBytes` (`0x798f30`) has `SetMaxLetters`'s exact count gate (`0x798fbc`, raising
+        // `Usage: %s:SetMaxBytes(max)` with the box's name, `0x87bf14`) and raw coercion, but it
+        // stores n - 1 for a positive n and -1, unlimited, otherwise (`0x799012`-`0x799022`; the
+        // ctor writes -1 at `0x7799df`).
         "SetMaxBytes",
         lua.create_function(|lua, (this, args): (Table, mlua::MultiValue)| {
             let args: Vec<Value> = args.into_iter().collect();
+            with_editbox(lua, &this, |_| ())?;
             if args.len() != 1 {
-                return Err(mlua::Error::runtime(
-                    "Usage: <unnamed>:SetMaxBytes(maxBytes)",
-                ));
+                return Err(binding_abi::usage(lua, &this, "SetMaxBytes(max)"));
             }
             let n = crate::script::binding_abi::coerced_number(lua, args.first().cloned());
             let n = n as i64;
             with_editbox(lua, &this, |eb| {
-                eb.max_bytes = (n > 0).then_some(n as usize);
+                eb.max_bytes = (n > 0).then(|| n as usize - 1);
             })
         })?,
     )?;
     m.set(
-        // -1 while unlimited, the reference's stored sentinel.
+        // The stored cap plus one (`0x7990e3`-`0x7990e9`), so 0 while unlimited.
         "GetMaxBytes",
         lua.create_function(|lua, this: Table| {
-            with_editbox(lua, &this, |eb| eb.max_bytes.map_or(-1, |n| n as i64))
+            with_editbox(lua, &this, |eb| eb.max_bytes.map_or(0, |n| n as i64 + 1))
         })?,
     )?;
     m.set(
         // `SetMaxLetters` (`0x799110`) checks the count exactly, `lua_gettop` (`0x6f3070`) against
-        // 2 at `0x79919c`, and not the type: no argument or two raise `Usage:`, nil or `{}` store
-        // 0, `"12"` stores 12. 0 is no limit: the insert skips its trim on zero (`0x77c085`).
+        // 2 at `0x79919c`, and not the type: no argument or two raise `Usage: %s:SetMaxLetters(max)`
+        // (`0x87bf30`) with the box's name, nil or `{}` store 0, `"12"` stores 12. 0 is no limit:
+        // the insert skips its trim on zero (`0x77c085`).
         "SetMaxLetters",
         lua.create_function(|lua, (this, args): (Table, mlua::MultiValue)| {
             let args: Vec<Value> = args.into_iter().collect();
+            with_editbox(lua, &this, |_| ())?;
             if args.len() != 1 {
-                return Err(mlua::Error::runtime(
-                    "Usage: <unnamed>:SetMaxLetters(maxLetters)",
-                ));
+                return Err(binding_abi::usage(lua, &this, "SetMaxLetters(max)"));
             }
             let n = crate::script::binding_abi::coerced_number(lua, args.first().cloned());
             // Truncated toward zero like `__ftol`; the reference stores a negative as is, but its
@@ -309,6 +310,17 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         )?;
     }
 
+    // The read-backs test one bit of the flags word `+0x318` each (`0x797dc5` & 1, `0x797f35` & 2,
+    // `0x7980a5` & 4, `0x798215` & 8) and push 1 or nil; no argument is read.
+    for (name, get) in flag_getters() {
+        m.set(
+            name,
+            lua.create_function(move |lua, this: Table| {
+                with_editbox(lua, &this, |eb| binding_abi::flag(get(eb)))
+            })?,
+        )?;
+    }
+
     install_font_block(lua, &m)?;
 
     lua.set_named_registry_value(REG_EDITBOX_METHODS, m)?;
@@ -347,10 +359,13 @@ fn install_font_block(lua: &Lua, m: &Table) -> mlua::Result<()> {
     ] {
         m.set(
             name,
-            lua.create_function(move |lua, (this, token): (Table, String)| {
-                let bits = EditBoxState::justify_bit(&token).ok_or_else(|| {
-                    mlua::Error::runtime(format!("Usage: <EditBox>:{name}(\"justify\")"))
-                })?;
+            lua.create_function(move |lua, (this, token): (Table, Value)| {
+                frame_handle_of(lua, &this)?;
+                let bits = binding_abi::optional_string(lua, &token)
+                    .and_then(|t| EditBoxState::justify_bit(&t))
+                    .ok_or_else(|| {
+                        binding_abi::usage(lua, &this, &format!("{name}(\"justify\")"))
+                    })?;
                 with_editbox(lua, &this, |eb| eb.set_justify_axis(mask, bits))
             })?,
         )?;
@@ -381,5 +396,18 @@ fn flag_setters() -> [FlagSetter; 4] {
         ("SetNumeric", |eb, on| eb.numeric = on),
         ("SetPassword", |eb, on| eb.password = on),
         ("SetMultiLine", |eb, on| eb.multi_line = on),
+    ]
+}
+
+/// An `Is<Flag>` method name and the field it reads.
+type FlagGetter = (&'static str, fn(&EditBoxState) -> bool);
+
+/// The four config-flag read-backs, the setters' partners.
+fn flag_getters() -> [FlagGetter; 4] {
+    [
+        ("IsAutoFocus", |eb| eb.auto_focus),
+        ("IsNumeric", |eb| eb.numeric),
+        ("IsPassword", |eb| eb.password),
+        ("IsMultiLine", |eb| eb.multi_line),
     ]
 }

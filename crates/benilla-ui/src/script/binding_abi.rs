@@ -14,7 +14,10 @@
 //!    `xor eax,eax; ret` that skips `0x6f4940` (`GetDefaultLanguage`'s failure edges);
 //! 3. raise.
 
-use mlua::{Lua, MultiValue, Value};
+use mlua::{Lua, MultiValue, Table, Value};
+
+use super::Model;
+use crate::widget::{FrameHandle, RegionHandle};
 
 /// `_ftol` (`0x40a2b0`) as the bindings consume it: the x87 rounding control set to chop, a
 /// `fistp` to a qword, and its low dword. What the qword cannot hold (an infinity, NaN, ±2^63 and
@@ -132,72 +135,96 @@ pub(crate) fn text_arg(lua: &Lua, v: Option<Value>) -> mlua::Result<Option<Strin
 }
 
 /// Lua's number-to-string as the 1.12 client compiles it: MSVC's `sprintf("%.14g")`
-/// (`luaV_tostring` `0x6f7c80`, format `0x871960`). `EditBox:SetNumber` (`0x798690`) formats
-/// through it too, being byte-identical to `SetText` (`0x7984c0`). The exponent has at least three
-/// digits: `1e20` prints `1e+020`.
-///
-/// Deviation: the result is correctly rounded, where the reference rounds to 17 digits half-up and
-/// then again to 14, differing in the last digit on about 0.05% of doubles, because no consumer
-/// reads that digit.
+/// (`luaV_tostring` `0x6f7c80`, format `0x871960`), the VM's own ([`mlua::benilla_lua::fmt_g14`]).
+/// `EditBox:SetNumber` (`0x798690`) formats through it too, being byte-identical to `SetText`
+/// (`0x7984c0`). The exponent has at least three digits: `1e20` prints `1e+020`.
 pub(crate) fn lua_number_text(v: f64) -> String {
-    if v.is_nan() {
-        // MSVC's own spellings, which are not "NaN".
-        return if v.is_sign_negative() {
-            "-1.#IND".into()
-        } else {
-            "1.#QNAN".into()
-        };
-    }
-    if v.is_infinite() {
-        return if v < 0.0 {
-            "-1.#INF".into()
-        } else {
-            "1.#INF".into()
-        };
-    }
-    if v == 0.0 {
-        // `%g` prints negative zero without the sign.
-        return "0".into();
-    }
-    const SIG: i32 = 14;
-    let exp = v.abs().log10().floor() as i32;
-    // Re-derive the exponent from the rounded form: 9.9999e2 rounds to 1e3 and changes style.
-    let exp = {
-        let probe = format!("{:.*e}", (SIG - 1) as usize, v);
-        probe
-            .rsplit('e')
-            .next()
-            .and_then(|e| e.parse::<i32>().ok())
-            .unwrap_or(exp)
-    };
-    // C's `%g` style rule verbatim: exponential when `exp < -4 || exp >= P`, else fixed.
-    if !(-4..SIG).contains(&exp) {
-        let mantissa = format!("{:.*e}", (SIG - 1) as usize, v);
-        let (m, _) = mantissa.split_once('e').unwrap_or((mantissa.as_str(), "0"));
-        let m = trim_g(m);
-        let sign = if exp < 0 { '-' } else { '+' };
-        // At least three exponent digits, more when needed.
-        format!("{m}e{sign}{:03}", exp.abs())
-    } else {
-        let decimals = (SIG - 1 - exp).max(0) as usize;
-        trim_g(&format!("{v:.decimals$}")).to_string()
-    }
+    mlua::benilla_lua::fmt_g14(v)
 }
 
-/// Strip `%g`'s trailing zeros, and the decimal point if nothing follows it.
-fn trim_g(s: &str) -> &str {
-    if !s.contains('.') {
-        return s;
-    }
-    s.trim_end_matches('0').trim_end_matches('.')
+/// The name an object without one prints as (`0x84c7f0`).
+pub(crate) const UNNAMED: &str = "<unnamed>";
+
+/// The `%s` a method's error line names: the object's own name, its vtable `+4` (`GetName`), or
+/// [`UNNAMED`] when that is NULL. Read off the model, never through a Lua `GetName` an addon can
+/// override. A frame, a region or a Font object; any other table is unnamed.
+pub(crate) fn object_name(model: &Model, this: &Table) -> String {
+    let name = match this.raw_get::<Value>(0) {
+        Ok(Value::LightUserData(l)) => {
+            let id = l.0 as usize as u32;
+            if let Some(&h) = model.id_to_frame.get(&id) {
+                model.arena.frame(h).and_then(|f| f.name.clone())
+            } else if let Some(&rh) = model.id_to_region.get(&id) {
+                model.arena.region(rh).and_then(|r| r.name.clone())
+            } else {
+                None
+            }
+        }
+        Ok(Value::Integer(_)) => {
+            super::font::id_of_table(model, this).and_then(|id| model.fonts.get(id).name.clone())
+        }
+        _ => None,
+    };
+    name.unwrap_or_else(|| UNNAMED.to_string())
+}
+
+/// [`object_name`] for a frame already resolved.
+pub(crate) fn frame_name(model: &Model, h: FrameHandle) -> String {
+    model
+        .arena
+        .frame(h)
+        .and_then(|f| f.name.clone())
+        .unwrap_or_else(|| UNNAMED.to_string())
+}
+
+/// [`object_name`] for a region already resolved.
+pub(crate) fn region_name(model: &Model, rh: RegionHandle) -> String {
+    model
+        .arena
+        .region(rh)
+        .and_then(|r| r.name.clone())
+        .unwrap_or_else(|| UNNAMED.to_string())
+}
+
+/// [`object_name`], borrowing the model; a caller holding a borrow uses that instead.
+pub(crate) fn name_of(lua: &Lua, this: &Table) -> String {
+    object_name(&lua.app_data_ref::<Model>().expect("model"), this)
+}
+
+/// `Usage: <name>:<line>`, the raise of a method whose format string is `Usage: %s:<line>`.
+pub(crate) fn usage(lua: &Lua, this: &Table, line: &str) -> mlua::Error {
+    mlua::Error::runtime(format!("Usage: {}:{line}", name_of(lua, this)))
+}
+
+/// A method's number argument: `is-number` (`0x6f34d0`) then `tonumber` (`0x6f3620`), so a
+/// numeric string passes, else the method's [`usage`] line naming `this`.
+pub(crate) fn method_number(lua: &Lua, this: &Table, v: Value, line: &str) -> mlua::Result<f64> {
+    lua.coerce_number(v)?.ok_or_else(|| usage(lua, this, line))
+}
+
+/// `SetOrientation`'s argument on the StatusBar and the Slider (`0x78f320`, `0x790610`): a
+/// `lua_isstring` value through the token parse `0x6f1a20`, `true` for VERTICAL. A non-string
+/// raises `Usage: %s:SetOrientation("orientation")` (`0x87b108`), a miss
+/// `%s:SetOrientation(): Unknown orientation: %s` (`0x87b130`), both naming `this`.
+pub(crate) fn orientation_arg(lua: &Lua, this: &Table, v: &Value) -> mlua::Result<bool> {
+    let Some(token) = optional_string(lua, v) else {
+        return Err(usage(lua, this, r#"SetOrientation("orientation")"#));
+    };
+    super::region::orientation(&token).ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "{}:SetOrientation(): Unknown orientation: {token}",
+            name_of(lua, this)
+        ))
+    })
 }
 
 /// Storm's `SStrToInt` (`0x64ac60`): an optional leading `-` (and no `+`), then the decimal digits
 /// up to the first other byte, with no whitespace skip; none is 0. The accumulator is a 32-bit
 /// register that wraps (`0x64ac98`-`0x64aca5`) and `neg` wraps too, so `"4294967297"` is 1.
-/// `RemoveChatWindowChannel` and `LeaveChannelByName` key on it (`0x49e880`), and the `item:` link
-/// fields and `SStrToFloat`'s exponent read it.
-pub(crate) fn s_str_to_int(s: &str) -> i64 {
+/// It is a CVar record's integer (`rec+0x28`, stored at `0x63e127`), which change callbacks and the
+/// glue read; `RemoveChatWindowChannel` and `LeaveChannelByName` key on it (`0x49e880`), and the
+/// `item:` link fields and `SStrToFloat`'s exponent read it.
+pub fn s_str_to_int(s: &str) -> i32 {
     let b = s.as_bytes();
     let (neg, mut i) = match b.first() {
         Some(b'-') => (true, 1),
@@ -211,7 +238,11 @@ pub(crate) fn s_str_to_int(s: &str) -> i64 {
         n = n.wrapping_mul(10).wrapping_add(i32::from(c - b'0'));
         i += 1;
     }
-    i64::from(if neg { n.wrapping_neg() } else { n })
+    if neg {
+        n.wrapping_neg()
+    } else {
+        n
+    }
 }
 
 /// Storm's `SStrToFloat` (`0x64aaa0`), which `EditBox:GetNumber` (`0x798790`) pushes: a prefix
@@ -237,7 +268,7 @@ pub(crate) fn s_str_to_int(s: &str) -> i64 {
 /// until it is stored, so an exponent past +-308 against a value that pulls it back in range
 /// (`"0.000...1e320"`) is reached here only by scaling in steps of 300 digits, which rounds more
 /// often; `"0e999"` is 0 as there, and only an exponent past +-4932 makes 0 * inf, NaN.
-pub(crate) fn s_str_to_float(s: &str) -> f64 {
+pub fn s_str_to_float(s: &str) -> f64 {
     let b = s.as_bytes();
     let at = |i: usize| b.get(i).copied().unwrap_or(0);
     let neg = at(0) == b'-';
@@ -268,7 +299,7 @@ pub(crate) fn s_str_to_float(s: &str) -> f64 {
         if at(i) == b'+' {
             i += 1;
         }
-        value = scale_by_pow10(value, s_str_to_int(&s[i..]) as i32);
+        value = scale_by_pow10(value, s_str_to_int(&s[i..]));
     }
     if neg {
         -value
@@ -318,22 +349,30 @@ fn scale_by_pow10(value: f64, exp: i32) -> f64 {
 /// So `"0"` is false and `"0.5"` goes by its first byte: the Interface panel passes its options
 /// the strings `"0"` and `"1"`.
 pub(crate) fn bool_or_default(v: Option<&Value>, default: bool) -> bool {
+    flag_or_default(v, i32::from(default)) != 0
+}
+
+/// `GetScriptFlagArg` (`0x6f1c10`) as its caller receives it: the same coercion as
+/// [`bool_or_default`], but the number arm returns the truncated integer itself (`0x6f1c46` calls
+/// `0x40a2b0` and returns, with no `!= 0`), so a caller that compares or stores the value sees a
+/// 2 as 2. A boolean, a string and a nil give 0 or 1, and every other type the raw `default`.
+pub(crate) fn flag_or_default(v: Option<&Value>, default: i32) -> i32 {
     let Some(v) = v else {
         return default; // LUA_TNONE
     };
     match v {
-        Value::Nil => false,
-        Value::Boolean(b) => *b,
+        Value::Nil => 0,
+        Value::Boolean(b) => i32::from(*b),
         Value::LightUserData(_) => default,
         // Truncated like `0x40a2b0` ([`ftol`]), which keeps only the low dword: 2^32 reads 0, and
         // an infinity or NaN too.
-        Value::Integer(i) => (*i as i32) != 0,
-        Value::Number(n) => ftol(*n) != 0,
+        Value::Integer(i) => *i as i32,
+        Value::Number(n) => ftol(*n),
         Value::String(s) => {
             // The keyword arm is also reached by every byte the remap table cannot index (and
             // by an empty string); a string it does not know takes `default`.
             let bytes = s.as_bytes();
-            crate::strings::keyword_bool(&bytes).unwrap_or(default)
+            crate::strings::keyword_bool(&bytes).map_or(default, i32::from)
         }
         _ => default,
     }
@@ -455,6 +494,23 @@ mod tests {
         for none in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 9.3e18, -9.3e18] {
             assert_eq!(ftol(none), 0, "{none}");
         }
+    }
+
+    /// `0x6f1c10` returns the truncated integer for a number (`0x6f1c46` returns `0x40a2b0`'s
+    /// result unchanged), 0 or 1 for a boolean or a string, and the raw default for the rest.
+    #[test]
+    fn flag_or_default_returns_the_number_itself() {
+        let lua = lua();
+        let st = |t: &str| Value::String(lua.create_string(t).unwrap());
+        assert_eq!(flag_or_default(Some(&Value::Number(2.9)), 0), 2);
+        assert_eq!(flag_or_default(Some(&Value::Number(-1.5)), 0), -1);
+        assert_eq!(flag_or_default(Some(&Value::Integer(7)), 0), 7);
+        assert_eq!(flag_or_default(Some(&Value::Boolean(true)), 0), 1);
+        assert_eq!(flag_or_default(Some(&Value::Nil), 5), 0);
+        assert_eq!(flag_or_default(None, 5), 5);
+        assert_eq!(flag_or_default(Some(&st("2")), 0), 1);
+        assert_eq!(flag_or_default(Some(&st("off")), 5), 0);
+        assert_eq!(flag_or_default(Some(&st("maybe")), 5), 5);
     }
 
     #[test]

@@ -35,13 +35,7 @@ pub(super) fn texture_object_arg(
     arg: &Table,
     method: &str,
 ) -> mlua::Result<RegionHandle> {
-    let who = {
-        let model = lua.app_data_ref::<Model>().expect("model app_data");
-        let name = super::object::frame_handle_of(lua, this)
-            .ok()
-            .and_then(|h| model.arena.frame(h).and_then(|f| f.name.clone()));
-        name.unwrap_or_else(|| "<unnamed>".to_string())
-    };
+    let who = super::binding_abi::name_of(lua, this);
     if decode_id(arg).is_err() {
         return Err(mlua::Error::runtime(format!(
             "{who}:{method}(): Couldn't find 'this' in texture"
@@ -180,19 +174,12 @@ pub(super) fn slot_arg(
         }
         _ => {}
     }
-    let who = {
-        let model = lua.app_data_ref::<Model>().expect("model app_data");
-        super::object::frame_handle_of(lua, this)
-            .ok()
-            .and_then(|h| model.arena.frame(h).and_then(|f| f.name.clone()))
-            .unwrap_or_else(|| "<unnamed>".to_string())
-    };
-    Err(mlua::Error::runtime(format!("Usage: {who}:{usage}")))
+    Err(super::binding_abi::usage(lua, this, usage))
 }
 
 /// A fresh anchorless Texture region of `owner` on `layer`, as the client builds the texture a
 /// path leg loads (`0x76fc40`) before it installs it as an object.
-pub(super) fn new_texture_region(
+fn new_texture_region(
     model: &mut Model,
     owner: crate::widget::FrameHandle,
     layer: crate::order::DrawLayer,
@@ -205,16 +192,32 @@ pub(super) fn new_texture_region(
     Some(rh)
 }
 
-/// `CSimpleTexture::SetTexture(path)` (`0x770200`) on a region: the file replaces a solid fill, and
-/// `""` clears the texture, which `QuestLogFrame.lua:165` relies on.
-pub(super) fn set_texture_path(model: &mut Model, rh: RegionHandle, path: &str) {
-    let set = if path.is_empty() {
-        super::texel::TexSet::None
-    } else {
-        super::texel::TexSet::File(path.to_string())
-    };
-    model.set_texel(rh, set);
-    model.note_art(rh);
+/// A widget's texture path leg (`SetStatusBarTexture` `0x783140`, `SetThumbTexture` `0x7897c0`, a
+/// ColorSelect marker `0x78b7b0`) over its current texture `existing`. That texture loads the path
+/// ([`paint::load_texture_name`]) and keeps its image when the load fails (`0x783165`). With none,
+/// a texture is built on `layer` (`0x76fc40`) and loaded, and one whose load fails is deleted with
+/// nothing installed (`0x7831b4` → `0x7831d9`, `0x789834` → `0x789849`, `0x78b824` → `0x78b837`);
+/// here the verdict comes first, so a failure builds nothing. `""` loads, as no image. Answers the
+/// texture built, for the caller to install.
+pub(super) fn load_path_leg(
+    model: &mut Model,
+    owner: crate::widget::FrameHandle,
+    existing: Option<RegionHandle>,
+    layer: crate::order::DrawLayer,
+    path: &str,
+) -> mlua::Result<Option<RegionHandle>> {
+    if let Some(rh) = existing {
+        paint::load_texture_name(model, rh, path, false);
+        return Ok(None);
+    }
+    let verdict = paint::texture_name_verdict(model, path);
+    if verdict == paint::FileLoad::Failed {
+        return Ok(None);
+    }
+    let rh = new_texture_region(model, owner, layer)
+        .ok_or_else(|| mlua::Error::runtime("stale frame handle"))?;
+    paint::apply_texture_name(model, rh, path, false, verdict);
+    Ok(Some(rh))
 }
 
 /// The loader's install of the texture a `<BarTexture>`, `<ThumbTexture>`, Button state-texture or
@@ -282,31 +285,60 @@ pub(super) fn clear_texture(model: &mut Model, rh: RegionHandle) {
     model.note_art(rh);
 }
 
-/// Apply the font parts an XML element supplies (`font=`, `<FontHeight>`, `outline=`), any of
-/// which may be absent. Not the `SetFont` binding: the reference applies XML fonts in `LoadXML`,
-/// and its `SetFont` requires a path and a height (`0x87c69c`). Each part is an explicit set, so it
-/// survives a change to the inherited font object; an empty `font=` keeps the inherited face.
-pub(crate) fn apply_font_parts(
+/// A FontString's XML font file (`font=`, its `<FontHeight>` and the flags word of `outline=` and
+/// `monochrome=`) through the string's own `SetFont` (`0x771214` → `0x7714f0`), not the Lua
+/// binding. The font it already holds, the path matched ignoring case, the height within 2⁻²² and
+/// the same flags, is a success that writes nothing (`0x771502`-`0x771541`); any other goes to the font
+/// load (`0x44d040`), whose failure writes nothing (`0x771575`), answered `false`. A success is an
+/// explicit set that clears the font bit (`0x77121d`), so it outlasts the followed font object's.
+pub(crate) fn load_xml_font_file(
     lua: &Lua,
     this: &Table,
-    path: Option<String>,
-    height: Option<f32>,
-    flags: Option<String>,
+    path: &str,
+    height: f32,
+    (outline, monochrome): (super::Outline, bool),
+) -> mlua::Result<bool> {
+    let rh = region_handle_of(lua, this)?;
+    let mut model = lua.app_data_mut::<Model>().expect("model");
+    let held = model.region_data.get(&rh).is_some_and(|d| {
+        d.font_path
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(path))
+            && d.font_height
+                .is_some_and(|h| (h - height).abs() < super::SAME_FONT_HEIGHT)
+            && (d.outline, d.monochrome) == (outline, monochrome)
+    });
+    if !held && !super::face_loads(&model, path) {
+        return Ok(false);
+    }
+    let d = model.region_data.entry(rh).or_default();
+    if !held {
+        d.font_path = Some(path.to_string());
+        d.font_height = Some(height);
+        d.outline = outline;
+        d.monochrome = monochrome;
+    }
+    d.font_mask.clear(super::FontMask::FONT);
+    model.touch_measure(rh);
+    Ok(true)
+}
+
+/// A FontString's XML `nonspacewrap` and `maxLines` (`0x77103f`-`0x7710cd`), each written only when
+/// the attribute is there, straight into its state: `maxLines` has no Lua verb in 1.12.
+pub(crate) fn apply_wrap_attrs(
+    lua: &Lua,
+    this: &Table,
+    non_space_wrap: Option<bool>,
+    max_lines: Option<u32>,
 ) -> mlua::Result<()> {
     let rh = region_handle_of(lua, this)?;
     let mut model = lua.app_data_mut::<Model>().expect("model");
     let d = model.region_data.entry(rh).or_default();
-    if let Some(p) = path.filter(|p| !p.is_empty()) {
-        d.font_path = Some(p);
-        d.font_explicit.face = true;
+    if let Some(on) = non_space_wrap {
+        d.non_space_wrap = on;
     }
-    if let Some(h) = height {
-        d.font_height = Some(h);
-        d.font_explicit.height = true;
-    }
-    if let Some(f) = flags {
-        d.outline = super::Outline::flags(&f);
-        d.font_explicit.outline = true;
+    if let Some(n) = max_lines {
+        d.max_lines = n;
     }
     model.touch_measure(rh);
     Ok(())
@@ -417,7 +449,11 @@ mod layout;
 mod paint;
 mod text;
 
-pub(crate) use paint::orientation;
+pub(crate) use paint::{
+    apply_texture_name, load_blend_mode, load_texture_file, load_texture_name, orientation,
+    texture_name_verdict, FileLoad,
+};
+pub(crate) use text::store_text_of;
 
 fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
     let m = lua.create_table()?;
@@ -460,17 +496,11 @@ fn install_region_methods(lua: &Lua) -> mlua::Result<()> {
         |lua, (this, want): (Table, Value)| {
             let rh = region_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            let want = match &want {
-                Value::String(s) => s.to_str()?.to_string(),
-                Value::Number(n) => n.to_string(),
-                Value::Integer(i) => i.to_string(),
-                _ => {
-                    let who = region_name_of(&model, decode_id(&this)?)
-                        .unwrap_or_else(|| "<unnamed>".to_string());
-                    return Err(mlua::Error::runtime(format!(
-                        "Usage: {who}:IsObjectType(\"TYPE\")"
-                    )));
-                }
+            let Some(want) = super::binding_abi::optional_string(lua, &want) else {
+                let who = super::binding_abi::region_name(&model, rh);
+                return Err(mlua::Error::runtime(format!(
+                    "Usage: {who}:IsObjectType(\"TYPE\")"
+                )));
             };
             let leaf = region_type_name(&model, rh);
             let hit = want.eq_ignore_ascii_case(leaf) || want.eq_ignore_ascii_case("Region");
@@ -705,9 +735,13 @@ pub(crate) fn free_regions(model: &mut Model, dying: &[RegionHandle]) {
     for &rh in dying {
         if let Some(data) = model.region_data.remove(&rh) {
             model.texels.release(data.tex);
+            // A dying FontString leaves its font's list (`0x773490` → `0x770c60(0)`).
+            if let Some(font) = data.font_object {
+                model.fonts.drop_region(font, rh);
+            }
         }
-        model.region_resolved.remove(&rh);
-        model.region_kept.remove(&rh);
+        model.region_rects.remove(&rh);
+        model.region_kept_rects.remove(&rh);
         let name = model.arena.region(rh).and_then(|r| r.name.clone());
         if let Some(id) = model.region_to_id.remove(&rh) {
             model.id_to_region.remove(&id);

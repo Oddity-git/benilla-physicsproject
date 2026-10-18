@@ -1,6 +1,7 @@
 //! The EditBox seam the host drives each frame: the advance-table round trip, the caret,
 //! selection and scroll geometry derived from it, and the clipboard pair.
 
+use crate::script::TextMeasure as _;
 use mlua::Lua;
 
 use crate::script::{types, Model, UiScript};
@@ -174,9 +175,8 @@ fn stale_advances(
     let wrap_width = multi_line
         .then(|| {
             model
-                .region_resolved
-                .get(&rh)
-                .or_else(|| model.resolved.get(&h))
+                .region_rect(rh)
+                .or_else(|| model.frame_rect(h))
                 .map(|r| r.right - r.left)
         })
         .flatten()

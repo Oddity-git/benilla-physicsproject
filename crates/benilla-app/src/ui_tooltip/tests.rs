@@ -998,6 +998,7 @@ fn the_mouseover_token_names_the_hovered_units_creature_type() {
         },
     );
     app.insert_resource(spells);
+    app.insert_resource(crate::target::CreatureTypes::korean_for_tests());
     let druid = app
         .world_mut()
         .spawn(ObjectStore(ObjectFields::from_pairs(&[
@@ -1013,7 +1014,7 @@ fn the_mouseover_token_names_the_hovered_units_creature_type() {
     };
 
     hover_unit(&mut app, druid, DRUID);
-    assert_eq!(creature_type(&mut app).as_deref(), Some("Beast"));
+    assert_eq!(creature_type(&mut app).as_deref(), Some("야수"));
     app.world_mut()
         .entity_mut(druid)
         .get_mut::<ObjectStore>()
@@ -1021,7 +1022,7 @@ fn the_mouseover_token_names_the_hovered_units_creature_type() {
         .0
         .merge(ObjectFields::from_pairs(&[(BYTES_1, 0)]));
     hover_unit(&mut app, druid, DRUID);
-    assert_eq!(creature_type(&mut app).as_deref(), Some("Humanoid"));
+    assert_eq!(creature_type(&mut app).as_deref(), Some("인간형"));
 }
 
 /// Once no unit wins the pick, `"mouseover"` names nobody: the publisher `0x492890` zeroes the pair
@@ -1121,6 +1122,7 @@ fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
     .add_systems(Update, feed_spell_tooltips);
 
     let mut script = UiScript::new().unwrap();
+    crate::ui_script::test_ui::load_tooltip_template(&script);
     script.set_pet_actions(
         true,
         true,
@@ -1149,6 +1151,7 @@ fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
             reagents: vec![],
             tools: vec![],
             spell_level: 0,
+            skill_line: None,
         }],
     }));
     // We target a mob that targets party1, whose list the VM holds by guid.
@@ -1178,7 +1181,7 @@ fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
         .run(
             r#"
             local a = CreateFrame("Button", "B"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-            CreateFrame("GameTooltip", "TT")
+            CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
             local function lines()
                 local t = {}
                 for i = 1, TT:NumLines() do t[i] = getglobal("TTTextLeft" .. i):GetText() end
@@ -1255,6 +1258,7 @@ fn the_feed_builds_the_pet_views_against_the_pet_and_rebuilds_them_on_its_level(
     index.0.insert(IMP, imp);
 
     let mut script = UiScript::new().unwrap();
+    crate::ui_script::test_ui::load_tooltip_template(&script);
     script.set_pet_actions(
         true,
         true,
@@ -1282,7 +1286,7 @@ fn the_feed_builds_the_pet_views_against_the_pet_and_rebuilds_them_on_its_level(
         .run(
             r#"
             local a = CreateFrame("Button", "B"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-            CreateFrame("GameTooltip", "TT")
+            CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
             function DESC(set) TT:SetOwner(B, "ANCHOR_RIGHT"); set(); return TTTextLeft2:GetText() end
             "#,
         )
@@ -1326,4 +1330,38 @@ fn the_feed_builds_the_pet_views_against_the_pet_and_rebuilds_them_on_its_level(
             Some("Stamina by 10.".to_string())
         )
     );
+}
+
+/// The build looks the hovered unit's name up with a callback (`GetUnitName`, `0x609210`, from
+/// `0x529fe0`) once per hover; the frames under that hover read. A refused name is asked again by
+/// the next hover onto the unit, once, and by no frame.
+#[test]
+fn a_refused_hover_name_is_asked_again_by_the_next_hover_only() {
+    let (mut app, _wolf, boar) = mouseover_app();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    app.insert_resource(NetCommands(tx));
+    const PLAYER: u64 = 0x42;
+    hover_unit(&mut app, boar, PLAYER);
+    assert!(matches!(
+        crate::query_cache::queries(&rx)[..],
+        [crate::net::ClientCommand::NameQuery { guid: PLAYER }]
+    ));
+    app.world_mut()
+        .resource_mut::<NameCache>()
+        .insert_player(PLAYER, String::new(), None);
+    for _ in 0..600 {
+        hover_unit(&mut app, boar, PLAYER);
+    }
+    assert!(crate::query_cache::queries(&rx).is_empty(), "no frame asks");
+    hover(&mut app, Hovered::default(), HoveredObject::default());
+    hover_unit(&mut app, boar, PLAYER);
+    assert_eq!(
+        crate::query_cache::queries(&rx).len(),
+        1,
+        "the new hover does"
+    );
+    for _ in 0..600 {
+        hover_unit(&mut app, boar, PLAYER);
+    }
+    assert!(crate::query_cache::queries(&rx).is_empty());
 }

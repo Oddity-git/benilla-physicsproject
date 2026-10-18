@@ -4,6 +4,7 @@ use super::*;
 use benilla_formats::{
     ItemDisplay, ItemDisplayCatalog, SpellDisplay, SPELL_ATTR_IS_TRADESKILL,
     SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_LEARN_PET_SPELL, SPELL_EFFECT_LEARN_SPELL,
+    SPELL_EFFECT_SKILL_STEP,
 };
 use benilla_protocol::messages::trainer_spell_state;
 use benilla_ui::script::TrainerTooltip;
@@ -23,6 +24,7 @@ fn probe_strings(key: &str) -> Option<String> {
         "TRADESKILL_SERVICE_STEP" => Some("<STEP>".into()),
         "TRADESKILL_SERVICE_LEARN" => Some("<LEARN>".into()),
         "KNOWN_TALENTS_HEADER" => Some("<KNOWN>".into()),
+        "INCREASE_POTENTIAL" => Some("Increases potential in %s by %d".into()),
         _ => None,
     }
 }
@@ -82,7 +84,7 @@ fn resolve_service(
             known,
             None,
             &deps.items,
-            &deps.commands,
+            Ask::New(&deps.commands),
             text,
             &probe_strings,
         )
@@ -114,7 +116,7 @@ fn snap(open: &TrainerOpen, spells: &SpellCatalog) -> Option<TrainerState> {
             &BTreeSet::new(),
             None,
             &deps.items,
-            &deps.commands,
+            Ask::New(&deps.commands),
             text,
             &probe_strings,
         )
@@ -168,7 +170,7 @@ fn icon_of(
         spells,
         icons.as_ref(),
         &deps.items,
-        &deps.commands,
+        Ask::New(&deps.commands),
     )
 }
 
@@ -198,6 +200,91 @@ fn trainer_icon_substitutes_the_product_only_at_a_tradeskill_trainer() {
 
     // A spell with no record: nil, where every failure ends (`0x4d911c`).
     assert_eq!(icon_of(&spells, TRAINER_TYPE_TRADESKILL, 999, true), None);
+}
+
+/// A skill-step wire spell is flagged for `IsTrainerServiceSkillStep` (`0x4d9dd0`, effect 44 in
+/// any slot) and carries `GetTrainerServiceStepIncrease`'s text (`0x4da030`): `INCREASE_POTENTIAL`
+/// over the first skill-step effect's line name and five times its step. A spell that lacks the
+/// effect, a step of 0 and a line with no row carry none; a service's group line name is the
+/// `SkillLine.dbc` row of its key.
+#[test]
+fn a_skill_step_service_carries_its_flag_its_increase_text_and_its_line_name() {
+    let step_spell = || SpellDisplay {
+        name: "Journeyman".into(),
+        effects: [0, SPELL_EFFECT_SKILL_STEP, 0],
+        ..Default::default()
+    };
+    let plain = SpellDisplay {
+        name: "Heroic Strike".into(),
+        ..Default::default()
+    };
+    let spells = SpellCatalog::from_displays_and_effects(
+        HashMap::from([
+            (7000, step_spell()),
+            (7001, step_spell()),
+            (7002, step_spell()),
+            (78, plain),
+        ]),
+        HashMap::from([
+            (
+                7000,
+                vec![LearnEffect::SkillStep {
+                    skill: 164,
+                    step: 150,
+                }],
+            ),
+            (
+                7001,
+                vec![LearnEffect::SkillStep {
+                    skill: 999,
+                    step: 150,
+                }],
+            ),
+            (
+                7002,
+                vec![LearnEffect::SkillStep {
+                    skill: 164,
+                    step: 0,
+                }],
+            ),
+        ]),
+    );
+    let lines = SkillLineCatalog::from_spell_lines([(78, 26)])
+        .with_line_names([(164, "Blacksmithing"), (26, "Arms")]);
+    let make = |spell: u32, trainer_type: u32| {
+        resolve_service(
+            &wire(spell, trainer_state(), 100, 1, 0),
+            trainer_type,
+            &spells,
+            Some(&lines),
+            &BTreeSet::new(),
+        )
+    };
+    fn trainer_state() -> u8 {
+        trainer_spell_state::GREEN
+    }
+    let step = make(7000, TRAINER_TYPE_TRADESKILL);
+    assert!(step.skill_step);
+    assert_eq!(
+        step.step_increase.as_deref(),
+        Some("Increases potential in Blacksmithing by 750")
+    );
+    // A tradeskill trainer keys its tree 1 or 2, which `SkillLine.dbc` lacks here.
+    assert_eq!(step.line_name, None);
+    // The line has no row, or the step is 0: no text, but still a step row.
+    for spell in [7001, 7002] {
+        let s = make(spell, TRAINER_TYPE_TRADESKILL);
+        assert!(s.skill_step, "{spell}");
+        assert_eq!(s.step_increase, None, "{spell}");
+    }
+    // A plain ability: neither, and its group's line name is the `SkillLine.dbc` row of its key.
+    let plain = make(78, 0);
+    assert!(!plain.skill_step);
+    assert_eq!(plain.step_increase, None);
+    assert_eq!(plain.group_key, 26);
+    assert_eq!(plain.line_name.as_deref(), Some("Arms"));
+    // A spell with no record is no step.
+    assert!(!make(31337, 0).skill_step);
 }
 
 #[test]
@@ -253,7 +340,7 @@ fn trainer_icon_is_nil_until_the_product_template_lands_and_asks_once() {
         &spells,
         Some(&icons),
         &deps.items,
-        &deps.commands,
+        Ask::New(&deps.commands),
     );
     assert_eq!(first, None, "no template yet → nil, not the wrapper's icon");
     assert_eq!(
@@ -268,7 +355,7 @@ fn trainer_icon_is_nil_until_the_product_template_lands_and_asks_once() {
         &spells,
         Some(&icons),
         &deps.items,
-        &deps.commands,
+        Ask::New(&deps.commands),
     );
     assert!(
         deps.queried_entries().is_empty(),
@@ -302,7 +389,7 @@ fn trainer_icon_on_real_data_reaches_for_the_crafted_item() {
         &spells,
         Some(&icons),
         &deps.items,
-        &deps.commands,
+        Ask::New(&deps.commands),
     );
     assert_eq!(
         icon, None,
@@ -316,7 +403,14 @@ fn trainer_icon_on_real_data_reaches_for_the_crafted_item() {
 
     // A class trainer with the same wire spell: the wrapper's own icon, not the recipe's.
     let deps = Deps::new();
-    let class_icon = service_icon(2756, 0, &spells, None, &deps.items, &deps.commands);
+    let class_icon = service_icon(
+        2756,
+        0,
+        &spells,
+        None,
+        &deps.items,
+        Ask::New(&deps.commands),
+    );
     assert_eq!(class_icon, wrapper_icon);
     assert_ne!(
         class_icon, recipe_icon,
@@ -371,7 +465,11 @@ fn display_name_is_the_wire_spell_not_the_taught_one() {
         &BTreeSet::new(),
     );
     assert_eq!(svc.name.as_deref(), Some("Apprentice Blacksmith"));
-    assert_eq!(svc.subtext.as_deref(), None);
+    assert_eq!(
+        svc.subtext.as_deref(),
+        Some(""),
+        "a rankless spell's NameSubtext is \"\" (0x4d8b84)"
+    );
     assert_ne!(
         spells.get(2020).map(|d| d.name.as_str()),
         spells.get(2018).map(|d| d.name.as_str()),
@@ -525,7 +623,7 @@ fn service_description_expands_the_wire_spells_own_text() {
                 0,
                 &spells,
                 &deps.items,
-                &deps.commands,
+                Ask::New(&deps.commands),
                 text,
             ),
             Some("Increases melee damage by 11.".into())
@@ -552,7 +650,7 @@ fn service_description_is_none_without_a_record_or_text() {
                     0,
                     &spells,
                     &deps.items,
-                    &deps.commands,
+                    Ask::New(&deps.commands),
                     text,
                 ),
                 None,
@@ -588,7 +686,7 @@ fn service_description_hops_to_the_taught_spell() {
                 0,
                 &spells,
                 &deps.items,
-                &deps.commands,
+                Ask::New(&deps.commands),
                 text,
             ),
             Some("Causes 10 threat.".into())
@@ -623,7 +721,7 @@ fn service_description_takes_the_recipes_product_text_verbatim() {
                 TRAINER_TYPE_TRADESKILL,
                 &spells,
                 &deps.items,
-                &deps.commands,
+                Ask::New(&deps.commands),
                 text,
             ),
             Some("Keeps $s1 for later.".into()),
@@ -655,7 +753,7 @@ fn service_description_skips_the_wire_text_for_a_used_mount_row() {
                 trainer_type,
                 &spells,
                 &deps.items,
-                &deps.commands,
+                Ask::New(&deps.commands),
                 text,
             )
         })
@@ -708,7 +806,7 @@ fn service_description_expands_against_the_pet_for_a_learn_pet_row() {
                 0,
                 &spells,
                 &deps.items,
-                &deps.commands,
+                Ask::New(&deps.commands),
                 text,
             ),
             Some("Causes 11 threat.".into()),
@@ -720,7 +818,7 @@ fn service_description_expands_against_the_pet_for_a_learn_pet_row() {
                 0,
                 &spells,
                 &deps.items,
-                &deps.commands,
+                Ask::New(&deps.commands),
                 text,
             ),
             Some("Causes 10 threat.".into()),
@@ -750,7 +848,7 @@ fn service_description_expands_z_to_the_bind_area() {
                     0,
                     &spells,
                     &deps.items,
-                    &deps.commands,
+                    Ask::New(&deps.commands),
                     text,
                 ),
                 Some(want.to_string())
@@ -808,7 +906,7 @@ fn service_description_on_real_data_reads_astral_recalls_bind_area() {
             &BTreeSet::new(),
             None,
             &deps.items,
-            &deps.commands,
+            Ask::New(&deps.commands),
             text,
             &probe_strings,
         )
@@ -882,7 +980,7 @@ fn service_description_on_real_data_reaches_for_the_recipes_product() {
                 TRAINER_TYPE_TRADESKILL,
                 &spells,
                 &deps.items,
-                &deps.commands,
+                Ask::New(&deps.commands),
                 text,
             )
         })
@@ -997,7 +1095,7 @@ fn tooltip_hops_to_the_taught_spell_where_the_icon_pins_the_wire() {
     // The icon law on the same row paints the wire spell's art.
     let deps = Deps::new();
     assert_eq!(
-        super::service_icon(100, 0, &spells, None, &deps.items, &deps.commands),
+        super::service_icon(100, 0, &spells, None, &deps.items, Ask::New(&deps.commands)),
         Some("WRAPPER".into()),
     );
 }
@@ -1509,4 +1607,99 @@ fn the_group_header_keys_resolve_in_the_real_global_strings() {
         let text = vm.lua().globals().get::<String>(key).unwrap_or_default();
         assert!(!text.is_empty(), "{key} missing");
     }
+}
+
+/// `OpenTrainer` (`0x4d8cf0`): the open window closes and `CMSG_TRAINER_LIST` goes out for the
+/// player's own guid (`TalkToTrainer`, `0x5df680`); with no player nothing happens at all
+/// (`0x4d8d24`), the open window included.
+#[test]
+fn open_trainer_closes_the_window_and_asks_for_the_players_own_list() {
+    const ME: u64 = 0x10;
+    const TRAINER: u64 = 0xF130_0000_4500_0001;
+    let run = |with_player: bool| {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<TrainerOpen>()
+            .add_systems(Update, drain_trainer);
+        app.insert_non_send_resource(UiScript::new().unwrap());
+        if with_player {
+            app.world_mut().spawn((Guid(ME), SelfPlayer));
+        }
+        app.world_mut()
+            .resource_mut::<TrainerOpen>()
+            .open(TRAINER, 0, Vec::new(), String::new());
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .run("OpenTrainer()")
+            .unwrap();
+        app.update();
+        let open = app.world().resource::<TrainerOpen>().trainer;
+        (open, rx.try_iter().collect::<Vec<_>>())
+    };
+    let (open, sent) = run(true);
+    assert_eq!(open, None, "the window closes");
+    assert!(
+        matches!(sent.as_slice(), [ClientCommand::TrainerList { trainer }] if *trainer == ME),
+        "{sent:?}"
+    );
+    let (open, sent) = run(false);
+    assert_eq!(open, Some(TRAINER), "no player: nothing happens");
+    assert!(sent.is_empty(), "no player, no request: {sent:?}");
+}
+
+/// The stock window calls `GetTrainerServiceIcon` at `TRAINER_SHOW` and `TRAINER_UPDATE`, which
+/// looks the product up with a callback (`0x4d9096`); the frames between ask only what the cache
+/// holds nothing for. A refused product is asked by no frame, and again by the trainer's next list.
+#[test]
+fn a_refused_product_is_asked_at_the_next_list_never_by_a_frame() {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut app = App::new();
+    app.add_message::<crate::net::FieldChanged>()
+        .insert_resource(NetCommands(tx))
+        .init_resource::<TrainerOpen>()
+        .init_resource::<TrainerErrors>()
+        .init_resource::<TrainerTooltipSubjects>()
+        .init_resource::<PlayerActions>()
+        .init_resource::<Items>()
+        .init_resource::<NameCache>()
+        .init_resource::<GuidIndex>()
+        .init_resource::<crate::ui_pet::PetBar>()
+        .init_resource::<crate::spell::SpellModifiers>()
+        .insert_resource(Spells {
+            catalog: icon_catalog(),
+            ..Spells::empty_for_tests()
+        })
+        .insert_resource(SkillLines {
+            catalog: benilla_formats::SkillLineCatalog::from_spell_lines([]),
+        })
+        .add_systems(Update, feed_trainer);
+    app.insert_non_send_resource(UiScript::new().unwrap());
+    let list = |app: &mut App| {
+        app.world_mut().resource_mut::<TrainerOpen>().open(
+            0xF130_0000_4500_0001,
+            TRAINER_TYPE_TRADESKILL,
+            vec![wire(100, trainer_spell_state::GREEN, 10, 1, 0)],
+            String::new(),
+        );
+    };
+    let product_asks = |rx: &crossbeam_channel::Receiver<ClientCommand>| {
+        crate::query_cache::queries(rx)
+            .iter()
+            .filter(|c| matches!(c, ClientCommand::ItemQuery { entry: 777, .. }))
+            .count()
+    };
+    list(&mut app);
+    app.update();
+    assert_eq!(product_asks(&rx), 1);
+    app.world_mut()
+        .resource_mut::<Items>()
+        .insert_template(777, None);
+    for _ in 0..600 {
+        app.update();
+    }
+    assert_eq!(product_asks(&rx), 0, "no frame asks the refusal");
+    list(&mut app);
+    app.update();
+    assert_eq!(product_asks(&rx), 1, "the next list does, once");
 }

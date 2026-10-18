@@ -44,9 +44,9 @@ pub struct Backdrop {
     /// `BackgroundInsets` (`+0x50..0x5c`).
     pub insets: Insets,
     /// The background's vertex colour (`+0x60`, `SetBackdropColor`).
-    pub bg_color: [f32; 4],
+    pub bg_color: crate::color::Rgba8,
     /// All 8 border pieces' vertex colour (`+0x64`, `SetBackdropBorderColor`).
-    pub border_color: [f32; 4],
+    pub border_color: crate::color::Rgba8,
 }
 
 impl Default for Backdrop {
@@ -59,8 +59,8 @@ impl Default for Backdrop {
             tile_size: 0.0,
             edge_size: DEFAULT_EDGE_SIZE,
             insets: Insets::default(),
-            bg_color: [1.0, 1.0, 1.0, 1.0],
-            border_color: [1.0, 1.0, 1.0, 1.0],
+            bg_color: crate::color::Rgba8::WHITE,
+            border_color: crate::color::Rgba8::WHITE,
         }
     }
 }
@@ -170,9 +170,10 @@ fn corner_uvs(edge: Edge) -> Uvs {
 /// The texcoords `0x77f0c0` runs for a frame `rect` on screen: the tiled background's, `None`
 /// when it stretches (no `SetTexCoord` call), and the four edge strips', which tile `run` periods
 /// between the corners. The divisors are the stored, unscaled sizes (`0x77f101 fdiv [esi+0x48]`,
-/// `0x77f195`), so a scaled frame repeats its art more or less often than at scale 1. All four
-/// arrays run `[TL, TR, BR, BL]`.
-fn run_uvs(bd: &Backdrop, rect: Rect, scale: f32) -> (Option<Uvs>, [Uvs; 4]) {
+/// `0x77f195`), so a scaled frame repeats its art more or less often than at scale 1. The
+/// background divides the frame's own rect (`0x77f18f`, `0x77f1af`), not its inset quad, so the
+/// tiles squeeze by the inset width over the frame width. All four arrays run `[TL, TR, BR, BL]`.
+fn run_uvs(bd: &Backdrop, rect: Rect) -> (Option<Uvs>, [Uvs; 4]) {
     let (l, r, b, t) = (rect.left, rect.right, rect.bottom, rect.top);
     let bg = (bd.has_bg() && bd.tile).then(|| {
         let period = if bd.tile_size != 0.0 {
@@ -180,10 +181,7 @@ fn run_uvs(bd: &Backdrop, rect: Rect, scale: f32) -> (Option<Uvs>, [Uvs; 4]) {
         } else {
             bd.edge_size
         };
-        let i = bd.insets;
-        let bg_w = (r - i.right * scale) - (l + i.left * scale);
-        let bg_h = (t - i.top * scale) - (b + i.bottom * scale);
-        let (wt, ht) = (bg_w / period, bg_h / period);
+        let (wt, ht) = ((r - l) / period, (t - b) / period);
         [[0.0, 0.0], [wt, 0.0], [wt, ht], [0.0, ht]]
     });
     // Run lengths clamp at 0 below two edges and never above.
@@ -234,7 +232,7 @@ pub(crate) fn pieces(frame: Rect, bd: &Backdrop, scale: f32) -> Vec<BackdropPiec
     let mut out = Vec::with_capacity(9);
     let e = bd.edge_size * scale;
     let (l, r, b, t) = (frame.left, frame.right, frame.bottom, frame.top);
-    let (bg_uvs, edge_uvs) = run_uvs(bd, frame, scale);
+    let (bg_uvs, edge_uvs) = run_uvs(bd, frame);
 
     if bd.has_bg() {
         // TOPLEFT, TOPRIGHT and BOTTOMLEFT place it; the BOTTOMRIGHT anchor is never read.
@@ -333,6 +331,7 @@ pub(crate) fn install(model: &mut Model, fh: FrameHandle, spec: Option<Backdrop>
                  layer: DrawLayer,
                  (anchors, size): PieceLayout,
                  texture: Option<String>,
+                 wrap: bool,
                  tex_coords: Option<TexCoords>|
      -> Option<RegionHandle> {
         // `0x76fc40(frame, layer, 1)`: a Texture on the frame, linked at the tail (`0x76a750`).
@@ -350,12 +349,27 @@ pub(crate) fn install(model: &mut Model, fh: FrameHandle, spec: Option<Backdrop>
             },
         );
         if let Some(path) = texture {
-            model.set_texel(rh, TexSet::File(path));
+            model.set_texel(
+                rh,
+                if wrap {
+                    TexSet::WrapFile(path)
+                } else {
+                    TexSet::File(path)
+                },
+            );
         }
         Some(rh)
     };
     if spec.has_bg() {
-        pieces[0] = build(model, DrawLayer::Background, bg_layout(&spec), bg_art, None);
+        // The background loads with the tile flag as its wrap flag (`0x77e9f1`).
+        pieces[0] = build(
+            model,
+            DrawLayer::Background,
+            bg_layout(&spec),
+            bg_art,
+            spec.tile,
+            None,
+        );
     }
     if spec.has_border() {
         for (k, edge) in EDGES.into_iter().enumerate() {
@@ -368,6 +382,9 @@ pub(crate) fn install(model: &mut Model, fh: FrameHandle, spec: Option<Backdrop>
                 DrawLayer::Border,
                 edge_layout(edge, spec.edge_size),
                 edge_art.clone(),
+                // A side loads with the wrap flag on, a corner with it off (`0x77ea9e`..`0x77ec9c`,
+                // `0x77ed94`..`0x77f09e`): the sides' strips run their texcoords past [0, 1].
+                !corner,
                 corner.then(|| TexCoords::Corners(corner_uvs(edge))),
             );
         }
@@ -384,7 +401,7 @@ pub(crate) fn install(model: &mut Model, fh: FrameHandle, spec: Option<Backdrop>
             ran_for: None,
         },
     );
-    if let Some(rect) = model.resolved.get(&fh).copied() {
+    if let Some(rect) = model.frame_rect(fh) {
         run_texcoords(model, fh, rect);
     }
 }
@@ -437,34 +454,28 @@ pub(crate) fn set_metrics(
     for rh in pieces.iter().flatten() {
         model.invalidate_region(*rh, true);
     }
-    if let Some(rect) = model.resolved.get(&fh).copied() {
+    if let Some(rect) = model.frame_rect(fh) {
         run_texcoords(model, fh, rect);
     }
 }
 
 /// `0x77f0c0` for frame `fh` at `rect`, from `install`.
 fn run_texcoords(model: &mut Model, fh: FrameHandle, rect: Rect) {
-    let scale = super::object::eff_scale(model, fh);
     let Model {
         backdrops,
         region_data,
         ..
     } = model;
     if let Some(inst) = backdrops.get_mut(&fh) {
-        rerun(inst, region_data, rect, scale);
+        rerun(inst, region_data, rect);
     }
 }
 
 /// `0x77f0c0`: the tiled background's and the edge strips' texcoords for a frame at `rect`, the
 /// corners' left as created, then both colours re-applied (`0x77f410`, `0x77f440`).
-fn rerun(
-    inst: &mut Installed,
-    region_data: &mut HashMap<RegionHandle, RegionData>,
-    rect: Rect,
-    scale: f32,
-) {
+fn rerun(inst: &mut Installed, region_data: &mut HashMap<RegionHandle, RegionData>, rect: Rect) {
     inst.ran_for = Some(rect);
-    let (bg, edges) = run_uvs(&inst.spec, rect, scale);
+    let (bg, edges) = run_uvs(&inst.spec, rect);
     if let (Some(rh), Some(uvs)) = (inst.bg(), bg) {
         if let Some(d) = region_data.get_mut(&rh) {
             d.tex_coords = Some(TexCoords::Corners(uvs));
@@ -493,7 +504,12 @@ fn paint(inst: &Installed, region_data: &mut HashMap<RegionHandle, RegionData>) 
 
 /// `SetBackdropColor` (`0x77f410`) or, with `border`, `SetBackdropBorderColor` (`0x77f440`): store
 /// the colour in the spec and tint that colour's pieces.
-pub(crate) fn set_color(model: &mut Model, fh: FrameHandle, border: bool, color: [f32; 4]) {
+pub(crate) fn set_color(
+    model: &mut Model,
+    fh: FrameHandle,
+    border: bool,
+    color: crate::color::Rgba8,
+) {
     let Model {
         backdrops,
         region_data,
@@ -521,15 +537,15 @@ pub(crate) fn set_color(model: &mut Model, fh: FrameHandle, border: bool, color:
 /// rect application `0x76b580` calls `0x77f0c0` (at `0x76b61e`); a move alone re-runs nothing.
 pub(crate) fn after_resolve(model: &mut Model) {
     let eps = model.size_eps();
+    let space = model.layout_space();
     let Model {
         backdrops,
-        resolved,
-        arena,
+        frame_rects,
         region_data,
         ..
     } = model;
     for (fh, inst) in backdrops.iter_mut() {
-        let Some(&rect) = resolved.get(fh) else {
+        let Some(rect) = frame_rects.get(fh).map(|&r| space.rect_to_root(r)) else {
             continue;
         };
         if inst
@@ -538,13 +554,7 @@ pub(crate) fn after_resolve(model: &mut Model) {
         {
             continue;
         }
-        // `eff_scale`'s guard: a zero scale lays out at 1.
-        let scale = arena
-            .frame(*fh)
-            .map(|f| f.effective_scale)
-            .filter(|s| s.abs() >= 1e-6)
-            .unwrap_or(1.0);
-        rerun(inst, region_data, rect, scale);
+        rerun(inst, region_data, rect);
     }
 }
 
@@ -584,9 +594,12 @@ mod tests {
         assert_eq!(bg.corners[1], [195.0, 95.0]); // TR
         assert_eq!(bg.corners[2], [195.0, 5.0]); // BR
         assert_eq!(bg.corners[3], [5.0, 5.0]); // BL
+
+        // The span divides the frame's 200×100, not the 190×90 quad (`0x77f18f`): 12.5 tiles
+        // across the inset quad, each squeezed to 190/200 of its period.
         assert_eq!(bg.uvs[0], [0.0, 0.0]);
-        assert!((bg.uvs[1][0] - 190.0 / 16.0).abs() < 1e-4);
-        assert!((bg.uvs[2][1] - 90.0 / 16.0).abs() < 1e-4);
+        assert!((bg.uvs[1][0] - 200.0 / 16.0).abs() < 1e-4);
+        assert!((bg.uvs[2][1] - 100.0 / 16.0).abs() < 1e-4);
 
         // Border pieces 1 to 8: LEFT, RIGHT, TOP, BOTTOM, TL, TR, BL, BR, flush inside the frame.
         let left = ps[1];
@@ -673,8 +686,8 @@ mod tests {
     }
 
     /// A half-scale frame: the geometry halves, but `0x77f0c0` divides the scaled rect by the
-    /// unscaled sizes, so a 100-wide (on screen) edge repeats `100/16 - 2` times and the 96-wide
-    /// background `96/16` times.
+    /// unscaled sizes, so a 100-wide (on screen) edge repeats `100/16 - 2` times and the
+    /// background, over the same 100×50 frame rect, `100/16` by `50/16` times.
     #[test]
     fn a_scaled_frames_texcoords_repeat_by_the_unscaled_sizes() {
         let frame = Rect::new(0.0, 0.0, 50.0, 100.0);
@@ -682,7 +695,7 @@ mod tests {
         let ps = pieces(frame, &bd, 0.5);
         let bg = ps[0];
         assert_eq!(bg.corners[0], [2.0, 48.0], "inset 4 units, 2 on screen");
-        assert_eq!(bg.uvs[2], [6.0, 46.0 / 16.0]);
+        assert_eq!(bg.uvs[2], [100.0 / 16.0, 50.0 / 16.0]);
         // TOP, slice 2, rotated: `u` holds the run.
         let top = ps[3];
         assert_eq!(top.corners[0][1], 50.0);

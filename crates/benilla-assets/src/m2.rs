@@ -24,6 +24,7 @@ use crate::model::{
     arm_subtree_roots, billboard_info, build_animation_clip, build_attachments, build_global_bones,
     build_grip_clip, build_skeleton, finger_subtree_roots, in_subtree, skeleton_pivots,
     upper_subtree_root, AnimClip, ModelAnimations, ModelAttachment, ModelSkeleton, ModelSubmesh,
+    Stage1,
 };
 
 /// A loaded M2: its batches, bounds, collision hull, rig, animations, effects and cameras.
@@ -64,11 +65,6 @@ pub struct M2Model {
     /// The camera table's first record, the glue scenes' `Model:SetCamera(0)`; their
     /// `cameraLookup[0]` is the `0xffff` none sentinel.
     pub camera0: Option<PortraitCamera>,
-    /// The camera table's second record, which a `<PlayerModel>` (paper doll, inspect, pet page)
-    /// renders through: raw index 1, not through `cameraLookup` (`0x505b30`, chooser `0x505890`,
-    /// frozen at `0x7acf10`). `None` with fewer than two cameras, where the reference builds a
-    /// fixed camera.
-    pub pane_camera: Option<PortraitCamera>,
     /// The whole camera table by raw index, for `SetCamera(n)`; an index past its end leaves the
     /// pane on the orthographic leg.
     pub cameras: Vec<PaneCamera>,
@@ -189,15 +185,10 @@ fn idle_pose_differs(anim: &benilla_formats::ModelAnimation) -> bool {
     !anim.is_rest_pose()
 }
 
-/// A model path inside an M2 record (`.mdx`/`.mdl`, backslashes) as its `mpq://….m2` URL.
+/// A model path inside an M2 record as its URL: an emitter's child model is created with flags 0
+/// (`0x7b1c99`, `0x7b5da7`), off the archives, under the cache's extension rule.
 fn m2_dep_url(raw: &str) -> String {
-    let p = raw.to_ascii_lowercase().replace('\\', "/");
-    let stem = p
-        .strip_suffix(".mdx")
-        .or_else(|| p.strip_suffix(".mdl"))
-        .or_else(|| p.strip_suffix(".m2"))
-        .unwrap_or(&p);
-    format!("mpq://{stem}.m2")
+    crate::m2_url(raw)
 }
 
 /// One ribbon emitter, riding its bone like [`ModelEmitter::bone_pivot`] (`0x718960`).
@@ -260,16 +251,38 @@ impl AssetLoader for M2ModelLoader {
             .ok()
             .filter(|c| !c.is_empty());
 
+        // The textures open as the model did (`0x71da64` pushes the model's own flag).
+        let source = match ctx.path().source() {
+            bevy::asset::io::AssetSourceId::Name(name) if &**name == crate::MPQ_LOOSE_SOURCE => {
+                crate::MPQ_LOOSE_SOURCE
+            }
+            _ => crate::MPQ_SOURCE,
+        };
         let mut submeshes = Vec::with_capacity(subs.len());
         for sub in subs {
             // The URL is lowercased, since Bevy matches the `blp` extension case-sensitively, and
             // carries the wrap modes, since two modes of one texture are two uploads.
-            let texture = sub
-                .texture
-                .as_deref()
-                .map(|t| ctx.load::<Image>(crate::texture_url(t, (sub.wrap_x, sub.wrap_y))));
+            let texture = sub.texture.as_deref().map(|t| {
+                ctx.load::<Image>(crate::texture_url_on(source, t, (sub.wrap_x, sub.wrap_y)))
+            });
+            // Stage 1 at the generated coordinate, the only kind a stock unit authors. Not built: a
+            // stage 1 reading the vertex's second UV set, which the mesh does not carry; such a
+            // unit draws its stage 0 alone.
+            let stage1 = sub.stage1.as_ref().filter(|s| s.env_map).and_then(|s| {
+                let t = s.texture.as_deref()?;
+                Some(Stage1 {
+                    texture: ctx.load::<Image>(crate::texture_url_on(
+                        source,
+                        t,
+                        (s.wrap_x, s.wrap_y),
+                    )),
+                    combine: s.combine,
+                })
+            });
             submeshes.push(ModelSubmesh {
                 texture,
+                stage1,
+                combine: Some(sub.combine),
                 skin_slot: sub.skin_slot,
                 geoset_id: sub.geoset_id,
                 char_slot: sub.char_slot,
@@ -492,6 +505,10 @@ impl AssetLoader for M2ModelLoader {
                     let clip = ctx.add_labeled_asset(format!("clip{i}"), clip);
                     let node = graph.add_clip(clip.clone(), 1.0, root);
                     pose.set_node(node, pose_idx, 0);
+                    // The key bone's blend slot keeps the outgoing sequence on its own clock
+                    // (`0x7125ea`), and it can be the sequence the primary re-arms.
+                    let blend_node = graph.add_clip(clip.clone(), 1.0, root);
+                    pose.set_node(blend_node, pose_idx, 0);
                     // The sheath family (89/90) gets per-arm masked nodes.
                     let arm_nodes =
                         (matches!(anim.anim_id, 89 | 90) && arm_roots.is_some()).then(|| {
@@ -514,6 +531,7 @@ impl AssetLoader for M2ModelLoader {
                         anim_id: anim.anim_id,
                         seq_index: anim.seq_index,
                         node,
+                        blend_node: Some(blend_node),
                         looping: anim.looping,
                         duration: anim.duration,
                         move_speed: anim.move_speed,
@@ -624,7 +642,6 @@ impl AssetLoader for M2ModelLoader {
         };
         let portrait_camera = parse_m2_portrait_camera(&bytes).map(to_bevy);
         let camera0 = benilla_formats::parse_m2_camera(&bytes, 0).map(to_bevy);
-        let pane_camera = benilla_formats::parse_m2_camera(&bytes, 1).map(to_bevy);
         let cameras: Vec<PaneCamera> = benilla_formats::parse_m2_pane_cameras(&bytes)
             .into_iter()
             .map(|c| PaneCamera {
@@ -664,7 +681,6 @@ impl AssetLoader for M2ModelLoader {
             markers,
             portrait_camera,
             camera0,
-            pane_camera,
             cameras,
             string_anchors,
             cch_marker,

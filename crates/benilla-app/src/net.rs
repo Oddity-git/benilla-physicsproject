@@ -6,7 +6,7 @@
 //! It runs in [`WorldStage::Net`], before `Input`, so a server teleport snaps, streams and covers
 //! in one frame. Coordinates cross from WoW into Bevy space here (`wow_to_bevy`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use benilla_protocol::{
@@ -22,7 +22,7 @@ use benilla_world::schedule::WorldStage;
 mod apply;
 pub(crate) mod handlers;
 pub(crate) mod io;
-mod motion;
+pub(crate) mod motion;
 mod objects;
 pub(crate) use objects::tear_down;
 mod session;
@@ -41,13 +41,9 @@ use motion::{
 // `pub(crate)`: `creature_anim` reads the shuffle latch it produces, and a test runs both.
 pub(crate) use motion::drive_display_facing;
 pub(crate) use motion::{
-    ground_derived, grounded_y, jump_seed, CreatureSwimming, FacingStep, RemoteMotion, Spline,
-    SplineStopped, UnitMoveModes,
+    grounded_y, jump_seed, CreatureSwimming, FacingStep, RemoteMotion, Spline, SplineStopped,
+    UnitMoveModes,
 };
-// Only the ground-census probe reads this, so a build without the instruments leaves it unused.
-// Not a `cfg`: seam knowledge lives in three fixed places, and this file is not one of them.
-#[allow(unused_imports)]
-pub(crate) use motion::GroundClamped;
 
 /// The net subsystem: spawns the background IO threads and drives the per-frame event drain.
 pub(crate) struct NetPlugin {
@@ -84,13 +80,13 @@ impl Plugin for NetPlugin {
             .insert_resource(NetCommands(handles.commands))
             .insert_resource(CharPick(handles.pick))
             .insert_resource(RealmChoice(handles.realm))
-            .insert_resource(RosterPolicy(handles.screen_asks_roster))
             .insert_resource(LoginSubmit(handles.login))
             .insert_resource(LoginAbandon(handles.login_abandon))
             .insert_resource(PingShared(handles.ping))
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
             .init_resource::<AddonInfoReply>()
+            .init_resource::<SessionBilling>()
             .init_resource::<PendingTransfer>()
             .init_resource::<NetStatus>()
             .init_resource::<DroppedOpcodes>()
@@ -106,6 +102,8 @@ impl Plugin for NetPlugin {
             .init_resource::<crate::world_state::WorldStates>()
             .add_message::<TeleportMessage>()
             .add_message::<FieldChanged>()
+            .add_message::<crate::item_watch::ItemNotice>()
+            .add_message::<crate::field_watch::FieldNotice>()
             .add_message::<SelfMoveMessage>()
             .add_message::<SpeedChangeMessage>()
             .add_message::<ClientControlMessage>()
@@ -140,6 +138,9 @@ impl Plugin for NetPlugin {
                     apply_net_updates,
                     tag_self_player,
                     enter_world_on_self_create,
+                    // The create gives control back (`0x5deb56`), in the Net stage ahead of
+                    // `control`'s read of the flags.
+                    crate::player::regain_control_on_arrival.in_set(crate::player::ControlRestore),
                     sample_splines,
                     // Swim state from the water at the feet (the wire never carries it for
                     // creatures), before the clamp so a swimmer is exempt the same frame.
@@ -284,24 +285,6 @@ impl FieldChanged {
     }
 }
 
-/// The field edges one feed saw this run, by guid and index: the reference fans a moved field out
-/// to every unit token naming the unit (`0x515e50`).
-#[derive(Default)]
-pub(crate) struct FieldEdges(HashSet<(u64, u16)>);
-
-impl FieldEdges {
-    pub fn collect(reader: &mut MessageReader<FieldChanged>) -> Self {
-        Self(reader.read().map(|e| (e.guid, e.index)).collect())
-    }
-    pub fn moved(&self, guid: u64, index: u16) -> bool {
-        self.0.contains(&(guid, index))
-    }
-    #[cfg(test)]
-    pub fn of(edges: &[(u64, u16)]) -> Self {
-        Self(edges.iter().copied().collect())
-    }
-}
-
 /// Merge a descriptor update into a store and emit its [`FieldChanged`] edges; the drain and the
 /// test harness share it.
 pub(crate) fn merge_store_fields(
@@ -380,12 +363,11 @@ pub(crate) struct ActiveMover;
 pub(crate) struct NetEvents(Receiver<SessionEvent>);
 
 /// The outbound command channel.
-#[derive(Resource)]
+#[derive(Resource, Debug)]
 pub(crate) struct NetCommands(pub(crate) Sender<ClientCommand>);
 
 /// The character-select channel to the IO thread parked at select: create and delete are served
-/// in place, re-emitting the roster (under the native policy), until an [`CharRequest::Enter`]
-/// moves into the world.
+/// in place until an [`CharRequest::Enter`] moves into the world.
 #[derive(Resource)]
 pub(crate) struct CharPick(pub(crate) ParkSender<CharRequest>);
 
@@ -486,14 +468,6 @@ pub(crate) enum CharRequest {
     Enumerate,
 }
 
-/// Whether the screen asks for its roster (the stock glue screens' `GetCharacterListUpdate`)
-/// instead of the IO thread fetching it on reaching the character park (the native screens'). Set
-/// by the UI session as it installs the VM that runs: true with the stock glue VM up, false
-/// otherwise, so a run whose stock VM did not build still gets its roster. The IO thread reads it
-/// as each park is entered.
-#[derive(Resource, Clone)]
-pub(crate) struct RosterPolicy(pub(crate) std::sync::Arc<std::sync::atomic::AtomicBool>);
-
 /// The realm channel: the answer to each [`RealmListMessage`]. Two parks listen, the login-side
 /// one and the character one, since the reference's realm list is a dialog over either screen
 /// (`RealmList.xml` is `frameStrata="DIALOG"`).
@@ -525,7 +499,7 @@ pub(crate) enum RealmRequest {
     Leave,
 }
 
-/// The credentials channel to the IO thread's pre-logon park, sent by [`crate::login`].
+/// The credentials channel to the IO thread's pre-logon park, sent by [`crate::glue_session::login`].
 #[derive(Resource)]
 pub(crate) struct LoginSubmit(pub(crate) Sender<io::LoginRequest>);
 
@@ -564,11 +538,15 @@ impl Objects<'_, '_> {
 
     /// A streamed object's merged descriptor fields, found as `0x468460` does, by guid.
     pub fn object(&self, guid: u64) -> Option<&ObjectFields> {
+        self.store(guid).map(|s| &s.0)
+    }
+
+    /// [`Self::object`] with its component.
+    pub(crate) fn store(&self, guid: u64) -> Option<&ObjectStore> {
         self.index
             .0
             .get(&guid)
             .and_then(|&e| self.stores.get(e).ok())
-            .map(|s| &s.0)
     }
 
     /// Every streamed object, items included.
@@ -655,15 +633,32 @@ pub(crate) struct WallClockSample {
     /// The server's `time(nullptr)` at `received`.
     base_unix: u32,
     received: Instant,
+    /// The responses of the session so far, this one included.
+    count: u64,
+    /// Whether the local clock read the server's second exactly, where the reference's offset
+    /// `G = local - server` would be 0 and is stored as 1 (`0x4def00`, `0x4def02`).
+    zero_offset: bool,
 }
 
 impl ServerWallClock {
     /// Take a fresh sample; it reads about RTT/2 behind, below a countdown's one-second grain.
-    pub(crate) fn sample(&mut self, unix_time: u32) {
+    pub(crate) fn sample(&mut self, unix_time: u32, local_unix: i64) {
         self.0 = Some(WallClockSample {
             base_unix: unix_time,
             received: Instant::now(),
+            count: self.samples() + 1,
+            zero_offset: local_unix == i64::from(unix_time),
         });
+    }
+
+    /// Whether the last sample found the local clock on the server's second (`0x4def02`).
+    pub(crate) fn zero_offset(&self) -> bool {
+        self.0.is_some_and(|s| s.zero_offset)
+    }
+
+    /// The responses sampled so far.
+    pub(crate) fn samples(&self) -> u64 {
+        self.0.map_or(0, |s| s.count)
     }
 
     /// Server unix seconds now, fractional.
@@ -1297,6 +1292,25 @@ pub(crate) enum ClientCommand {
     },
     /// `CMSG_GMTICKET_GETTICKET`: `GetGMTicket()`.
     GmTicketGet,
+    /// `CMSG_SKILL_BUY_STEP`: `BuySkillTier`, the skill line id.
+    SkillBuyStep {
+        skill_id: u32,
+    },
+    /// `CMSG_LOTTERY_QUERY_OBSOLETE`: `GetLastLotteryNumbers()`.
+    LotteryQuery,
+    /// `CMSG_BUY_LOTTERY_TICKET_OBSOLETE`: `BuyRandomPicks` is `(count, 0)`, `SubmitNumbers`
+    /// `(0, mask)`.
+    BuyLotteryTicket {
+        first: u32,
+        second: u32,
+    },
+    /// `CMSG_GMSURVEY_SUBMIT`: `GMSurveySubmit()`, the survey id, each answered question as
+    /// `(question id, rating, comment)` and the overall comment.
+    GmSurveySubmit {
+        survey: u32,
+        answers: Vec<(u32, u8, String)>,
+        comment: String,
+    },
     /// `CMSG_GMTICKET_DELETETICKET`.
     GmTicketDelete,
     /// `CMSG_GMTICKET_SYSTEMSTATUS`: `GetGMStatus()`.
@@ -1964,6 +1978,11 @@ pub(crate) enum ClientCommand {
         slots: [u32; 3],
         comment: String,
     },
+    /// `MSG_LOOKING_FOR_GROUP`: `LFGQuery`'s inquiry.
+    LfgQuery {
+        criterion: u32,
+        class: u32,
+    },
     /// `CMSG_DEL_FRIEND`.
     DelFriend {
         guid: u64,
@@ -2146,8 +2165,7 @@ pub(crate) struct RealmListMessage {
     pub(crate) failed: bool,
 }
 
-/// The character roster (`SMSG_CHAR_ENUM`); the IO thread waits for [`crate::char_select`] to
-/// pick. `realm` is the realm this session connected to.
+/// The character roster (`SMSG_CHAR_ENUM`); the IO thread waits for the select screen to pick. `realm` is the realm this session connected to.
 #[derive(Message)]
 pub(crate) struct CharListMessage {
     pub(crate) characters: Vec<benilla_protocol::Character>,
@@ -2156,8 +2174,6 @@ pub(crate) struct CharListMessage {
     pub(crate) cause: benilla_protocol::RosterCause,
     /// The world session that sent it ([`WorldAuthMessage::epoch`]).
     pub(crate) epoch: u64,
-    /// The abandon generation of the attempt that dialed that session.
-    pub(crate) generation: u64,
 }
 
 /// The world server accepted the authentication: the world connect to `realm` is done and the IO
@@ -2203,7 +2219,7 @@ pub(crate) struct CharRenameMessage {
 }
 
 /// `SMSG_CHARACTER_LOGIN_FAILED`: the picked character was refused. `result` is the raw reason,
-/// read by [`crate::char_select::char_login_refusal_text`].
+/// read by the glue manager ([`crate::ui_script::glue_mgr`]).
 #[derive(Message, Clone, Copy)]
 pub(crate) struct CharacterLoginFailedMessage {
     pub(crate) result: u8,
@@ -2212,8 +2228,6 @@ pub(crate) struct CharacterLoginFailedMessage {
 /// We entered the world.
 #[derive(Message)]
 pub(crate) struct EnteredWorldMessage {
-    /// Rested billing minutes from `SMSG_AUTH_RESPONSE`, the only time they arrive.
-    pub(crate) billing_time_rested: u32,
     /// The tutorial flags, if `SMSG_TUTORIAL_FLAGS` came during the login handshake.
     pub(crate) tutorial_flags: Option<Vec<u8>>,
 }
@@ -2229,6 +2243,12 @@ pub(crate) struct WorldEnterCascadeMessage;
 /// rewritten on every login from the reply its link got.
 #[derive(Resource, Default)]
 pub(crate) struct AddonInfoReply(pub(crate) Option<Vec<benilla_protocol::messages::AddonRecord>>);
+
+/// The connection's billing group, from its authentication alone (`0x5b41b0`); a resource for the
+/// same reason as [`AddonInfoReply`], rewritten at every login. The in-game `GetBillingTimeRested`
+/// and [`crate::ui_billing`]'s warning read it.
+#[derive(Resource, Default, Clone, Copy)]
+pub(crate) struct SessionBilling(pub(crate) benilla_protocol::messages::Billing);
 
 /// `SMSG_TRIGGER_CINEMATIC`: a `CinematicSequences.dbc` id; [`crate::cinematic`] plays and acks it.
 #[derive(Message)]
@@ -2290,16 +2310,11 @@ impl DisconnectedMessage {
 }
 
 /// A login attempt failed before the roster; the IO thread is back at its pre-logon park.
-/// `terminal` is a failure retrying cannot fix (the server requires Warden, say): never resubmit.
 #[derive(Message, Clone)]
 pub(crate) struct LoginFailedMessage {
     /// Which server refused us, with which byte; `None` on a transport failure.
     pub(crate) refusal: Option<benilla_protocol::LoginRefusal>,
     pub(crate) reason: String,
-    pub(crate) terminal: bool,
-    /// The dial that never opened a socket, so the screen can tell an unknown name from a host
-    /// that does not answer.
-    pub(crate) dial: Option<benilla_protocol::DialFailure>,
 }
 
 /// A same-map teleport of our player: snap, then ack. Read by the controller in `Input`.

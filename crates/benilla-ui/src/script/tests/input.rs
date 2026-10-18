@@ -233,8 +233,8 @@ fn hit_rect_insets_shrink_the_mouse_rect_only() {
     .unwrap();
     s.resolve();
 
-    assert_eq!(s.eval::<f64>("return A:GetHeight()").unwrap(), 100.0);
-    assert_eq!(s.eval::<f64>("return A:GetTop()").unwrap(), 100.0);
+    crate::assert_near!(s.eval::<f64>("return A:GetHeight()").unwrap(), 100.0);
+    crate::assert_near!(s.eval::<f64>("return A:GetTop()").unwrap(), 100.0);
 
     assert!(
         s.hit_test(50.0, 90.0).is_none(),
@@ -287,7 +287,7 @@ fn hit_rect_insets_default_to_zero() {
 }
 
 #[test]
-fn the_mouse_wheel_flag_round_trips_and_the_scrolling_kinds_are_born_enabled() {
+fn the_mouse_wheel_flag_round_trips_and_only_the_world_frame_is_born_enabled() {
     let s = script();
     s.run(
         r#"
@@ -298,15 +298,15 @@ fn the_mouse_wheel_flag_round_trips_and_the_scrolling_kinds_are_born_enabled() {
     )
     .unwrap();
 
-    // A plain frame is born wheel-disabled, as in the reference; the two scrolling kinds' own
-    // constructors enable it.
-    assert!(!s
-        .eval::<bool>("return Plain:IsMouseWheelEnabled()")
-        .unwrap());
-    assert!(s
-        .eval::<bool>("return Scroll:IsMouseWheelEnabled()")
-        .unwrap());
-    assert!(s.eval::<bool>("return Msg:IsMouseWheelEnabled()").unwrap());
+    // Every frame is born wheel-disabled, the scrolling kinds included: their constructors enable
+    // nothing (`0x786a40`, `0x787670`), and only the world frame's does (`0x481b1f`).
+    for f in ["Plain", "Scroll", "Msg"] {
+        assert!(
+            !s.eval::<bool>(&format!("return {f}:IsMouseWheelEnabled()"))
+                .unwrap(),
+            "{f}"
+        );
+    }
 
     s.run("Plain:EnableMouseWheel(true)").unwrap();
     assert!(s
@@ -589,8 +589,7 @@ fn the_unfired_script_kinds_still_raise_rather_than_silently_accepting() {
     for name in [
         // A 2.0 secure-frame slot; no 1.12 resolver has it.
         "OnAttributeChanged",
-        // Real 1.12 slots that benilla does not fire.
-        "OnMessageScrollChanged",
+        // A real 1.12 slot that benilla does not fire.
         "OnInputLanguageChanged",
     ] {
         let err = s

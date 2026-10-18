@@ -54,6 +54,7 @@ fn inventory_with_head_item() -> InventorySlots {
     slots[1] = Some(InvSlotView {
         duration_ms: None,
         already_bound: false,
+        occupied_seats: None,
         bonding: 0,
         use_spell: 0,
         use_fork: Default::default(),
@@ -71,7 +72,11 @@ fn inventory_with_head_item() -> InventorySlots {
         guid: 0x70e,
         equip_slots: vec![1],
         creator: None,
+        gift_creator: None,
+        creator_guid: 0,
+        gift_creator_guid: 0,
         enchants: Vec::new(),
+        spell_0: false,
     });
     slots
 }
@@ -87,6 +92,7 @@ fn backpack_with_fitting_helm() -> benilla_ui::script::ContainerState {
             duration_ms: None,
             petition: None,
             already_bound: false,
+            occupied_seats: None,
             bonding: 0,
             use_spell: 0,
             bar_placeable: true,
@@ -103,8 +109,12 @@ fn backpack_with_fitting_helm() -> benilla_ui::script::ContainerState {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     benilla_ui::script::ContainerState {
@@ -464,7 +474,7 @@ fn clicking_an_occupied_doll_slot_picks_it_up_and_locks_it() {
     s.resolve();
     let head_icon_dim = s.extract().iter().any(|q| {
         matches!(&q.content, QuadContent::Texture { path: Some(p), color: Some(c), desaturated, .. }
-            if p.contains("INV_Helmet_01") && *desaturated && c[0] == 0.5 && c[1] == 0.5 && c[2] == 0.5)
+            if p.contains("INV_Helmet_01") && *desaturated && c[..3] == benilla_ui::color::quant::drawn([0.5, 0.5, 0.5, 1.0])[..3])
     });
     assert!(head_icon_dim, "the picked slot's icon dims");
 
@@ -617,7 +627,7 @@ fn broken_equipped_item_tints_its_doll_slot_red() {
             _ => None,
         })
     }
-    let red = [0.9, 0.0, 0.0, 1.0];
+    let red = benilla_ui::color::quant::drawn([0.9, 0.0, 0.0, 1.0]);
     let white = [1.0, 1.0, 1.0, 1.0];
     assert_eq!(
         slot_color(&mut s, "CharacterHeadSlot", "Quickslot2"),
@@ -680,6 +690,9 @@ fn tab_round_trip_with_a_selected_skill_by_point() {
                 category_order: 1,
                 description: "Defensive expertise.".into(),
                 abandonable: false,
+                step: 0,
+                flags: 0,
+                tier_id: 0,
                 mono: false,
             },
             SkillEntry {
@@ -697,6 +710,9 @@ fn tab_round_trip_with_a_selected_skill_by_point() {
                 description: "Working with metals.".into(),
                 // A primary profession: SkillRaceClassInfo flag 0x20, `SKILL_FLAG_UNLEARNABLE`.
                 abandonable: true,
+                step: 0,
+                flags: 0,
+                tier_id: 0,
                 mono: false,
             },
         ],
@@ -1056,7 +1072,7 @@ fn the_five_tabs_fit_their_labels_on_the_first_show() {
     for i in [0, 2, 3, 4] {
         let (label, width) = first[i];
         assert!(label > 0.0, "tab {} measured its label", i + 1);
-        assert_eq!(
+        benilla_ui::assert_near!(
             width,
             fitted(label),
             "tab {} is its text plus the two end slices, from OnShow alone",
@@ -1069,8 +1085,9 @@ fn the_five_tabs_fit_their_labels_on_the_first_show() {
             i + 1
         );
     }
-    assert_eq!(
-        first[1].1, 115.0,
+    benilla_ui::assert_near!(
+        first[1].1,
+        115.0,
         "…and the hidden pet tab is not yet fitted"
     );
 
@@ -1078,7 +1095,7 @@ fn the_five_tabs_fit_their_labels_on_the_first_show() {
     s.run("CharacterFrameTab2:Show()").unwrap();
     s.resolve();
     let (pet_label, pet_width) = widths(&mut s)[1];
-    assert_eq!(
+    benilla_ui::assert_near!(
         pet_width,
         fitted(pet_label),
         "the pet tab fits when it is first shown"
@@ -1089,11 +1106,12 @@ fn the_five_tabs_fit_their_labels_on_the_first_show() {
     }
     s.resolve();
     let settled = widths(&mut s);
-    assert_eq!(
-        settled[0], first[0],
+    benilla_ui::assert_near!(
+        settled[0],
+        first[0],
         "the fit is once, in OnShow — nothing re-fits per frame"
     );
-    assert_eq!(&settled[2..], &first[2..], "…for the whole row");
+    benilla_ui::assert_near!(&settled[2..], &first[2..], "…for the whole row");
     assert!(s.errors().is_empty(), "no handler errors: {:?}", s.errors());
 }
 

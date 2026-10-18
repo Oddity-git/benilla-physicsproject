@@ -69,6 +69,7 @@ fn merchant_compare_renders_the_compare_shape_and_no_hover_seats_a_plate() {
             duration_ms: None,
             petition: None,
             already_bound: false,
+            occupied_seats: None,
             bonding: 0,
             use_spell: 0,
             bar_placeable: true,
@@ -85,8 +86,12 @@ fn merchant_compare_renders_the_compare_shape_and_no_hover_seats_a_plate() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(
@@ -102,9 +107,9 @@ fn merchant_compare_renders_the_compare_shape_and_no_hover_seats_a_plate() {
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("LEFT", 0, 0); a:SetWidth(10); a:SetHeight(10)
         -- CreateFrame'd frames start SHOWN; the shipped XML instances are hidden="true".
-        CreateFrame("GameTooltip", "GameTooltip"):Hide()
-        CreateFrame("GameTooltip", "ShoppingTooltip1"):Hide()
-        CreateFrame("GameTooltip", "ShoppingTooltip2"):Hide()
+        CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate"):Hide()
+        CreateFrame("GameTooltip", "ShoppingTooltip1", nil, "TestTooltipTemplate"):Hide()
+        CreateFrame("GameTooltip", "ShoppingTooltip2", nil, "TestTooltipTemplate"):Hide()
         -- A ref-shaped SHOW_COMPARE_TOOLTIP listener, kept as the NEGATIVE control: 5875 never
         -- signals event 377 (zero fire sites in the whole image), so nothing
         -- benilla does may reach this handler.
@@ -211,6 +216,16 @@ fn merchant_compare_renders_the_compare_shape_and_no_hover_seats_a_plate() {
 #[test]
 fn set_inventory_item_name_only_is_the_trimmed_build() {
     let mut s = script();
+    // 255 read back times the float at `0x81c6b4`; `FontString:GetTextColor` rounds green and
+    // blue to `f32`s (`0x79d958`).
+    s.lua()
+        .globals()
+        .set("ONE", crate::color::channel(255))
+        .unwrap();
+    s.lua()
+        .globals()
+        .set("ONE32", f64::from(crate::color::channel(255) as f32))
+        .unwrap();
     s.set_screen_size(800.0, 600.0);
     let mut inv: InventorySlots = Default::default();
     inv[16] = Some(InvSlotView {
@@ -221,6 +236,7 @@ fn set_inventory_item_name_only_is_the_trimmed_build() {
         ..Default::default()
     });
     s.set_inventory_slots(inv);
+    s.set_lock_rows(HashMap::from([(7, Vec::new())]));
     s.set_item_template(
         8100,
         ItemTemplateView {
@@ -246,7 +262,7 @@ fn set_inventory_item_name_only_is_the_trimmed_build() {
         r#"
         local a = CreateFrame("Button", "Slot13"); a:SetPoint("CENTER", 0, 0)
         a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
 
         function has(needle)
@@ -273,7 +289,7 @@ fn set_inventory_item_name_only_is_the_trimmed_build() {
         assert(tt:SetInventoryItem("player", 16, 1) == 1, "nameOnly still answers 1")
         assert(TTTextLeft1:GetText() == "Sealed Blade")
         local r2, g2, b2 = TTTextLeft1:GetTextColor()
-        assert(r2 == 1 and g2 == 1 and b2 == 1, "nameOnly: the NAME goes white (0x52b8b3)")
+        assert(r2 == ONE and g2 == ONE32 and b2 == ONE32, "nameOnly: the NAME goes white (0x52b8b3)")
         assert(not has("[ITEM_CONJURED]") and not has("[ITEM_BIND_ON_PICKUP]")
                and not has("[ITEM_UNIQUE]") and not has("[LOCKED]"),
                "nameOnly: the bind/lock region is cut (0x52bac3)")
@@ -329,7 +345,7 @@ fn set_inventory_item_renders_full_outside_compare() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot9"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         assert(tt:SetInventoryItem("player", 16) == 1, "occupied slot answers 1")
         assert(TTTextLeft1:GetText() == "Worn Axe")
@@ -383,7 +399,7 @@ fn set_hyperlink_renders_items_and_ignores_other_links() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot10"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetHyperlink("|cff1eff00|Hitem:7002:0:0:0|h[New Loop]|h|r")
         assert(TTTextLeft1:GetText() == "New Loop", "escaped link renders")
@@ -409,7 +425,7 @@ fn ts_recipe(spell_id: u32, name: &str, group: (u32, u32, &str)) -> TradeSkillRe
         icon: None,
         min_made: 1,
         max_made: 1,
-        cooldown_secs: None,
+        cooldown: None,
         product_item: spell_id + 10_000,
         product_inv_type: 0,
         product_item_level: 0,
@@ -432,7 +448,7 @@ fn set_trade_skill_item_indexes_visible_rows_not_raw_recipes() {
     s.set_screen_size(800.0, 600.0);
     // Owned, as the stock hover owns it before the setter; an unowned tooltip's show hides it.
     s.run(
-        r#"local tt = CreateFrame("GameTooltip", "TT")
+        r#"local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
            tt:SetOwner(CreateFrame("Frame", "TTOwner"), "ANCHOR_NONE")"#,
     )
     .unwrap();
@@ -575,8 +591,8 @@ fn set_merchant_compare_item_answers_one_or_nil_per_candidate_slot() {
 
     s.run(
         r#"
-        CreateFrame("GameTooltip", "ShoppingTooltip1"):Hide()
-        CreateFrame("GameTooltip", "ShoppingTooltip2"):Hide()
+        CreateFrame("GameTooltip", "ShoppingTooltip1", nil, "TestTooltipTemplate"):Hide()
+        CreateFrame("GameTooltip", "ShoppingTooltip2", nil, "TestTooltipTemplate"):Hide()
         -- Owned, as the stock compare owns them before the setter; an unowned tooltip's show
         -- hides it.
         local owner = CreateFrame("Frame", "CompareOwner")
@@ -740,7 +756,7 @@ fn item_bindings_return_the_pushed_repair_cost() {
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0)
         a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         local has, _, cost = tt:SetInventoryItem("player", 16)
         assert(has == 1 and cost == 1234, "equipped: " .. tostring(cost))
@@ -788,6 +804,7 @@ fn locked_is_drawn_for_a_locked_object_and_sets_the_builder_flag() {
             slots: HashMap::from([(1, slot(0)), (2, slot(0x4))]),
         }),
     );
+    s.set_lock_rows(HashMap::from([(7, Vec::new())]));
     s.set_item_template(
         8300,
         ItemTemplateView {
@@ -801,7 +818,7 @@ fn locked_is_drawn_for_a_locked_object_and_sets_the_builder_flag() {
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0)
         a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         local function locked()
             for i = 1, tt:NumLines() do
                 if getglobal("TTTextLeft" .. i):GetText() == "[LOCKED]" then return true end
@@ -852,6 +869,7 @@ fn bank_vault_items_keep_their_flags_and_expiry() {
             ]),
         }),
     );
+    s.set_lock_rows(HashMap::from([(7, Vec::new())]));
     s.set_item_template(
         8300,
         ItemTemplateView {
@@ -865,7 +883,7 @@ fn bank_vault_items_keep_their_flags_and_expiry() {
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0)
         a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         local function text(needle)
             for i = 1, tt:NumLines() do
                 if getglobal("TTTextLeft" .. i):GetText() == needle then return true end
@@ -944,7 +962,7 @@ fn item_bindings_push_has_cooldown_as_one_or_nil() {
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0)
         a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         -- `arg.n` counts the returns (`select` is 5.1's, not a 1.12 global).
         local function r(...) return arg.n, arg[2] end

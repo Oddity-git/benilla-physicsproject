@@ -75,6 +75,9 @@ pub struct CraftRecipe {
     /// `Spell.dbc` `spellLevel` (`+0x74`), the Beast Training comparator's rank key. The
     /// reference's `requiredLevel` return comes from it; here that return is 0.
     pub spell_level: u32,
+    /// The name of the recipe's group key, the skill line of the spell's ability (row `+0x04`,
+    /// `0x4f61b1`), for `GetCraftSkillLine`; `None` when `SkillLine.dbc` has no such row.
+    pub skill_line: Option<String>,
 }
 
 /// The open craft window, pushed whole by the app.
@@ -198,6 +201,25 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 .as_ref()
                 .map_or_else(|| "UNKNOWN".to_string(), |c| c.name.clone());
             Ok(Value::String(lua.create_string(&name)?))
+        })?,
+    )?;
+
+    // GetCraftSkillLine(index) (`0x4f7210`): the name of the skill line in the row's group field
+    // (`+0x04`), nil for a row outside the list (`dec`, then an unsigned compare against the row
+    // count, `ds:0xbdcfc0`) or a line `SkillLine.dbc` lacks. The list here is flat: the
+    // reference's header rows are not built, so an index counts recipes alone.
+    g.set(
+        "GetCraftSkillLine",
+        lua.create_function(|lua, index: Value| {
+            let row = binding_abi::number_arg(lua, index, "Usage: GetCraftSkillLine(index)")?
+                .wrapping_sub(1) as u32;
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            let line = model
+                .craft
+                .as_ref()
+                .and_then(|c| c.recipes.get(row as usize))
+                .and_then(|r| r.skill_line.as_ref());
+            opt_str(lua, line)
         })?,
     )?;
 
@@ -412,8 +434,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "DoCraft",
         lua.create_function(|lua, index: usize| {
+            // The recipe's cast is `TryCastSpell` (`0x4f7d64` → `0x6e5a90`), behind the gate's
+            // tag 2 (`0x6e4bc1`).
+            let may_cast = super::protected::gate(lua, super::protected::Tag::CAST);
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            if let Some(spell_id) = recipe(&model, index).map(|r| r.spell_id) {
+            if let Some(spell_id) = recipe(&model, index)
+                .map(|r| r.spell_id)
+                .filter(|_| may_cast)
+            {
                 model.craft_dos.push(spell_id);
             }
             Ok(())
@@ -481,6 +509,7 @@ mod tests {
             }],
             tools: vec![("Runed Copper Rod".into(), true)],
             spell_level: 0,
+            skill_line: None,
         }
     }
 
@@ -506,6 +535,59 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    /// `GetCraftSkillLine` (`0x4f7210`): the usage text for a non-number, nil for a row outside
+    /// the list or a recipe whose line has no `SkillLine.dbc` row, else the line's name; rows
+    /// count in the sorted display order.
+    #[test]
+    fn craft_skill_line_answers_the_rows_group_name() {
+        let mut s = UiScript::new().unwrap();
+        for call in [
+            "GetCraftSkillLine()",
+            "GetCraftSkillLine(nil)",
+            "GetCraftSkillLine('x')",
+            "GetCraftSkillLine({})",
+        ] {
+            let err = s.run(call).expect_err(call).to_string();
+            assert!(
+                err.contains("Usage: GetCraftSkillLine(index)"),
+                "{call}: {err}"
+            );
+        }
+        // No window: nil.
+        assert!(s
+            .eval::<bool>("return GetCraftSkillLine(1) == nil")
+            .unwrap());
+        let mut st = state();
+        for r in &mut st.recipes {
+            // The second recipe's line has no row.
+            r.skill_line = (r.spell_id == 683).then(|| "Enchanting".to_string());
+        }
+        s.set_craft(Some(st));
+        let by_row = |s: &UiScript, i: i64| -> (String, Option<String>) {
+            s.eval(&format!("return GetCraftInfo({i}), GetCraftSkillLine({i})"))
+                .unwrap()
+        };
+        // Row 1 is the Optimal recipe (683); row 2 the Trivial one, with no line row.
+        let (name, line) = by_row(&s, 1);
+        assert!(name.contains("Minor Health"), "{name}");
+        assert_eq!(line.as_deref(), Some("Enchanting"));
+        assert_eq!(by_row(&s, 2).1, None);
+        for call in [
+            "GetCraftSkillLine(0)",
+            "GetCraftSkillLine(-1)",
+            "GetCraftSkillLine(3)",
+        ] {
+            assert!(
+                s.eval::<bool>(&format!("return {call} == nil")).unwrap(),
+                "{call}"
+            );
+        }
+        assert_eq!(
+            s.eval::<String>("return GetCraftSkillLine('1')").unwrap(),
+            "Enchanting"
+        );
     }
 
     #[test]
@@ -609,6 +691,21 @@ mod tests {
         without_7418.recipes.remove(0);
         s.set_craft(Some(without_7418));
         assert_eq!(s.eval::<i64>("return GetCraftSelectionIndex()").unwrap(), 0);
+    }
+
+    /// The recipe's cast is `TryCastSpell`'s, behind the gate's tag 2 (`0x4f7d64` → `0x6e4bc1`).
+    #[test]
+    fn do_craft_casts_only_inside_an_input_event() {
+        let mut s = UiScript::new().unwrap();
+        s.set_craft(Some(state()));
+
+        s.run(r#"RunScript("DoCraft(1)")"#).unwrap();
+        assert!(
+            s.take_craft_dos().is_empty(),
+            "a macro outside an input event"
+        );
+        s.run_binding(r#"RunScript("DoCraft(1)")"#).unwrap();
+        assert_eq!(s.take_craft_dos(), vec![683], "inside a key's body");
     }
 
     #[test]
@@ -725,6 +822,7 @@ mod tests {
             reagents: vec![],
             tools: vec![],
             spell_level: level,
+            skill_line: None,
         };
         // Shuffled on purpose.
         let recipes = vec![

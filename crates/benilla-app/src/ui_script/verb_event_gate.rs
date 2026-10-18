@@ -1,5 +1,5 @@
 //! The verb-fired event gate: an event the reference fires on a verb's own call path
-//! (`reference/1.12-verb-events.tsv`) must be fired by a file that registers the verb, since stock
+//! (`reference/verb_events.tsv`) must be fired by a file that registers the verb, since stock
 //! Lua calls such a verb for its event (`0x4d8c90`, the trainer filter's commit, fires
 //! `TRAINER_UPDATE`). Otherwise the pair is declared in [`ELSEWHERE`] or [`GAP`], and the verb's
 //! own file must not fire it. The check is textual, so it cannot see a fire off the verb's path.
@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// One row of `reference/1.12-verb-events.tsv`.
+/// One row of `reference/verb_events.tsv`.
 struct Pair {
     verb: String,
     event: String,
@@ -23,14 +23,6 @@ const ELSEWHERE: &[(&str, &str, &str)] = &[];
 
 /// Pairs nothing fires on the verb's path, each with its reason.
 const GAP: &[(&str, &str, &str)] = &[
-    (
-        "CancelSkillUps",
-        "SKILL_LINES_CHANGED",
-        "the reference's verb (0x4d3e30) calls the temp-point reset and fires unconditionally at \
-         0x4d3e35; here the reset runs over a table this model keeps empty (`skills.rs`), so \
-         nothing moves and `ui_char.rs`'s feed has nothing to announce — the stock SkillFrame \
-         would only repaint under its own Close",
-    ),
     (
         "ClickTargetTradeButton",
         "TRADE_REPLACE_ENCHANT",
@@ -80,9 +72,9 @@ const GAP: &[(&str, &str, &str)] = &[
 fn table() -> Vec<Pair> {
     let tsv = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../reference/1.12-verb-events.tsv"
+        "/../../reference/verb_events.tsv"
     );
-    let text = std::fs::read_to_string(tsv).expect("reference/1.12-verb-events.tsv");
+    let text = std::fs::read_to_string(tsv).expect("reference/verb_events.tsv");
     text.lines()
         .filter(|l| !l.starts_with('#') && !l.starts_with("verb\t"))
         .filter_map(|l| {
@@ -121,7 +113,10 @@ fn sources() -> Vec<(PathBuf, String)> {
             {
                 continue;
             }
-            let whole = std::fs::read_to_string(&p).unwrap_or_default();
+            // A CRLF checkout reads the same: the `#[cfg(test)]` split below is on `\n`.
+            let whole = std::fs::read_to_string(&p)
+                .unwrap_or_default()
+                .replace("\r\n", "\n");
             let head = whole
                 .rfind("#[cfg(test)]\nmod ")
                 .map_or(whole.as_str(), |i| &whole[..i]);
@@ -141,10 +136,15 @@ fn quoted(text: &str, name: &str) -> bool {
     text.contains(&format!("\"{name}\""))
 }
 
+/// A source path from `crates/` on, with forward slashes whichever separator the platform uses.
 fn short(p: &std::path::Path) -> String {
-    let s = p.to_string_lossy();
+    let s = slashed(p);
     s.split_once("/crates/")
         .map_or(s.to_string(), |(_, t)| t.to_string())
+}
+
+fn slashed(p: &std::path::Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
 }
 
 /// The files that register `verb`, and whether any of them fires `event`.
@@ -228,7 +228,7 @@ fn the_declared_rows_are_still_true() {
         }
         let named: Vec<&(PathBuf, String)> = src
             .iter()
-            .filter(|(p, _)| p.to_string_lossy().ends_with(file))
+            .filter(|(p, _)| slashed(p).ends_with(file))
             .collect();
         if named.is_empty() {
             wrong.push(format!(

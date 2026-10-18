@@ -1,6 +1,7 @@
 //! The character-window feed: the [`UnitCombatStats`] and `InventorySlots` snapshots the paper
-//! doll's Lua bindings read, built from our avatar's descriptor and item stores; the events that
-//! repaint it; and the booth's yaw from the stock `CharacterModelFrame`. [`unit_combat_stats`] is
+//! doll's Lua bindings read, built from our avatar's descriptor and item stores, pushed ahead of
+//! the stat events that repaint it ([`crate::ui_unit::field_events`]); the inventory events; and
+//! the booth's yaw from the stock `CharacterModelFrame`. [`unit_combat_stats`] is
 //! the half any unit shares: a creature has no player fields, so those read absent and keep their
 //! defaults.
 
@@ -16,7 +17,7 @@ use benilla_ui::strings::Arg;
 use crate::entities::ItemDisplays;
 use crate::items::Items;
 use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects, SelfPlayer};
-use crate::portrait::PaperDollBooth;
+use crate::query_cache::Ask;
 use crate::ui_items::{find_equip_slot, item_link};
 use crate::ui_script::{gate, UiFeed, UiInput};
 
@@ -29,13 +30,9 @@ const ITEM_CLASS_WEAPON: u32 = 2;
 /// Weapon subclass 19, wand (`ItemPrototype.h:211`), for `HasWandEquipped`.
 const SUBCLASS_WAND: u32 = 19;
 
-/// An f32 snapshot field as a diff key, quantized to 1/32 so equal wire values compare equal.
-fn fixed(v: f32) -> i64 {
-    (v * 32.0).round() as i64
-}
-
-/// The last snapshots pushed, so events fire on transitions only; held per VM
-/// ([`crate::ui_script::VmMemo`]), so a `/reload` re-pushes and re-fires as a login does.
+/// The last snapshots pushed, so a push happens on change only; held per VM
+/// ([`crate::ui_script::VmMemo`]), so a `/reload` re-pushes. The stat events are field watches
+/// ([`crate::field_watch`]), never fired off these diffs.
 #[derive(Resource, Default)]
 pub(crate) struct CharFeedState {
     vm: crate::ui_script::VmMemo<CharFeedMemo>,
@@ -63,20 +60,45 @@ pub(crate) struct UiCharPlugin;
 
 impl Plugin for UiCharPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<CharFeedState>().add_systems(
-            Update,
-            (
-                // Before `feed_containers`: a `BAG_UPDATE` handler may read the bag item's own
-                // row (`GetInventoryItemLink("player", ContainerIDToInventoryID(bag))`), so the
-                // inventory push lands first.
-                feed_char
-                    .before(crate::ui_items::feed::feed_containers)
-                    .in_set(UiFeed),
-                watch_skill_ups.in_set(UiFeed),
-                feed_skills.in_set(UiFeed),
-                drain_skill_abandons.after(UiInput),
-            ),
-        );
+        app.init_resource::<CharFeedState>()
+            .add_systems(
+                Startup,
+                load_skill_tiers.after(benilla_assets::AssetSet::Open),
+            )
+            .add_systems(
+                Update,
+                (
+                    // Before `feed_containers`: a `BAG_UPDATE` handler may read the bag item's own
+                    // row (`GetInventoryItemLink("player", ContainerIDToInventoryID(bag))`), so the
+                    // inventory push lands first.
+                    feed_char
+                        .before(crate::ui_items::feed::feed_containers)
+                        .in_set(UiFeed)
+                        .in_set(crate::ui_unit::field_events::FieldEventPushes),
+                    watch_skill_ups.in_set(UiFeed),
+                    feed_skills.in_set(UiFeed),
+                    drain_skill_abandons.after(UiInput),
+                ),
+            );
+    }
+}
+
+/// `SkillTiers.dbc`, which `BuySkillTier` prices a step by.
+#[derive(Resource)]
+struct SkillTiersRes(benilla_formats::SkillTiers);
+
+fn load_skill_tiers(mut commands: Commands, assets: Option<Res<benilla_assets::WorldAssets>>) {
+    use benilla_assets::LockRecover;
+    let Some(assets) = assets else { return };
+    let loaded = {
+        let mut chain = assets.chain.lock_recover();
+        benilla_formats::load_skill_tiers(&mut chain)
+    };
+    match loaded {
+        Ok(tiers) => commands.insert_resource(SkillTiersRes(tiers)),
+        Err(e) => {
+            warn!("ui_char: SkillTiers.dbc failed to load — BuySkillTier prices nothing: {e:#}")
+        }
     }
 }
 
@@ -221,11 +243,21 @@ fn feed_skills(
     script: Option<NonSendMut<UiScript>>,
     self_store: Query<Ref<ObjectStore>, With<SelfPlayer>>,
     skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
+    tiers: Option<Res<SkillTiersRes>>,
     mut last: Local<crate::ui_script::VmMemo<Option<SkillsState>>>,
+    mut tiers_pushed: Local<crate::ui_script::VmMemo<bool>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    // The cost table, once per VM.
+    let pushed = tiers_pushed.get(&script);
+    if !*pushed {
+        if let Some(tiers) = tiers.as_deref() {
+            script.set_skill_tiers(tiers.0.tiers());
+            *pushed = true;
+        }
+    }
     let last = last.get(&script);
     let lines_moved = skill_lines.as_ref().is_some_and(|l| l.is_changed());
     let (Ok(store), Some(skill_lines)) = (self_store.single(), skill_lines.as_deref()) else {
@@ -298,6 +330,9 @@ pub(crate) fn skills_row(
         // The unlearnable bit and a nonzero skill step (`0x4d3953`).
         abandonable: slot.step != 0 && rc.unlearnable(),
         mono: rc.mono(),
+        step: u32::from(slot.step),
+        flags: rc.flags,
+        tier_id: rc.tier_id,
     })
 }
 
@@ -321,17 +356,12 @@ fn slot_entry(store: &ObjectStore, objects: &Objects, slot0: u8) -> Option<u32> 
 
 /// The weapon-skill line for `slot0`: vmangos's subclass table (`Item.cpp:700`) for a weapon,
 /// Unarmed (162) for anything else.
-fn weapon_skill_id(
-    store: &ObjectStore,
-    objects: &Objects,
-    items: &Items,
-    commands: &NetCommands,
-    slot0: u8,
-) -> u32 {
+fn weapon_skill_id(store: &ObjectStore, objects: &Objects, items: &Items, slot0: u8) -> u32 {
     let Some(entry) = slot_entry(store, objects, slot0) else {
         return SKILL_UNARMED;
     };
-    let Some(t) = items.template(entry, 0, commands) else {
+    // A worn item's record only read: its create asked.
+    let Some(t) = items.template(entry, 0, Ask::Read) else {
         return SKILL_UNARMED; // in flight: refined when the template lands
     };
     if t.class != ITEM_CLASS_WEAPON {
@@ -430,25 +460,20 @@ pub(crate) fn unit_combat_stats(store: &ObjectStore) -> UnitCombatStats {
 }
 
 /// The player's snapshot: [`unit_combat_stats`] plus the equipment flags and the skill pairs.
-fn combat_stats(
-    store: &ObjectStore,
-    objects: &Objects,
-    items: &Items,
-    commands: &NetCommands,
-) -> UnitCombatStats {
+fn combat_stats(store: &ObjectStore, objects: &Objects, items: &Items) -> UnitCombatStats {
     // The off hand counts only as a weapon (a shield does not swing); both flags read false
     // until the template lands.
     let has_offhand = slot_entry(store, objects, SLOT_OFF_HAND)
-        .and_then(|e| items.template(e, 0, commands))
+        .and_then(|e| items.template(e, 0, Ask::Read))
         .is_some_and(|t| t.class == ITEM_CLASS_WEAPON);
     let has_wand = slot_entry(store, objects, SLOT_RANGED)
-        .and_then(|e| items.template(e, 0, commands))
+        .and_then(|e| items.template(e, 0, Ask::Read))
         .is_some_and(|t| t.class == ITEM_CLASS_WEAPON && t.subclass == SUBCLASS_WAND);
 
-    let main_skill = weapon_skill_id(store, objects, items, commands, SLOT_MAIN_HAND);
-    let offhand_skill = weapon_skill_id(store, objects, items, commands, SLOT_OFF_HAND);
+    let main_skill = weapon_skill_id(store, objects, items, SLOT_MAIN_HAND);
+    let offhand_skill = weapon_skill_id(store, objects, items, SLOT_OFF_HAND);
     let ranged_skill_id = slot_entry(store, objects, SLOT_RANGED)
-        .and_then(|e| items.template(e, 0, commands))
+        .and_then(|e| items.template(e, 0, Ask::Read))
         .filter(|t| t.class == ITEM_CLASS_WEAPON)
         .and_then(|t| weapon_subclass_skill(t.subclass));
 
@@ -478,7 +503,6 @@ fn slot_view(
     items: &Items,
     icons: Option<&ItemDisplays>,
     rolls: crate::items::RollCatalogs,
-    commands: &NetCommands,
     names: &crate::names::NameCache,
     // `ItemSubClass.dbc`, for the count gate below; absent, every bag counts 0.
     sub_classes: Option<&crate::ui_items::ItemSubClasses>,
@@ -509,10 +533,13 @@ fn slot_view(
     // Soulbound or carrying a binding enchant (`0x5da2c0`), read off the raw descriptor, never off
     // the enchant lines below.
     let already_bound = crate::items::already_bound(obj, rolls.enchants);
+    // Only read: the tooltip build asks the creator (`crate::ui_items::feed::ask_item_build_lookups`).
     let creator = obj
         .item_creator()
         .filter(|&g| g != 0)
-        .and_then(|g| names.resolve(g, commands).map(str::to_string));
+        .and_then(|g| names.resolve_player(g, Ask::Read).map(str::to_string));
+    let gift_creator = crate::items::gift_creator_name(obj, names);
+    let (creator_guid, gift_creator_guid) = crate::items::creator_guids(obj);
     // All seven enchant slots: our own gear streams as item objects, where an inspected player's
     // descriptor carries only two.
     let enchants = crate::items::enchant_lines(
@@ -529,7 +556,8 @@ fn slot_view(
     // `ITEM_FIELD_RANDOM_PROPERTIES_ID`, the roll behind an "of the Bear" name; its enchants are
     // already in the slots above.
     let roll = obj.item_random_properties_id();
-    let t = items.template(entry, guid, commands);
+    // Only read, as the inventory getters read it (`0x4c8a0a`, `0x4c8d34`): the item's create asked.
+    let t = items.template(entry, guid, Ask::Read);
     let (name, quality, display, link, equip_slots, kind, bar_placeable, consumable) = match t {
         Some(t) => {
             let name = rolls.name(&t.name, roll);
@@ -568,7 +596,11 @@ fn slot_view(
         .and_then(|d| d.icon.clone());
     Some(InvSlotView {
         bonding: t.map_or(0, |t| t.bonding),
+        // A container's filled seats, which `ClickTradeButton` counts (`0x4bff50`).
+        occupied_seats: is_container
+            .then(|| content_guids.iter().filter(|&&g| g != 0).count() as u32),
         use_spell: t.and_then(|t| t.use_spell).map_or(0, |u| u.spell_id),
+        spell_0: t.is_some_and(benilla_protocol::ItemInfo::has_spell_0),
         use_fork: t.map_or(Default::default(), |t| {
             crate::ui_items::dispatch_fork(t, flags, obj.item_text_id().unwrap_or(0))
         }),
@@ -587,6 +619,9 @@ fn slot_view(
         bar_placeable,
         consumable,
         creator,
+        gift_creator,
+        creator_guid,
+        gift_creator_guid,
         enchants,
         duration_ms,
     })
@@ -641,7 +676,9 @@ fn inventory_slots(
     let mut inv: InventorySlots = Default::default();
     let ammo_id = store.0.player_ammo_id().unwrap_or(0);
     if ammo_id != 0 {
-        let t = items.template(ammo_id, 0, commands);
+        // An entry, not an item object, so no create asked for it; the texture getter's lookup
+        // passes a callback (`0x4c83ce`), on the doll's events, which none here marks.
+        let t = items.template(ammo_id, 0, Ask::New(commands));
         let (name, quality, display, link) = match t {
             Some(t) => (
                 Some(t.name.clone()),
@@ -660,6 +697,7 @@ fn inventory_slots(
             // Ammo has no item object, only its template, so there is no bind to read.
             already_bound: false,
             bonding: 0,
+            occupied_seats: None,
             use_spell: 0,
             use_fork: Default::default(),
             item_id: ammo_id,
@@ -676,9 +714,13 @@ fn inventory_slots(
             bar_placeable: false,
             consumable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             // No ammo instance streams, only its template id: no enchants, no countdown.
             enchants: Vec::new(),
             duration_ms: None,
+            spell_0: false,
         });
     }
     // Equipment 1..=19, then `Bag0Slot`..`Bag3Slot` (20..=23 in `PaperDollItemFrame.dbc`), the
@@ -692,7 +734,6 @@ fn inventory_slots(
             items,
             icons,
             rolls,
-            commands,
             names,
             sub_classes,
             has_relic_slot,
@@ -711,7 +752,6 @@ fn bank_bag_slots(
     items: &Items,
     icons: Option<&ItemDisplays>,
     rolls: crate::items::RollCatalogs,
-    commands: &NetCommands,
     names: &crate::names::NameCache,
     sub_classes: Option<&crate::ui_items::ItemSubClasses>,
 ) -> BankBagSlots {
@@ -725,7 +765,6 @@ fn bank_bag_slots(
             items,
             icons,
             rolls,
-            commands,
             names,
             sub_classes,
             // A bank bag slot holds a bag; the relic flag decides INVSLOT 17 alone.
@@ -734,102 +773,6 @@ fn bank_bag_slots(
         );
     }
     bags
-}
-
-/// Fire the paper doll's repaint events for one unit's snapshot transition, `arg1 = token`: the
-/// eight unit-stat events both pages register (`PaperDollFrame.lua:14-28`,
-/// `PetPaperDollFrame.lua:12-20`), each when a value its handlers read moved. A first snapshot
-/// fires them all.
-pub(crate) fn fire_stat_transitions(
-    script: &mut UiScript,
-    token: &str,
-    prev: Option<&UnitCombatStats>,
-    stats: &UnitCombatStats,
-) {
-    let tok = || ScriptValue::Str(token.to_string());
-    let changed = |sel: fn(&UnitCombatStats) -> Vec<i64>| prev.is_none_or(|p| sel(p) != sel(stats));
-    if changed(|s| {
-        let mut v: Vec<i64> = s.stats.iter().map(|&x| i64::from(x)).collect();
-        v.extend(
-            s.stat_pos
-                .iter()
-                .chain(s.stat_neg.iter())
-                .map(|&x| i64::from(x)),
-        );
-        v
-    }) {
-        script.fire_event("UNIT_STATS", vec![tok()]);
-    }
-    if changed(|s| {
-        s.resistances
-            .iter()
-            .chain(s.resistance_pos.iter())
-            .chain(s.resistance_neg.iter())
-            .map(|&x| i64::from(x))
-            .collect()
-    }) {
-        script.fire_event("UNIT_RESISTANCES", vec![tok()]);
-    }
-    if changed(|s| {
-        vec![
-            fixed(s.min_damage),
-            fixed(s.max_damage),
-            fixed(s.min_offhand_damage),
-            fixed(s.max_offhand_damage),
-            i64::from(s.physical_bonus_pos),
-            i64::from(s.physical_bonus_neg),
-            fixed(s.damage_percent),
-        ]
-    }) {
-        script.fire_event("UNIT_DAMAGE", vec![tok()]);
-    }
-    if changed(|s| {
-        vec![
-            i64::from(s.main_attack_time_ms),
-            i64::from(s.offhand_attack_time_ms),
-            i64::from(s.has_offhand),
-        ]
-    }) {
-        script.fire_event("UNIT_ATTACK_SPEED", vec![tok()]);
-    }
-    if changed(|s| {
-        vec![
-            i64::from(s.attack_power),
-            i64::from(s.attack_power_pos),
-            i64::from(s.attack_power_neg),
-        ]
-    }) {
-        script.fire_event("UNIT_ATTACK_POWER", vec![tok()]);
-    }
-    if changed(|s| {
-        vec![
-            i64::from(s.ranged_attack_power),
-            i64::from(s.ranged_attack_power_pos),
-            i64::from(s.ranged_attack_power_neg),
-            i64::from(s.has_wand),
-        ]
-    }) {
-        script.fire_event("UNIT_RANGED_ATTACK_POWER", vec![tok()]);
-    }
-    if changed(|s| {
-        vec![
-            fixed(s.ranged_min_damage),
-            fixed(s.ranged_max_damage),
-            i64::from(s.ranged_attack_time_ms),
-        ]
-    }) {
-        script.fire_event("UNIT_RANGEDDAMAGE", vec![tok()]);
-    }
-    if changed(|s| {
-        vec![
-            i64::from(s.main_weapon_skill.0),
-            i64::from(s.main_weapon_skill.1),
-            i64::from(s.ranged_weapon_skill.0),
-            i64::from(s.ranged_weapon_skill.1),
-        ]
-    }) {
-        script.fire_event("UNIT_ATTACK", vec![tok()]);
-    }
 }
 
 pub(crate) fn feed_char(
@@ -843,7 +786,6 @@ pub(crate) fn feed_char(
     props: Option<Res<crate::items::RandomProperties>>,
     commands: Res<NetCommands>,
     mut feed: ResMut<CharFeedState>,
-    mut booth: ResMut<PaperDollBooth>,
     names: Res<crate::names::NameCache>,
     // `ItemSubClass.dbc`, for `GetInventoryItemCount`'s container count bit.
     sub_classes: Option<Res<crate::ui_items::ItemSubClasses>>,
@@ -851,14 +793,7 @@ pub(crate) fn feed_char(
     let Some(mut script) = script else {
         return;
     };
-    // The stock `CharacterModelFrame` owns the yaw (`Model_Rotate*` call `SetRotation`); the booth
-    // mirrors it, written only on change so it is not marked changed every frame.
-    let yaw = script.model_pane_facing("CharacterModelFrame");
-    if booth.yaw != yaw {
-        booth.yaw = yaw;
-    }
-
-    // Per VM: after a `/reload` both snapshots re-push and their events re-fire.
+    // Per VM: after a `/reload` both snapshots re-push, and `UNIT_INVENTORY_CHANGED` re-fires.
     let (memo, vm_reset) = feed.vm.get_reset(&script);
 
     let Some(store) = inv.self_store.iter().next() else {
@@ -918,13 +853,12 @@ pub(crate) fn feed_char(
         return;
     }
 
-    let stats = combat_stats(store, objects, &items, &commands);
+    // The paper doll's getters read this; the stat events that repaint it are field watches,
+    // fired after this push (`crate::ui_unit::field_events`).
+    let stats = combat_stats(store, objects, &items);
     if memo.last_stats.as_ref() != Some(&stats) {
         gate.audit("feed_char", "the combat-stats snapshot");
-        // Push before firing: handlers run synchronously and would paint the old values.
-        let prev = memo.last_stats.take();
         script.set_player_combat_stats(Some(stats.clone()));
-        fire_stat_transitions(&mut script, "player", prev.as_ref(), &stats);
         memo.last_stats = Some(stats);
     }
 
@@ -951,7 +885,6 @@ pub(crate) fn feed_char(
             enchants: enchants.as_deref(),
             props: props.as_deref(),
         },
-        &commands,
         &names,
         sub_classes.as_deref(),
     );
@@ -992,12 +925,14 @@ pub(crate) fn feed_char(
         gate.audit("feed_char", "a bank bag slot transition");
     }
     for same_bag in repainted {
-        let args = if same_bag {
-            vec![ScriptValue::Str("player".to_string())]
+        if same_bag {
+            script.fire_event(
+                "PLAYERBANKSLOTS_CHANGED",
+                vec![ScriptValue::Str("player".to_string())],
+            );
         } else {
-            Vec::new()
-        };
-        script.fire_event("PLAYERBANKSLOTS_CHANGED", args);
+            script.fire_event("PLAYERBANKSLOTS_CHANGED", vec![]);
+        }
     }
 }
 
@@ -1034,6 +969,51 @@ fn weapon_enchant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worn bag's view says how many of its seats are filled, which `ClickTradeButton` reads
+    /// to refuse it (`0x4bff50`, then `0x4bffae` for an empty one in a bag slot).
+    #[test]
+    fn a_worn_bag_view_counts_its_filled_seats() {
+        use benilla_protocol::field::{FIELD_CONTAINER_SLOT_1, FIELD_OBJECT_ENTRY};
+        let mut objs = crate::ui_items::TestObjects::new();
+        // `OBJECT_FIELD_TYPE` container, `CONTAINER_FIELD_NUM_SLOTS` 4, seat 2 filled.
+        objs.spawn_container(
+            0xB1,
+            ObjectFields::from_pairs(&[
+                (2, 0x7),
+                (FIELD_OBJECT_ENTRY, 4496),
+                (48, 4),
+                (FIELD_CONTAINER_SLOT_1 + 4, 0xC1),
+            ]),
+        );
+        objs.spawn_container(
+            0xB2,
+            ObjectFields::from_pairs(&[(2, 0x7), (FIELD_OBJECT_ENTRY, 4496), (48, 4)]),
+        );
+        objs.spawn(
+            0xB3,
+            ObjectFields::from_pairs(&[(2, 0x3), (FIELD_OBJECT_ENTRY, 2589)]),
+        );
+        let items = Items::default();
+        let names = crate::names::NameCache::default();
+        let mut seats = |guid: u64| {
+            slot_view(
+                &objs.get(),
+                &items,
+                None,
+                crate::items::RollCatalogs::NONE,
+                &names,
+                None,
+                false,
+                guid,
+            )
+            .expect("a view")
+            .occupied_seats
+        };
+        assert_eq!(seats(0xB1), Some(1));
+        assert_eq!(seats(0xB2), Some(0));
+        assert_eq!(seats(0xB3), None);
+    }
     use benilla_protocol::messages::ObjectFields;
     use bevy::ecs::system::RunSystemOnce;
 
@@ -1104,7 +1084,6 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.init_resource::<CharFeedState>()
-            .init_resource::<PaperDollBooth>()
             .init_resource::<Items>()
             .init_resource::<crate::net::GuidIndex>()
             .init_resource::<crate::names::NameCache>()

@@ -27,7 +27,7 @@ use super::group_relation::{GroupInputs, GroupRoster};
 use crate::creature_type::CreatureTypeSources;
 use crate::names::NameCache;
 use crate::net::{GuidIndex, ObjectStore, Reputations, SelfGuid, SelfPlayer};
-use crate::target::{can_assist, can_attack, Factions, Selection};
+use crate::target::{can_assist, can_attack, Assist, Factions, Selection};
 use benilla_protocol::messages::OwnerFallback;
 
 /// `TARGET_FLAG_*` bits of the client's targeting flag word (`0xcecac0`).
@@ -150,6 +150,7 @@ impl TargetRelations<'_> {
                 self.reputations,
                 self.self_store,
                 |_| self.target_owner_store.cloned(),
+                Assist::PlayerToUnit,
             )
     }
 
@@ -285,6 +286,7 @@ impl CastTargeting<'_, '_> {
                 types: CreatureTypeSources {
                     names: self.names.as_deref(),
                     forms: self.spells.as_deref().map(|s| &s.forms),
+                    ..Default::default()
                 },
                 group: GroupInputs {
                     self_guid: self.self_guid.0,

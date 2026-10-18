@@ -16,6 +16,7 @@ use benilla_ui::script::{BattlefieldScoreRow, BattlefieldScores, BattlefieldStat
 
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands};
+use crate::query_cache::Ask;
 use crate::ui_dialog_verbs::BattlefieldQueue;
 use crate::ui_script::{UiFeed, UiInput};
 use crate::world_state_ui::WorldStateUiRes;
@@ -56,15 +57,18 @@ pub(crate) fn score_columns(catalog: &WorldStateUiRes, map: u32) -> Vec<Battlefi
     out
 }
 
-/// Resolve the raw board through the name cache; `None` while any name is still in flight.
+/// Resolve the raw board through the name cache; `None` while any name is still in flight. The
+/// packet's handler looks each row's name up with the callback `0x4a9ef0` (`0x4aac79`), so `ask`
+/// is the packet's [`Ask::Event`] on its first run.
 fn resolve_board(
     log: &PvpLogData,
     names: &NameCache,
-    commands: &NetCommands,
+    ask: Ask<'_>,
+    unit_names: crate::ui_unit::UnitNames<'_>,
 ) -> Option<Vec<BattlefieldScoreRow>> {
     let mut rows = Vec::with_capacity(log.rows.len());
     for r in &log.rows {
-        let name = names.resolve(r.guid, commands)?.to_string();
+        let name = names.resolve_player(r.guid, ask)?.to_string();
         let (race, class) = names
             .player_traits(r.guid)
             .map_or((0, 0), |(race, class, _)| (race, class));
@@ -83,8 +87,8 @@ fn resolve_board(
             honor_gained: r.honor_gained,
             faction,
             rank: i32::try_from(r.rank).unwrap_or(i32::MAX),
-            race: crate::ui_unit::race_names(race).map(|(n, _)| n.to_string()),
-            class: crate::ui_unit::class_names(class).map(|(n, _)| n.to_string()),
+            race: unit_names.race(race).map(|(n, _)| n.to_string()),
+            class: unit_names.class(class).map(|(n, _)| n.to_string()),
             stats,
         });
     }
@@ -98,6 +102,7 @@ pub(crate) fn feed_battlefield_score(
     catalog: Option<Res<WorldStateUiRes>>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
+    unit_names: crate::ui_unit::NameTables,
     mut last: Local<crate::ui_script::VmMemo<Option<BattlefieldScores>>>,
 ) {
     let Some(mut script) = script else {
@@ -106,8 +111,9 @@ pub(crate) fn feed_battlefield_score(
     let now = Instant::now();
     script.set_battlefield_run_time_ms(queue.run_time_ms(now));
 
+    let ask = Ask::at(board.is_changed(), &commands);
     let fresh = board.log.as_ref().and_then(|log| {
-        let rows = resolve_board(log, &names, &commands)?;
+        let rows = resolve_board(log, &names, ask, unit_names.get())?;
         let columns = queue
             .active_map()
             .zip(catalog.as_deref())
@@ -207,6 +213,58 @@ impl Plugin for BattlefieldScorePlugin {
 mod tests {
     use super::*;
     use benilla_formats::{WorldStateUiCatalog, WorldStateUiRow};
+
+    /// The log packet looks each row's name up with the callback `0x4a9ef0` (`0x4aac79`); the
+    /// frames its board waits through read. A refused name is asked by no frame after it, only by
+    /// the next log.
+    #[test]
+    fn a_refused_score_row_is_asked_by_the_next_log_never_by_a_frame() {
+        use benilla_protocol::messages::PvpLogRow;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<BattlefieldScoreboard>()
+            .init_resource::<BattlefieldQueue>()
+            .init_resource::<NameCache>()
+            .add_systems(Update, feed_battlefield_score);
+        app.insert_non_send_resource(UiScript::new().unwrap());
+        let log = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<BattlefieldScoreboard>()
+                .apply(PvpLogData {
+                    ended: false,
+                    winner: None,
+                    rows: vec![PvpLogRow {
+                        guid: 0x9,
+                        rank: 0,
+                        killing_blows: 0,
+                        honorable_kills: 0,
+                        deaths: 0,
+                        honor_gained: 0,
+                        stats: Vec::new(),
+                    }],
+                });
+            app.update();
+        };
+        log(&mut app);
+        assert_eq!(crate::query_cache::queries(&rx).len(), 1);
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(0x9, String::new(), None);
+        for _ in 0..600 {
+            app.update();
+        }
+        assert!(
+            crate::query_cache::queries(&rx).is_empty(),
+            "no frame asks a refusal"
+        );
+        log(&mut app);
+        assert_eq!(
+            crate::query_cache::queries(&rx).len(),
+            1,
+            "the next log asks again"
+        );
+    }
 
     fn row(map_id: u32, ui_type: u32, text: &str) -> WorldStateUiRow {
         WorldStateUiRow {

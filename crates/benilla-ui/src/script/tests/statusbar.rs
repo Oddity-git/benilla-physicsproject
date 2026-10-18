@@ -100,7 +100,7 @@ fn statusbar_bar_region_scales_by_fraction_on_extract() {
         })
         .expect("bar fill quad");
     let r = bar.rect.expect("bar rect resolved");
-    assert_eq!(
+    crate::assert_near!(
         (r.left, r.right, r.bottom, r.top),
         (100.0, 150.0, 100.0, 120.0),
         "horizontal fill: left-pinned, 25% of 200px"
@@ -123,7 +123,7 @@ fn statusbar_bar_region_scales_by_fraction_on_extract() {
         })
         .expect("bar fill quad");
     let r = bar.rect.expect("bar rect resolved");
-    assert_eq!(
+    crate::assert_near!(
         (r.left, r.right, r.bottom, r.top),
         (100.0, 300.0, 100.0, 105.0),
         "vertical fill: bottom-pinned, 25% of 20px"
@@ -185,6 +185,11 @@ fn statusbar_bar_region_crops_its_texture_rather_than_stretching_it() {
 #[test]
 fn statusbar_get_texture_returns_the_bar_region() {
     let s = script();
+    // 255 read back times the float at `0x81c6b4`.
+    s.lua()
+        .globals()
+        .set("ONE", crate::color::channel(255))
+        .unwrap();
     s.run(
         r#"
         local b = CreateFrame("StatusBar", "SbTex")
@@ -194,7 +199,7 @@ fn statusbar_get_texture_returns_the_bar_region() {
         assert(t ~= nil and t == b:GetStatusBarTexture(), "stable region wrapper")
         b:SetStatusBarColor(1, 0, 0)
         local r, g, bb, a = b:GetStatusBarColor()
-        assert(r == 1 and g == 0 and bb == 0 and a == 1)
+        assert(r == ONE and g == 0 and bb == 0 and a == ONE)
     "#,
     )
     .unwrap();

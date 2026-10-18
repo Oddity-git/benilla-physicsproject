@@ -11,11 +11,13 @@ fn one_tab_state() -> TalentUiState {
                 name: "Fire".into(),
                 background: "MageFire".into(),
                 points_spent: 7,
+                texture: Some("Interface\\Icons\\Spell_Fire_Fire".into()),
             },
             TalentTabView {
                 name: "Frost".into(),
                 background: "MageFrost".into(),
                 points_spent: 0,
+                texture: None,
             },
         ],
         talents: vec![
@@ -69,7 +71,11 @@ fn bindings_read_the_pushed_snapshot() {
         r#"
         assert(GetNumTalentTabs() == 2)
         local name, texture, points, file = GetTalentTabInfo(1)
-        assert(name == "Fire" and texture == nil and points == 7 and file == "MageFire")
+        assert(name == "Fire" and points == 7 and file == "MageFire")
+        assert(texture == "Interface\\Icons\\Spell_Fire_Fire", "the tab's SpellIcon path")
+        local n2, texture2, points2, file2 = GetTalentTabInfo(2)
+        assert(n2 == "Frost" and texture2 == nil and points2 == 0 and file2 == "MageFrost",
+            "a tab whose icon id is not in SpellIcon.dbc pushes nil there")
         assert(GetTalentTabInfo(3) == nil, "out of range is nil")
         assert(GetNumTalents(1) == 2 and GetNumTalents(2) == 0 and GetNumTalents(9) == 0)
 
@@ -187,7 +193,7 @@ fn set_talent_on_a_passive_talent_is_the_talent_builder() {
     s.run(
         r#"
         local a = CreateFrame("Button", "TB1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetTalent(1, 1)
         assert(tt:IsShown(), "SetTalent shows")
@@ -248,7 +254,7 @@ fn set_talent_on_an_exceptional_talent_keeps_the_spell_body() {
     s.run(
         r#"
         local a = CreateFrame("Button", "TB3"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT3")
+        local tt = CreateFrame("GameTooltip", "TT3", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetTalent(1, 2)
         local want = {
@@ -266,6 +272,31 @@ fn set_talent_on_an_exceptional_talent_keeps_the_spell_body() {
     assert!(s.take_errors().is_empty());
 }
 
+/// `TOOLTIP_TALENT_RANK` is a `_G` read (`0x703bf0`), so an `__index` that calls a verb runs inside
+/// `SetTalent`; the Model must be free for it.
+#[test]
+fn set_talent_reads_the_rank_string_with_the_model_free() {
+    let mut s = script();
+    s.set_talents(one_tab_state());
+    s.run(
+        r#"
+        local a = CreateFrame("Button", "TB4"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+        local tt = CreateFrame("GameTooltip", "TT4", nil, "TestTooltipTemplate")
+        tt:SetOwner(a, "ANCHOR_RIGHT")
+        setmetatable(getfenv(0), { __index = function(t, k)
+            if k == "TOOLTIP_TALENT_RANK" then
+                CreateFrame("Frame"):SetWidth(10)
+                return "[RANK %d/%d]"
+            end
+        end })
+        tt:SetTalent(1, 2)
+        assert(TT4TextLeft1:GetText() == "[RANK 0/5]", tostring(TT4TextLeft1:GetText()))
+    "#,
+    )
+    .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
 /// A missing spell view renders the rank line alone and asks for the view once.
 #[test]
 fn set_talent_locked_reqs_and_the_ask_once_miss() {
@@ -276,7 +307,7 @@ fn set_talent_locked_reqs_and_the_ask_once_miss() {
     s.run(
         r#"
         local a = CreateFrame("Button", "TB2"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT2")
+        local tt = CreateFrame("GameTooltip", "TT2", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetTalent(1, 2)
         assert(tt:IsShown())

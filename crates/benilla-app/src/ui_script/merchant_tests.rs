@@ -2,7 +2,7 @@
 
 use benilla_ui::script::{
     ContainerState, CursorPayload, DressUpIntent, ExtractedQuad, ItemStatsHead, MerchantItem,
-    MerchantState, QuadContent, ScriptValue, SoundRequest, UiScript,
+    MerchantState, QuadContent, SoundRequest, UiScript,
 };
 
 use super::test_ui::{bag_open, load_ui as load_xml, BAG_UI};
@@ -687,7 +687,7 @@ fn shipped_merchant_hover_scopes_highlight_and_anchors_item_tooltip() {
         hl.width(),
         hl.height()
     );
-    assert_eq!(
+    benilla_ui::assert_near!(
         (hl.left, hl.top),
         (sword_icon.left, sword_icon.top),
         "highlight sits on the icon, not the row"
@@ -735,7 +735,7 @@ fn shipped_merchant_hover_scopes_highlight_and_anchors_item_tooltip() {
     let (tip_left, tip_bottom): (f32, f32) = s
         .eval("return GameTooltip:GetLeft(), GameTooltip:GetBottom()")
         .unwrap();
-    assert_eq!(
+    benilla_ui::assert_near!(
         (tip_left, tip_bottom),
         (sword_icon.right, sword_icon.top),
         "tooltip BOTTOMLEFT sits on the icon's TOPRIGHT"
@@ -824,10 +824,7 @@ fn merchant_tabs_drive_buyback_page_and_repair_pair() {
         can_repair: true,
     }));
     s.set_repair_all_cost(76);
-    s.fire_event(
-        "MERCHANT_SHOW",
-        vec![ScriptValue::Str("Kurdram Stonehammer".into())],
-    );
+    s.fire_event("MERCHANT_SHOW", vec![]);
     assert!(s.errors().is_empty(), "show errors: {:?}", s.errors());
 
     // Merchant page: the latest sale in the buyback slot (`MerchantFrame.lua:133`), repair up.
@@ -912,7 +909,7 @@ fn merchant_tabs_fit_their_labels() {
     }
     s.set_money(0);
     s.set_merchant(Some(MerchantState::default()));
-    s.fire_event("MERCHANT_SHOW", vec![ScriptValue::Str("Vendor".into())]);
+    s.fire_event("MERCHANT_SHOW", vec![]);
     s.resolve();
 
     let (l1, l2, w1, w2, m1, m2): (f64, f64, f64, f64, f64, f64) = s
@@ -923,12 +920,12 @@ fn merchant_tabs_fit_their_labels() {
         )
         .unwrap();
     assert!(l1 > 0.0 && l2 > 0.0, "both labels measured synchronously");
-    assert_eq!(
+    benilla_ui::assert_near!(
         (w1, w2),
         (l1 + SIDES, l2 + SIDES),
         "text + 40, not the fixed 115"
     );
-    assert_eq!((m1, m2), (l1, l2), "middle slices stretch to the text");
+    benilla_ui::assert_near!((m1, m2), (l1, l2), "middle slices stretch to the text");
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 

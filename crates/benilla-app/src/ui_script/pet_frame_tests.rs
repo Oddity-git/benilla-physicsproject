@@ -70,7 +70,14 @@ fn pet(name: &str, health: u32, power: u32, max_power: u32, power_type: u8) -> U
         (POWER1 + slot, power),
         (MAXPOWER1 + slot, max_power),
     ]));
-    crate::ui_unit::snapshot(&store, 0, Some(name.into()), 0, None, Default::default())
+    crate::ui_unit::snapshot(
+        &store,
+        0,
+        Some(name.into()),
+        0,
+        Default::default(),
+        Default::default(),
+    )
 }
 
 /// Every texture path drawn this frame, with its vertex tint.
@@ -202,7 +209,15 @@ fn a_powerless_pet_wears_the_no_mana_plate() {
         )
         .unwrap();
     assert!(visible);
-    assert_eq!((r, g, b), (1.0, 0.5, 0.25), "FOCUS, not the mana default");
+    assert_eq!(
+        (r, g, b),
+        (
+            benilla_ui::color::quant::read(1.0),
+            benilla_ui::color::quant::read(0.5),
+            benilla_ui::color::quant::read(0.25)
+        ),
+        "FOCUS, not the mana default"
+    );
     assert!(draws(&mut s, PLAIN), "the plate with a mana rail");
     assert!(!draws(&mut s, NO_MANA));
 
@@ -346,7 +361,7 @@ fn every_leg_of_the_pet_frame_click_reaches_a_live_binding() {
         "SpellTargetUnit",
     ] {
         assert!(
-            s.eval::<bool>(&format!("return _G[\"{global}\"] ~= nil"))
+            s.eval::<bool>(&format!("return getfenv(0)[\"{global}\"] ~= nil"))
                 .unwrap_or(false),
             "{global} is not registered — the pet frame's click calls it"
         );

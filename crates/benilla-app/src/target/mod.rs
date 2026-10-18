@@ -20,6 +20,9 @@ pub(crate) mod click;
 // `pub(crate)` for the hover inspector, which runs the cursor's `cursor_mode::go_highlightable`.
 pub(crate) mod cursor_mode;
 mod flash;
+mod front;
+#[cfg(test)]
+mod front_tests;
 mod highlight;
 pub(crate) mod hover;
 mod hover_probe;
@@ -63,13 +66,17 @@ pub(crate) use price_discount::vendor_price_discount;
 #[cfg(test)]
 pub(crate) use price_discount::{stormwind_fixture, HUMAN_WARRIOR};
 pub(crate) use relations::{
-    can_assist, can_attack, can_interact, corpse_friendly, is_possessed_by, UNIT_FLAG_POSSESSED,
+    can_assist, can_attack, can_interact, corpse_friendly, is_possessed_by, is_selectable, Assist,
+    UNIT_FLAG_POSSESSED,
 };
 // The attack validator's target half, run in the call that asks, for the player's Attack and the
 // pet bar's; the melee probe's press with nothing selected.
-pub(crate) use scan::{AttackNearestRequest, AttackPick};
-// The chat layer's by-name asks (`/target`, `/assist`).
-pub(crate) use by_name::{AssistRequest, PlayerLookup, TargetByNameRequest};
+#[cfg(test)]
+pub(crate) use scan::LastEnemy;
+pub(crate) use scan::{AttackNearestRequest, AttackPick, CreatureTypes};
+// The chat layer's by-name asks (`/target`, `/assist`), and the typemask `TargetByName`'s
+// candidate feed shares.
+pub(crate) use by_name::{AssistRequest, Candidacy, NameSearch, PlayerLookup, TargetByNameRequest};
 // The one SetSelection path, for the loot response's select (`0x48f3a0`).
 pub(crate) use by_name::SelectCommit;
 // The reaction decode and its faction catalog, which also tint the target frame

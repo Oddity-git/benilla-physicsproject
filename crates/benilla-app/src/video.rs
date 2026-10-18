@@ -107,14 +107,39 @@ pub(crate) fn window_mode(
 /// does not flash windowed until `Startup`. `MonitorSelection::Primary`, since `Current` has no
 /// answer before the window exists (`bevy_winit::select_monitor`).
 pub(crate) fn boot_window_mode() -> WindowMode {
-    let flag = |name| crate::cvars::boot_cvar(name).and_then(|v| v.parse::<f32>().ok());
+    // Quiet and lazy: the log plugin does not exist yet, and a config holding both rows needs no
+    // locale at all.
+    boot_window_mode_for(
+        || crate::ui_script::boot_client_locale().index(),
+        crate::cvars::boot_cvar,
+        windowed_env(),
+    )
+}
+
+/// [`boot_window_mode`] on a client whose locale index `locale` answers, asked only when a row is
+/// not stored, with `stored` answering for `config.toml`: a row the file does not hold boots at its
+/// registered default there, which zhCN's differs from the other locales' (`0x63a738`). A stored
+/// row reads as the load then applies it, through the record's float and integer
+/// ([`crate::cvars::CvarChanged::num`], [`crate::cvars::CvarChanged::flag`]), so text that is no
+/// number reads 0 on both.
+fn boot_window_mode_for(
+    locale: impl Fn() -> usize,
+    stored: impl Fn(&str) -> Option<String>,
+    windowed_env: bool,
+) -> WindowMode {
+    let text = |name: &str| {
+        stored(name)
+            .or_else(|| crate::cvars::registered_default(name, locale()).map(str::to_string))
+    };
     // A run that sizes its own window owns both rows for the session.
-    let (display, maximize) = if windowed_env() {
+    let (display, maximize) = if windowed_env {
         (DisplayMode::Windowed, false)
     } else {
         (
-            flag("gxWindow").map_or_else(DisplayMode::default, display_from_flag),
-            flag("gxMaximize").is_some_and(|v| v != 0.0),
+            text("gxWindow").map_or_else(DisplayMode::default, |v| {
+                display_from_flag(crate::cvars::record_float(&v))
+            }),
+            text("gxMaximize").is_some_and(|v| benilla_ui::script::s_str_to_int(&v) != 0),
         )
     };
     window_mode(display, maximize, MonitorSelection::Primary)
@@ -181,7 +206,6 @@ pub(crate) fn on_cvar(
     particles: Option<ResMut<benilla_world::particles::ParticleTuning>>,
     mut spell_effect_level: ResMut<SpellEffectLevel>,
     mut ffx: ResMut<benilla_world::ffx_glow::FfxSwitches>,
-    mut console: Option<ResMut<crate::console::ConsoleEcho>>,
     mut cvars: ResMut<crate::cvars::Cvars>,
 ) {
     use benilla_world::view::{FARCLIP_RANGE, MSAA_RANGE};
@@ -208,6 +232,8 @@ pub(crate) fn on_cvar(
             }
             info!("video: full-screen effects {:?}", *ffx);
         }
+        // The registry refuses a value outside the callback's range (`0x688d40`); the clamp only
+        // keeps the knob in it.
         "farclip" => view.farclip = v.clamp(*FARCLIP_RANGE.start(), *FARCLIP_RANGE.end()),
         // Clamped, where the reference refuses an out-of-range write and keeps the value
         // (`0x688d90` echoes "NearClip must be in range 0.01 - 0.33" and returns 0).
@@ -248,10 +274,11 @@ pub(crate) fn on_cvar(
                 &benilla_ui::script::small_cull_text(v.clamp(0.0, 2.0) as usize),
             );
         }
-        // The same knob in the reference's cells per chunk, clamped to `[1, 256]`
-        // (`ClutterConfig::set_frill_density`); the loaded tiles re-scatter off the change.
+        // The same knob in the reference's cells per chunk, which the registry holds to `[1, 256]`
+        // (`0x688de0`); the callback hands on `SStrToInt`'s integer (`0x688dfa`), so "48.9" is 48.
+        // The loaded tiles re-scatter off the change.
         "frilldensity" => {
-            clutter.set_frill_density(v);
+            clutter.set_frill_density(benilla_ui::script::s_str_to_int(&ev.new) as f32);
             cvars.mirror(
                 benilla_ui::script::CVAR_WORLD_DETAIL,
                 &(clutter.density - 1.0).to_string(),
@@ -266,11 +293,9 @@ pub(crate) fn on_cvar(
         // `particleDensity`. The reference runs it on every write, an unchanged one included; an
         // observer fires only on a change.
         "spelleffectlevel" => {
-            spell_effect_level.0 = benilla_ui::script::sstr_to_int(&ev.new);
+            spell_effect_level.0 = benilla_ui::script::s_str_to_int(&ev.new);
             let level = spell_effect_level.0.clamp(0, 2);
-            if let Some(console) = console.as_mut() {
-                console.print(format!("Spell effect level set to {level}."));
-            }
+            cvars.print(format!("Spell effect level set to {level}."));
             if let Some(mut particles) = particles {
                 particles.set_density(spell_effect_scale(level));
             }
@@ -303,30 +328,23 @@ pub(crate) fn spell_effect_scale(level: i32) -> f32 {
     }
 }
 
-/// `/console detailDoodadAlpha [0..255]`, the reference's console command (`0x6739a0`, registered
-/// by `0x63f9e0` as a command, not a CVar, so it never persists): the ground-clutter cutout that
-/// `texel.a x distance_ramp` is tested against, so at the default 128 grass ends ~61 yd out of
-/// the 70 yd horizon. Out of range is rejected (`0x6739b9`) with a readout. A bare command also
-/// prints the readout, where the reference reads an uninitialised stack slot.
+/// `/console detailDoodadAlpha <n>`, the reference's console command (`0x6739a0`, registered by
+/// `0x63f9e0` as a command, not a CVar, so it never persists): the ground-clutter cutout that
+/// `texel.a x distance_ramp` is tested against (`[0xc7b2fc]`, 128 at `0x66f861`), so at the
+/// default grass ends ~61 yd out of the 70 yd horizon. `sscanf(args, "%d")` (`0x835154`), then an
+/// unsigned compare with 255 (`0x6739b9`): in range it is set without a word, above it (a
+/// negative too) only "Alpha ref range 0 - 255." (`0x867f6c`) is printed. With no number the
+/// slot keeps what `push ecx` left in it, the parse buffer's address `0xc4ee08`, which is above
+/// 255.
 fn detail_doodad_alpha(world: &mut World, args: &str) -> Vec<String> {
-    let Some(mut clutter) = world.get_resource_mut::<benilla_world::clutter::ClutterConfig>()
-    else {
-        return vec!["detailDoodadAlpha: this run has no ground clutter".to_string()];
-    };
-    match args
-        .split_whitespace()
-        .next()
-        .and_then(|v| v.parse::<u8>().ok())
-    {
-        Some(v) => {
-            clutter.alpha_ref = f32::from(v) / 255.0;
-            vec![format!("detailDoodadAlpha set to {v}")]
-        }
-        None => vec![format!(
-            "detailDoodadAlpha is {} (usage: /console detailDoodadAlpha 0-255)",
-            (clutter.alpha_ref * 255.0).round() as u32
-        )],
+    let alpha = benilla_ui::script::scanf_d(args).map_or(0x00c4_ee08, |v| v as u32);
+    if alpha > 0xff {
+        return vec!["Alpha ref range 0 - 255.".to_string()];
     }
+    if let Some(mut clutter) = world.get_resource_mut::<benilla_world::clutter::ClutterConfig>() {
+        clutter.alpha_ref = alpha as f32 / 255.0;
+    }
+    Vec::new()
 }
 
 impl Plugin for VideoPlugin {
@@ -334,9 +352,11 @@ impl Plugin for VideoPlugin {
         use crate::console::ConsoleCommandApp;
         app.init_resource::<SpellEffectLevel>();
         app.add_observer(on_cvar);
+        // Category 1 with no help (`0x66fae8`-`0x66faf5`).
         app.console_command(
             "detailDoodadAlpha",
-            "The ground-clutter cutout reference, 0-255 (128 = the default).",
+            crate::console::GRAPHICS,
+            None,
             detail_doodad_alpha,
         );
         app.init_resource::<VideoConfig>()
@@ -572,7 +592,7 @@ fn display_session() -> String {
 
 /// Push vsync to the window only when the setting moves or a `RestartGx()` asks: the capture
 /// probes write `present_mode` directly, and their override must stick.
-fn apply_present_mode(
+pub(crate) fn apply_present_mode(
     cfg: Res<VideoConfig>,
     restarts: Res<GxRestarts>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
@@ -600,7 +620,7 @@ fn apply_present_mode(
 /// Push the display mode to the window, gated as [`apply_present_mode`] is. The guard matches the
 /// variant, not the monitor: birth uses `Primary` and a live toggle `Current`, so a `!=` compare
 /// would re-assert fullscreen on every launch.
-fn apply_window_mode(
+pub(crate) fn apply_window_mode(
     cfg: Res<VideoConfig>,
     restarts: Res<GxRestarts>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
@@ -651,6 +671,36 @@ fn apply_window_mode(
 mod tests {
     use super::*;
 
+    /// `0x6739a0`: `sscanf %d` and an unsigned compare with 255. In range it sets the cutout and
+    /// says nothing; above it, a negative and text with no number print only the range line.
+    #[test]
+    fn detail_doodad_alpha_reads_like_the_references_command() {
+        let mut world = World::new();
+        world.insert_resource(benilla_world::clutter::ClutterConfig::default());
+        let at = |w: &World| {
+            (w.resource::<benilla_world::clutter::ClutterConfig>()
+                .alpha_ref
+                * 255.0)
+                .round() as u32
+        };
+        for (args, said, now) in [
+            ("12abc", None, 12),
+            (" +12", None, 12),
+            ("200", None, 200),
+            ("300", Some("Alpha ref range 0 - 255."), 200),
+            ("-1", Some("Alpha ref range 0 - 255."), 200),
+            ("", Some("Alpha ref range 0 - 255."), 200),
+            ("abc", Some("Alpha ref range 0 - 255."), 200),
+        ] {
+            let lines = detail_doodad_alpha(&mut world, args);
+            assert_eq!(
+                lines,
+                said.map(String::from).into_iter().collect::<Vec<_>>(),
+                "{args:?}"
+            );
+            assert_eq!(at(&world), now, "{args:?}");
+        }
+    }
     /// Synced is `Fifo`, not `AutoVsync` (`FifoRelaxed`, which tears on a late frame).
     #[test]
     fn the_default_is_synced_like_the_window_literal() {
@@ -676,6 +726,84 @@ mod tests {
         assert_eq!(
             window_mode(DisplayMode::Windowed, false, MonitorSelection::Primary),
             WindowMode::Windowed
+        );
+    }
+
+    /// The window is born in the mode its rows register at on this locale, a stored value over
+    /// that, and a run that sizes its own window over both. zhCN registers windowed and maximized
+    /// (`0x63a738`), which is borderless over the monitor, as every other locale's fullscreen is
+    /// here; they part when the player stores one of the two rows: a stored "0" for `gxMaximize`
+    /// leaves zhCN windowed where another locale stays fullscreen.
+    #[test]
+    fn the_window_is_born_at_the_locales_registered_modes() {
+        let none = |_: &str| None;
+        let fullscreen = WindowMode::BorderlessFullscreen(MonitorSelection::Primary);
+        for locale in 0..8 {
+            assert_eq!(boot_window_mode_for(|| locale, none, false), fullscreen);
+        }
+        // zhCN with the player's stored windowed, unmaximized choice.
+        let stored = |name: &str| match name {
+            "gxWindow" => Some("1".to_string()),
+            "gxMaximize" => Some("0".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            boot_window_mode_for(|| 4, stored, false),
+            WindowMode::Windowed
+        );
+        assert_eq!(
+            boot_window_mode_for(|| 0, stored, false),
+            WindowMode::Windowed
+        );
+        // The player un-maximizes only the maximize row: zhCN's windowed default then stands
+        // unmaximized, enUS's fullscreen default stands fullscreen.
+        let unmaximized = |name: &str| (name == "gxMaximize").then(|| "0".to_string());
+        assert_eq!(
+            boot_window_mode_for(|| 4, unmaximized, false),
+            WindowMode::Windowed
+        );
+        assert_eq!(boot_window_mode_for(|| 0, unmaximized, false), fullscreen);
+        // An instrumented run stays windowed whatever the locale registers.
+        assert_eq!(boot_window_mode_for(|| 4, none, true), WindowMode::Windowed);
+    }
+
+    /// A stored value that is no number loads as it is and reads 0 (`InternalSet` `0x63e0b0` has
+    /// no parse check), so the window is born as the load then applies it, instead of flipping
+    /// after: zhCN with `gxWindow = "x"` is fullscreen, as enUS is; and `gxMaximize = "0.5"` reads
+    /// the record's integer, 0.
+    #[test]
+    fn a_stored_row_that_is_no_number_boots_as_the_load_applies_it() {
+        let junk = |name: &str| match name {
+            "gxWindow" => Some("x".to_string()),
+            "gxMaximize" => Some("0".to_string()),
+            _ => None,
+        };
+        for locale in [4, 0] {
+            assert_eq!(
+                boot_window_mode_for(|| locale, junk, false),
+                WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
+                "locale {locale}"
+            );
+        }
+        let half = |name: &str| match name {
+            "gxWindow" => Some("1".to_string()),
+            "gxMaximize" => Some("0.5".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            boot_window_mode_for(|| 0, half, false),
+            WindowMode::Windowed
+        );
+    }
+
+    /// Both rows stored, the locale is never asked, so the boot opens no chain for them.
+    #[test]
+    fn a_fully_stored_config_asks_no_locale() {
+        let both = |_: &str| Some("0".to_string());
+        let mode = boot_window_mode_for(|| panic!("the locale was read"), both, false);
+        assert_eq!(
+            mode,
+            WindowMode::BorderlessFullscreen(MonitorSelection::Primary)
         );
     }
 

@@ -3,6 +3,7 @@
 
 use super::lock::GoLockInputs;
 use super::*;
+use crate::query_cache::Ask;
 
 /// The right-click payload leg of the reference's click router (`0x481f60`, clean clicks only,
 /// `0x514ae0`): over terrain (`0x492c90`) or nothing (`0x492d30`) any payload clears, silently.
@@ -30,12 +31,18 @@ pub(super) fn world_right_click_payload(
 /// plate's unit, as a scripted `plate:Click()` (pfUI, `nameplates.lua:1228`) has no cursor; the
 /// right replays [`WorldRightClick`] only when the press pick names it, so a scripted one does
 /// nothing yet. A physical right-click arrives only here: `0x7cb910` → `0x4949f0` → `0x492820`.
+///
+/// The left click is the body click's select (`0x4949f0` action 1 → `0x4925d0` → `SelectTarget`
+/// `0x49280c`), so with the targeting cursor up the unit goes to the cast's bind and the target
+/// stays ([`super::front`]). The right is dropped while the cursor is up: its `0x492820` also binds
+/// (`0x492870`) and then interacts, which is not built.
 pub(super) fn select_on_plate_click(
     mut plate: ResMut<crate::vplates::PlateClicks>,
     press: Res<PressPick>,
     ground: Res<crate::spell::SpellTargeting>,
     mut selection: ResMut<Selection>,
     mut seam: crate::creature_anim::AttackSeam,
+    mut front: super::front::SelectFront,
     self_q: Query<(&Guid, Has<Engaged>), With<SelfPlayer>>,
     mut greeting: MessageWriter<crate::sound::NpcGreetingRequest>,
     mut right_clicks: MessageWriter<WorldRightClick>,
@@ -45,9 +52,6 @@ pub(super) fn select_on_plate_click(
         std::mem::take(&mut plate.left),
         std::mem::take(&mut plate.right),
     );
-    if ground.active() {
-        return;
-    }
     let (self_guid, engaged) = self_q
         .single()
         .map(|(g, e)| (Some(g.0), e))
@@ -58,6 +62,10 @@ pub(super) fn select_on_plate_click(
         };
         // The greeting fires on the select, plate or body, before SetTarget (`0x60c270`).
         greeting.write(crate::sound::NpcGreetingRequest { npc: entity });
+        // `SelectTarget`'s returns: charmed, or the cursor's bind in the select's place.
+        if front.takes(entity, guid.0) {
+            continue;
+        }
         // Attack-classified only when the press was on this unit: a scripted click has no cursor.
         let attack = press.attack() && press.hovered.target == Some(entity);
         scan::commit(
@@ -71,7 +79,7 @@ pub(super) fn select_on_plate_click(
             attack,
         );
     }
-    if right.into_iter().any(|e| press.hovered.target == Some(e)) {
+    if !ground.active() && right.into_iter().any(|e| press.hovered.target == Some(e)) {
         right_clicks.write(WorldRightClick);
     }
 }
@@ -98,8 +106,20 @@ pub(super) fn select_on_click(
     if !clicked || inspect.enabled {
         return;
     }
-    // The ground cursor owns the click (`0x492580`); its commit system runs after this one.
+    // The click router returns for a charmed player before anything (`0x481f98`), greeting included.
+    if seam.player_is_charmed() {
+        return;
+    }
+    // The ground cursor owns the click (`0x492580`); its commit system runs after this one. The
+    // greeter runs ahead of `SelectTarget` for every unit the click names (`0x4927fd`) and nothing
+    // before it tests targeting, so the unit the cursor's click binds is greeted as well, unless a
+    // nearer GameObject takes the click.
     if ground.active() {
+        let object_click = ground.wants(crate::spell::TargetingWants::GameObject)
+            && go_is_nearest(&hovered, &press.object);
+        if let Some(entity) = hovered.target.filter(|_| !object_click) {
+            greeting.write(crate::sound::NpcGreetingRequest { npc: entity });
+        }
         return;
     }
     let (self_guid, engaged) = self_q
@@ -157,17 +177,18 @@ pub(crate) struct ServiceArms<'w> {
 /// The re-click gate (`0x5f0251`), before the ladder: a right-click on the NPC whose window is
 /// open (`[0xb4e2d0]`) does nothing, no packet, no error, no gesture. The reference arms that NPC
 /// only from window openers (`0x4930d0`, cleared at `0x493310`), never on the click, the set
-/// [`crate::ui_session::feed_interact_npc`] collapses (less the mailbox and text reader).
+/// [`crate::ui_session::feed_interact_npc`] publishes.
 fn interaction_already_open_on(target: u64, interact: &crate::ui_session::InteractNpc) -> bool {
     interact.1 == Some(target)
 }
 
 /// The refusals and openers the dispatchers raise.
 #[derive(bevy::ecs::system::SystemParam)]
-pub(crate) struct Feedback<'w> {
+pub(crate) struct Feedback<'w, 's> {
     errors: ResMut<'w, crate::ui_action::UiErrorKeys>,
     cast_errors: ResMut<'w, crate::ui_action::CastErrors>,
-    mail: ResMut<'w, crate::ui_mail::MailOpen>,
+    // The mailbox's open, which registers on the interaction latch with the world in hand.
+    windows: Commands<'w, 's>,
     item_text: ResMut<'w, crate::ui_item_text::ItemTextOpen>,
     // The opener queue: this system cannot also hold `CastLadder` (a second `Items` and
     // `CastErrors` borrow), so the lock verdict goes to `ui_action::drain::drain_go_openers`.
@@ -176,7 +197,7 @@ pub(crate) struct Feedback<'w> {
     stone_uses: MessageWriter<'w, crate::ui_dialog_verbs::MeetingStoneUse>,
 }
 
-impl Feedback<'_> {
+impl Feedback<'_, '_> {
     /// Whether a walk started; the leash's refusal says `ERR_AUTOFOLLOW_TOO_FAR` (`0x61110c`).
     fn walked(&mut self, started: Result<(), crate::player::Refused>) -> bool {
         match started {
@@ -204,6 +225,9 @@ enum MeleeApproach {
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct Dispatch<'w, 's> {
     seam: crate::creature_anim::AttackSeam<'w, 's>,
+    /// The returns ahead of the select both attack-or-click entries make (`SelectTarget`,
+    /// [`super::front`]).
+    front: super::front::SelectFront<'w, 's>,
     self_player: Query<'w, 's, (Entity, &'static Guid, Has<Engaged>), With<SelfPlayer>>,
     // Through `creature_anim::gesture`, the chat path's entry, as the reference's dispatcher does.
     gestures: ResMut<'w, crate::creature_anim::GestureQueue>,
@@ -222,7 +246,7 @@ pub(crate) struct Dispatch<'w, 's> {
     >,
     places: Query<'w, 's, &'static Transform>,
     service: ServiceArms<'w>,
-    feedback: Feedback<'w>,
+    feedback: Feedback<'w, 's>,
     auto: crate::player::AutoMove<'w, 's>,
     player: Res<'w, crate::player::Player>,
 }
@@ -330,11 +354,10 @@ impl Dispatch<'_, '_> {
         walked
     }
 
-    /// `0x5f86b0`, `OnUse` past its highlightable gate: the GameObject's own mounted gate, its type's
-    /// use handler, then its lock. A usable object out of `in_reach` goes to
+    /// `0x5f86b0`, `OnUse` past its highlightable gate: `usable`'s player arms, its type's use
+    /// handler, then its lock. A usable object out of `in_reach` goes to
     /// [`Self::walk_to_object`].
     fn use_gameobject(&mut self, entity: Entity, guid: u64, in_reach: bool, walk: bool) {
-        let self_mounted = self.mounted();
         let self_store = self
             .me()
             .and_then(|(e, ..)| self.stores.get(e).ok())
@@ -344,12 +367,9 @@ impl Dispatch<'_, '_> {
             .get(entity)
             .ok()
             .map(|(s, anim)| (s, crate::go_anim::go_state(anim, s)));
-        // The GameObject's own mounted gate (`0x5f31a8`) returns before the opener: no packet, no
-        // cast. It applies only without a Lock.dbc row (`0x5f8180`, a pointer test, so an
-        // all-empty row counts, unlike `LockCatalog::is_locked`); a locked object is refused by
-        // its opener cast. Only MAILBOX is exempt (`0x5f31bb`). Silent: the key has no text or
-        // sound, and `0x4945b0` drops the empty string.
-        let lock_id = self.go_inputs.templates.get(guid).map_or(0, |t| t.lock_id);
+        let lock_id = go
+            .and_then(|(s, _)| self.go_inputs.templates.of(&s.0))
+            .map_or(0, |t| t.lock_id);
         let has_lock_row = lock_id != 0
             && self
                 .go_inputs
@@ -357,10 +377,18 @@ impl Dispatch<'_, '_> {
                 .as_deref()
                 .is_some_and(|l| l.0.slots(lock_id).is_some());
         let go_type = go.map_or(-1, |(s, _)| s.0.gameobject_type_id());
-        if self_mounted && !has_lock_row && go_type != cursor_mode::GO_TYPE_MAILBOX {
-            debug!(
-                "right-click gameobject {guid:#x}: refused, mounted (lock-less type {go_type}, silent)"
-            );
+        // The player arms refuse ahead of the range arm, so a dead player is never walked there,
+        // and before the opener: no packet, no cast, no mail window.
+        if let Some(refusal) =
+            self_store.and_then(|me| cursor_mode::go_player_refusal(me, has_lock_row, go_type))
+        {
+            debug!("right-click gameobject {guid:#x}: refused, {refusal:?} (type {go_type})");
+            if let Some(key) = refusal.error_key() {
+                self.feedback
+                    .errors
+                    .0
+                    .push(crate::ui_action::UiError::key(key));
+            }
             return;
         }
         // MAILBOX (type 19) opens locally: its use handler `0x5f6820` sends no
@@ -368,7 +396,9 @@ impl Dispatch<'_, '_> {
         if go_type == cursor_mode::GO_TYPE_MAILBOX {
             if in_reach {
                 debug!("right-click mailbox: open mail window {guid:#x}");
-                self.feedback.mail.click(guid);
+                self.feedback
+                    .windows
+                    .queue(move |world: &mut World| crate::ui_mail::open_mailbox(world, guid));
             } else {
                 self.walk_to_object(entity, guid, go_type, walk);
             }
@@ -379,11 +409,10 @@ impl Dispatch<'_, '_> {
         if go_type == cursor_mode::GO_TYPE_TEXT {
             if !in_reach {
                 self.walk_to_object(entity, guid, go_type, walk);
-            } else if self.feedback.item_text.toggle_closed(guid) {
+            } else if self.feedback.item_text.read_pages(guid) {
                 debug!("right-click text gameobject: re-click closes {guid:#x}");
             } else {
                 debug!("right-click text gameobject: read {guid:#x}");
-                self.feedback.item_text.open_pages(guid);
             }
             return;
         }
@@ -856,7 +885,13 @@ fn interact(dispatch: &mut Dispatch, press: &PressPick, mut select: Select) {
     // sword, not the fork, as the re-swing also needs the player's own legs.
     // Deref'd only where it commits: a leg that does not select leaves the change tick alone.
     let commit = |seam: &mut crate::creature_anim::AttackSeam,
+                  front: &mut super::front::SelectFront,
                   selection: &mut ResMut<Selection>| {
+        // Both selects are `SelectTarget`'s (`0x492870`, `0x5eccaa`): charmed, or a standing
+        // cursor's bind in its place.
+        if front.takes(entity, guid) {
+            return scan::CommitOutcome::default();
+        }
         scan::commit(
             selection,
             seam,
@@ -869,7 +904,7 @@ fn interact(dispatch: &mut Dispatch, press: &PressPick, mut select: Select) {
         )
     };
     let mut outcome = match &mut select {
-        Select::First(selection) => commit(&mut dispatch.seam, selection),
+        Select::First(selection) => commit(&mut dispatch.seam, &mut dispatch.front, selection),
         Select::OnAttack(_) => scan::CommitOutcome::default(),
     };
     match unit_branch(attack, dead_fork, leg) {
@@ -900,7 +935,7 @@ fn interact(dispatch: &mut Dispatch, press: &PressPick, mut select: Select) {
                 // StartAttack's own select (`0x5eccaa`), past its gates and before the swing
                 // (`0x5eccfd`): the click's commit, with its stop and re-swing mid-combat.
                 if let Select::OnAttack(selection) = &mut select {
-                    outcome = commit(&mut dispatch.seam, selection);
+                    outcome = commit(&mut dispatch.seam, &mut dispatch.front, selection);
                 }
                 debug!("right-click attack: {guid:#x}");
                 // `0x5ecb70`'s body through the seam; `swung` means the commit's re-swing already
@@ -1098,7 +1133,7 @@ pub(crate) fn resolve_go_action(
     me_store: Option<&ObjectStore>,
     net: &NetCommands,
 ) -> GoAction {
-    let Some(tmpl) = inputs.templates.get(guid) else {
+    let Some(tmpl) = inputs.templates.of_guid(&inputs.objects, guid) else {
         return GoAction::Use;
     };
     let Some(locks) = inputs.locks.as_deref() else {
@@ -1131,7 +1166,7 @@ pub(crate) fn resolve_go_action(
             // The toast routing keys off Lock.dbc slot 0, whichever slot the resolver walked.
             let slot0 = slots[0];
             let key = if slot0.key_type == benilla_formats::LOCK_KEY_ITEM {
-                match inputs.items.template(slot0.index, 0, net) {
+                match inputs.items.template(slot0.index, 0, Ask::Event(net)) {
                     Some(info) => KeyFact::Named(info.name.clone()),
                     None => KeyFact::Unknown,
                 }
@@ -1167,7 +1202,7 @@ pub(crate) fn resolve_go_action(
     };
     // An uncached template queries and does nothing this click. `use_spell_index` is the spell
     // block ordinal, the packet's third byte.
-    let Some(tmpl) = inputs.items.template(key_entry, 0, net) else {
+    let Some(tmpl) = inputs.items.template(key_entry, 0, Ask::Event(net)) else {
         return GoAction::Refuse(None);
     };
     let Some(spell_index) = tmpl.use_spell_index() else {
@@ -1504,6 +1539,10 @@ pub(super) fn deselect(
     seam: &mut crate::creature_anim::AttackSeam,
     engaged: bool,
 ) {
+    // Charmed returns before the guid test (`0x49359c`), so a deselect is refused too.
+    if seam.player_is_charmed() {
+        return;
+    }
     if selection.guid.is_some() {
         selection.last = selection.guid;
     }
@@ -1941,21 +1980,30 @@ mod tests {
         assert!(!interaction_already_open_on(NPC, &idle));
         assert!(!interaction_already_open_on(OTHER, &idle));
 
-        // One opener per family (a menu, a quest panel, a specialized window) arms its own NPC.
+        // One opener per family (a menu, a quest panel, a specialized window) arms its own NPC,
+        // through the latch it registers on (`0x4930d0`).
         let with_gossip = armed(&|w| {
-            let mut g = crate::ui_gossip::GossipState::default();
-            g.npc = Some(NPC);
-            w.insert_resource(g);
+            w.init_resource::<crate::ui_gossip::GossipState>();
+            crate::ui_session::register(w, NPC);
+            w.resource_mut::<crate::ui_gossip::GossipState>().npc = Some(NPC);
         });
         let with_quest = armed(&|w| {
-            let mut q = crate::ui_quest::QuestGiver::default();
-            q.npc = Some(NPC);
-            w.insert_resource(q);
+            w.init_resource::<crate::ui_quest::QuestGiver>();
+            crate::ui_quest::open_panel(
+                w,
+                NPC,
+                crate::ui_quest::QuestView::Greeting(benilla_protocol::messages::QuestGiverList {
+                    npc: NPC,
+                    greeting: String::new(),
+                    emote_delay: 0,
+                    emote: 0,
+                    quests: Vec::new(),
+                }),
+            );
         });
         let with_trainer = armed(&|w| {
-            let mut t = crate::ui_trainer::TrainerOpen::default();
-            t.open(NPC, 0, Vec::new(), String::new());
-            w.insert_resource(t);
+            w.init_resource::<crate::ui_trainer::TrainerOpen>();
+            crate::ui_trainer::open_trainer(w, NPC, 0, Vec::new(), String::new());
         });
         for (what, armed) in [
             ("gossip", &with_gossip),
@@ -1977,10 +2025,9 @@ mod tests {
 
         // Closing the window disarms it, as the reference's `0x493310` zeroes the pair.
         let closed = armed(&|w| {
-            let mut t = crate::ui_trainer::TrainerOpen::default();
-            t.open(NPC, 0, Vec::new(), String::new());
-            t.clear();
-            w.insert_resource(t);
+            w.init_resource::<crate::ui_trainer::TrainerOpen>();
+            crate::ui_trainer::open_trainer(w, NPC, 0, Vec::new(), String::new());
+            crate::ui_trainer::close_core(w);
         });
         assert_eq!(closed.1, None);
         assert!(!interaction_already_open_on(NPC, &closed));
@@ -2079,6 +2126,8 @@ mod tests {
         world.init_resource::<Messages<WorldRightClick>>();
         world.init_resource::<PressPick>();
         world.init_resource::<Selection>();
+        world.init_resource::<crate::spell::SpellTargeting>();
+        world.init_resource::<crate::spell::CursorPicks>();
         world.init_resource::<crate::spell::QueuedMeleeSpell>();
         world.init_resource::<crate::spell::AutoRepeatActive>();
         world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
@@ -2517,6 +2566,67 @@ mod tests {
                 "{x} yd"
             );
             assert!(!world.is_resource_changed::<Selection>(), "{x} yd");
+        }
+    }
+
+    /// `usable 0x5f3130`'s player arms: dead or a ghost (`0x5f315f`) grays every object's cursor and
+    /// its use raises `ERR_PLAYER_DEAD` (0x7e) with nothing sent and no mail window; mounted
+    /// (`0x5f31a8`) grays a lock-less chest silently, never a mailbox (`0x5f31bb`).
+    #[test]
+    fn a_dead_ghost_or_mounted_player_is_refused_an_object_in_reach() {
+        const F_PLAYER_FLAGS: u16 = 190;
+        const F_MOUNT: u16 = benilla_protocol::field::FIELD_UNIT_MOUNTDISPLAYID;
+        const DEAD: &[(u16, u32)] = &[(F_HEALTH, 0), (F_MAXHEALTH, 100)];
+        const GHOST: &[(u16, u32)] = &[(F_HEALTH, 1), (F_MAXHEALTH, 100), (F_PLAYER_FLAGS, 0x10)];
+        const MOUNTED: &[(u16, u32)] = &[(F_HEALTH, 100), (F_MAXHEALTH, 100), (F_MOUNT, 14_337)];
+        const LIVE: &[(u16, u32)] = &[(F_HEALTH, 100), (F_MAXHEALTH, 100)];
+        const REFUSED: Option<&str> = Some("ERR_PLAYER_DEAD");
+        // (label, our fields, GameObject type, grayed, used, error key)
+        let cases = [
+            ("dead chest", DEAD, 3, true, false, REFUSED),
+            ("dead mailbox", DEAD, 19, true, false, REFUSED),
+            ("ghost chest", GHOST, 3, true, false, REFUSED),
+            ("ghost mailbox", GHOST, 19, true, false, REFUSED),
+            ("mounted chest", MOUNTED, 3, true, false, None),
+            ("mounted mailbox", MOUNTED, 19, false, true, None),
+            ("live chest", LIVE, 3, false, true, None),
+            ("live mailbox", LIVE, 19, false, true, None),
+        ];
+        for (label, own, go_type, grayed, used, error) in cases {
+            let (mut world, _vendor, rx) = walking_world(Vec3::ZERO, false);
+            let me = world
+                .query_filtered::<Entity, With<SelfPlayer>>()
+                .single(&world)
+                .unwrap();
+            world.entity_mut(me).insert(store(own));
+            let object = spawn_object(&mut world, go_type, Vec3::new(2.0, 0.0, 0.0));
+            let hovered = HoveredObject {
+                target: Some(object),
+                guid: Some(CHEST),
+                distance: 2.0,
+            };
+            let cursor = world
+                .run_system_once(move |inputs: cursor_mode::CursorInputs| {
+                    cursor_mode::classify(&inputs, &Hovered::default(), &hovered).0
+                })
+                .unwrap();
+            assert_eq!(cursor.unable, grayed, "{label}: {cursor:?}");
+            interact_with(&mut world, object);
+            let sent_use = rx
+                .try_iter()
+                .any(|c| matches!(c, ClientCommand::GameObjUse { .. }));
+            let mail_open = world
+                .resource::<crate::ui_mail::MailOpen>()
+                .mailbox
+                .is_some();
+            assert_eq!(sent_use || mail_open, used, "{label}");
+            let keys: Vec<&str> = world
+                .resource::<crate::ui_action::UiErrorKeys>()
+                .0
+                .iter()
+                .map(|e| e.key)
+                .collect();
+            assert_eq!(keys, error.into_iter().collect::<Vec<_>>(), "{label}");
         }
     }
 

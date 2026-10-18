@@ -22,7 +22,7 @@
 use mlua::{Lua, MultiValue, Value};
 
 use super::binding_abi::{flag, number_arg, string_arg};
-use super::glue_core::{call, glue_status_key, leading_int, GlueCall};
+use super::glue_core::{call, glue_status_key, GlueCall};
 use super::{check_char_name, Model, ScriptValue, CHAR_NAME_SUCCESS};
 
 /// The record flag a server sets on a character it wants renamed (`[rec+0xfc]` bit `0x4000`,
@@ -102,6 +102,12 @@ pub struct GlueScenePane {
     /// The pane is the create screen's customize frame (`[0xb420f0]`), whose scene the preview
     /// character stands in.
     pub create: bool,
+    /// The root inputs the paint places the scene by (`0x76d1a0`): `SetModelScale`, the frame's
+    /// effective scale, `SetPosition` in layout units and `SetFacing` in radians.
+    pub model_scale: f32,
+    pub layout_scale: f32,
+    pub position: [f32; 3],
+    pub facing: f32,
 }
 
 /// A record of the array: the character and whether `+0x110`, the built composite, is set.
@@ -112,7 +118,7 @@ struct Record {
 }
 
 /// The roster and the select screen's cells the verbs read.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GlueRoster {
     records: Vec<Record>,
     cells: GlueSelectCells,
@@ -297,9 +303,7 @@ impl super::UiScript {
     /// otherwise the cell is set to 0 (`0x472556`), the `lastCharacterIndex` CVar's integer is
     /// selected (`0x472550`-`0x472563`) and `CHARACTER_LIST_UPDATE` fires.
     pub fn load_glue_roster(&mut self, roster: Vec<GlueCharacter>) -> bool {
-        let last = self
-            .cvar("lastCharacterIndex")
-            .map_or(0, |v| i32::try_from(leading_int(&v)).unwrap_or(0));
+        let last = self.cvar_int("lastCharacterIndex").unwrap_or(0);
         let count = roster.len();
         {
             let mut model = self.model_mut();
@@ -377,8 +381,7 @@ fn scene_pane(model: &Model, h: crate::widget::FrameHandle) -> Option<GlueSceneP
     Some(GlueScenePane {
         handle: h,
         rect: model
-            .resolved
-            .get(&h)
+            .frame_rect(h)
             .filter(|_| sw > 0.0 && sh > 0.0)
             .map(|r| {
                 [
@@ -393,6 +396,10 @@ fn scene_pane(model: &Model, h: crate::widget::FrameHandle) -> Option<GlueSceneP
         fog: m.scene_fog(),
         select: model_frame_handle(model) == Some(h),
         create: super::glue_create::create_frame_handle(model) == Some(h),
+        model_scale: m.scale,
+        layout_scale: f.effective_scale,
+        position: m.position.into(),
+        facing: m.facing,
     })
 }
 
@@ -597,7 +604,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             if name.is_empty() {
                 return Ok(MultiValue::new());
             }
-            let (guid, old, lists) = {
+            let (guid, old, lists, charsets) = {
                 let m = model(lua);
                 let Some(record) = usize::try_from(index)
                     .ok()
@@ -610,6 +617,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     record.character.guid,
                     record.character.name.clone(),
                     m.glue.name_lists(),
+                    m.name_charsets(),
                 )
             };
             let force_rename = |key: &str| {
@@ -625,7 +633,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             }
             // `0x46b340`: a zero guid sends nothing and answers 1 (`0x46b355`).
             if guid != 0 {
-                let status = check_char_name(Some(&name), &*lists);
+                let status = check_char_name(Some(&name), &*lists, charsets);
                 if status != CHAR_NAME_SUCCESS {
                     force_rename(glue_status_key(i32::from(status)));
                     return Ok(MultiValue::from_vec(vec![Value::Nil]));
@@ -1059,7 +1067,7 @@ mod tests {
         s.run("High:SetPoint('TOPLEFT', 256, -192) High:SetWidth(512) High:SetHeight(384)")
             .unwrap();
         s.resolve();
-        assert_eq!(
+        crate::assert_near!(
             s.glue_scene().unwrap().rect,
             Some([0.25, 0.75, 0.25, 0.75]),
             "the rect as screen fractions from the top-left"
@@ -1181,6 +1189,18 @@ mod tests {
         s.set_cvar_engine("lastCharacterIndex", "-3");
         assert!(!s.load_glue_roster(three()));
         assert_eq!(fired(&s)[0], "UPDATE_SELECTED_CHARACTER 1");
+        // The record's integer is `SStrToInt` (`0x472560` reads `+0x28`): no whitespace skip and
+        // no `+`, so these read 0, and the 32-bit wrap makes `4294967298` 2.
+        for (text, picked) in [(" 2", "1"), ("+2", "1"), ("2x", "3"), ("4294967298", "3")] {
+            s.run("FIRED = {}").unwrap();
+            s.set_cvar_engine("lastCharacterIndex", text);
+            assert!(!s.load_glue_roster(three()));
+            assert_eq!(
+                fired(&s)[0],
+                format!("UPDATE_SELECTED_CHARACTER {picked}"),
+                "{text:?}"
+            );
+        }
     }
 
     /// A VM over `three()` with Bravo flagged for a rename, `FIRED` also logging
@@ -1336,6 +1356,51 @@ mod tests {
                 ] if a == "Newname" && b == "Zoë"
             ),
             "{queued:?}"
+        );
+    }
+
+    /// The rename's check holds the name to the client's charsets (`0x46b36f` → `0x5abd50`): a
+    /// Hangul name is the host's on a koKR client and invalid on an enUS one, and a `Region` of
+    /// 2 gives enUS the same Hangul pair.
+    #[test]
+    fn rename_character_checks_the_clients_charsets() {
+        let hangul = "RenameCharacter(2, '한글')";
+        let key = |s: &mut super::super::UiScript| {
+            s.run("FIRED = {}").unwrap();
+            s.eval::<f64>(&format!(
+                "local function n(...) return arg.n end return n({hangul})"
+            ))
+            .unwrap();
+            fired(s)
+        };
+        let mut s = rename_vm();
+        assert_eq!(
+            key(&mut s),
+            ["FORCE_RENAME_CHARACTER CHAR_NAME_INVALID_CHARACTER"]
+        );
+        assert!(s.take_glue_calls().is_empty());
+
+        s.set_locale(1);
+        assert!(key(&mut s).is_empty(), "koKR takes Hangul");
+        assert!(matches!(
+            s.take_glue_calls().as_slice(),
+            [GlueCall::RenameCharacter { guid: 2, name }] if name == "한글"
+        ));
+
+        s.set_locale(0);
+        s.set_client_region(2);
+        assert!(
+            key(&mut s).is_empty(),
+            "Region 2 takes Hangul on any locale"
+        );
+        assert_eq!(s.take_glue_calls().len(), 1);
+
+        s.set_client_region(1);
+        s.set_locale(1);
+        assert_eq!(
+            key(&mut s),
+            ["FORCE_RENAME_CHARACTER CHAR_NAME_INVALID_CHARACTER"],
+            "Region 1 is Latin even on koKR"
         );
     }
 

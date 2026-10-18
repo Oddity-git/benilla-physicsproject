@@ -6,10 +6,9 @@
 
 use mlua::{Lua, Table, Value};
 
+use super::binding_abi;
 use super::object::{draw_layer_from_str, frame_handle_of};
-use super::region::{
-    install_into_slot, new_texture_region, region_wrapper, set_texture_path, slot_arg, SlotArg,
-};
+use super::region::{install_into_slot, load_path_leg, region_wrapper, slot_arg, SlotArg};
 use super::{event, Model};
 use crate::order::DrawLayer;
 use crate::widget::{KindState, RegionHandle, StatusBarState};
@@ -110,9 +109,9 @@ pub(super) fn install_loaded(
     install_bar_model(model, h, Some(rh), layer.unwrap_or(DrawLayer::Artwork))
 }
 
-/// `SetStatusBarTexture`'s path leg (`0x783140`): a bar that exists has its file swapped and
-/// nothing else, its layer included; with none, a texture is built, given the file and installed
-/// on `layer` (`0x7831cb`).
+/// `SetStatusBarTexture`'s path leg (`0x783140`, [`load_path_leg`]): a bar that exists has its file
+/// swapped and nothing else, its layer included; with none, a texture that loads is installed on
+/// `layer` (`0x7831cb`).
 fn set_bar_path(lua: &Lua, this: &Table, path: &str, layer: DrawLayer) -> mlua::Result<()> {
     let h = frame_handle_of(lua, this)?;
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
@@ -125,16 +124,10 @@ fn set_bar_path(lua: &Lua, this: &Table, path: &str, layer: DrawLayer) -> mlua::
         KindState::StatusBar(sb) => sb.bar,
         _ => return Err(mlua::Error::runtime("not a StatusBar")),
     };
-    match existing {
-        Some(rh) => set_texture_path(&mut model, rh, path),
-        None => {
-            let rh = new_texture_region(&mut model, h, layer)
-                .ok_or_else(|| mlua::Error::runtime("stale frame handle"))?;
-            set_texture_path(&mut model, rh, path);
-            // `SetAllPoints` onto the bar (`0x7831bf`).
-            super::region::implicit_creation_anchor(&mut model, rh);
-            install_bar_model(&mut model, h, Some(rh), layer)?;
-        }
+    if let Some(rh) = load_path_leg(&mut model, h, existing, layer, path)? {
+        // `SetAllPoints` onto the bar (`0x7831bf`).
+        super::region::implicit_creation_anchor(&mut model, rh);
+        install_bar_model(&mut model, h, Some(rh), layer)?;
     }
     Ok(())
 }
@@ -144,7 +137,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     m.set(
         "SetMinMaxValues",
-        lua.create_function(|lua, (this, min, max): (Table, f32, f32)| {
+        lua.create_function(|lua, (this, min, max): (Table, Value, Value)| {
+            // Both `lua_isnumber` (`0x78f542`, `0x78f553`) else
+            // `Usage: %s:SetMinMaxValues(min, max)` (`0x87b160`).
+            with_bar(lua, &this, |_| ())?;
+            let line = "SetMinMaxValues(min, max)";
+            let min = binding_abi::method_number(lua, &this, min, line)? as f32;
+            let max = binding_abi::method_number(lua, &this, max, line)? as f32;
             // A reversed pair is swapped, as `LoadXML` does; the held value re-clamps, and a move
             // fires `OnValueChanged`.
             let changed = with_bar(lua, &this, |sb| {
@@ -160,7 +159,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     m.set(
         "SetValue",
-        lua.create_function(|lua, (this, v): (Table, f32)| {
+        lua.create_function(|lua, (this, v): (Table, Value)| {
+            // `lua_isnumber` (`0x78f720`) else `Usage: %s:SetValue(value)` (`0x87b184`).
+            with_bar(lua, &this, |_| ())?;
+            let v = binding_abi::method_number(lua, &this, v, "SetValue(value)")? as f32;
             let changed = with_bar(lua, &this, |sb| store_value(sb, v))?;
             fire_value_changed(lua, &this, changed)
         })?,
@@ -171,16 +173,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     m.set(
         "SetOrientation",
-        lua.create_function(|lua, (this, o): (Table, String)| {
-            let vertical = match o.to_ascii_uppercase().as_str() {
-                "HORIZONTAL" => false,
-                "VERTICAL" => true,
-                _ => {
-                    return Err(mlua::Error::runtime(format!(
-                        "SetOrientation: unknown orientation '{o}'"
-                    )))
-                }
-            };
+        lua.create_function(|lua, (this, o): (Table, Value)| {
+            with_bar(lua, &this, |_| ())?;
+            let vertical = binding_abi::orientation_arg(lua, &this, &o)?;
             with_bar(lua, &this, |sb| sb.vertical = vertical)
         })?,
     )?;
@@ -244,12 +239,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "SetStatusBarColor",
         lua.create_function(
             |lua, (this, r, g, b, a): (Table, Value, Value, Value, Value)| {
-                let a = crate::script::object::alpha_f32(lua, &a);
-                let (r, g, b) = (
-                    crate::script::object::tonumber_f32(lua, &r),
-                    crate::script::object::tonumber_f32(lua, &g),
-                    crate::script::object::tonumber_f32(lua, &b),
-                );
+                let c = crate::script::object::colour_args(lua, &r, &g, &b, &a);
                 // `0x78fc20` hands the colour to the bar (`0x782dd0`), which sets its vertex colour
                 // (`0x77f750`, collapsing a gradient) only if a bar exists and keeps nothing
                 // otherwise.
@@ -261,7 +251,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     .region_data
                     .entry(rh)
                     .or_default()
-                    .set_vertex_color(Some([r, g, b, a]));
+                    .set_vertex_color(Some(c));
                 Ok(())
             },
         )?,
@@ -271,11 +261,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let bar = with_bar(lua, &this, |sb| sb.bar)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
+            // Each byte times the float at `0x81c6b4` (`0x78fab0`).
             let c = bar
                 .and_then(|rh| model.region_data.get(&rh))
-                .and_then(|d| d.vertex_color)
-                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            Ok((c[0], c[1], c[2], c[3]))
+                .map_or(crate::color::Rgba8::WHITE, |d| d.vertex_color_or_white());
+            Ok(crate::script::object::colour_values(c))
         })?,
     )?;
 

@@ -284,7 +284,7 @@ fn the_reported_book_crest_draws_at_the_blps_own_size() {
     let mut s = UiScript::new().unwrap();
     // Wired as `ui_script::lifecycle::install_addon_asset_resolvers` wires the live one.
     s.set_texture_size_probe(Box::new(move |path| {
-        benilla_assets::sprite_dimensions(&chain, None, path)
+        benilla_assets::sprite_dimensions(&chain, &benilla_assets::LooseFiles::default(), path)
     }));
     load_ui(&s);
     s.set_item_text(Some(ItemTextState {
@@ -320,9 +320,9 @@ fn the_reported_book_crest_draws_at_the_blps_own_size() {
         })
         .filter_map(|q| q.rect)
         .collect();
-    assert_eq!(crest.len(), 1, "one crest quad on the page");
+    benilla_ui::assert_near!(crest.len(), 1, "one crest quad on the page");
     let r = crest[0];
-    assert_eq!(
+    benilla_ui::assert_near!(
         (r.right - r.left, r.top - r.bottom),
         (128.0, 128.0),
         "the crest draws at the BLP's own 128x128 — a texel is a FrameXML unit"
@@ -371,9 +371,9 @@ fn the_reported_book_crest_draws_at_the_blps_own_size() {
         })
         .filter_map(|q| q.rect)
         .collect();
-    assert_eq!(badges.len(), 5, "one quad per officer rank");
+    benilla_ui::assert_near!(badges.len(), 5, "one quad per officer rank");
     for b in &badges {
-        assert_eq!(
+        benilla_ui::assert_near!(
             (b.right - b.left, b.top - b.bottom),
             (32.0, 32.0),
             "each rank badge is its own 32x32 BLP, not a page-wide slab"

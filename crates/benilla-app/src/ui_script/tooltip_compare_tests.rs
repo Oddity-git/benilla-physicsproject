@@ -66,6 +66,7 @@ fn seed_items(s: &mut UiScript) {
     inv[1] = Some(InvSlotView {
         duration_ms: None,
         already_bound: false,
+        occupied_seats: None,
         bonding: 0,
         use_spell: 0,
         use_fork: Default::default(),
@@ -83,7 +84,11 @@ fn seed_items(s: &mut UiScript) {
         guid: 0x715,
         equip_slots: vec![1],
         creator: None,
+        gift_creator: None,
+        creator_guid: 0,
+        gift_creator_guid: 0,
         enchants: Vec::new(),
+        spell_0: false,
     });
     s.set_inventory_slots(inv);
     s.set_item_template(
@@ -120,6 +125,7 @@ fn seed_items(s: &mut UiScript) {
             duration_ms: None,
             petition: None,
             already_bound: false,
+            occupied_seats: None,
             bonding: 0,
             use_spell: 0,
             bar_placeable: true,
@@ -136,8 +142,12 @@ fn seed_items(s: &mut UiScript) {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(
@@ -166,7 +176,7 @@ fn item_ref_tooltip_renders_a_chat_link() {
             "local p, rel, rp, x, y = ItemRefTooltip:GetPoint() \
              return ItemRefTooltip:IsShown() \
                and ItemRefTooltipTextLeft1:GetText() == \"Another Helm\" \
-               and p == \"BOTTOM\" and y == 80",
+               and p == \"BOTTOM\" and math.abs(y - 80) < 1e-3",
         )
         .unwrap();
     assert!(ok, "the link tooltip shows at its parked seat");
@@ -192,6 +202,7 @@ fn doll_hover_renders_the_live_instance() {
     inv[1] = Some(InvSlotView {
         duration_ms: None,
         already_bound: false,
+        occupied_seats: None,
         bonding: 0,
         use_spell: 0,
         use_fork: Default::default(),
@@ -209,7 +220,11 @@ fn doll_hover_renders_the_live_instance() {
         guid: 0x717,
         equip_slots: vec![1],
         creator: None,
+        gift_creator: None,
+        creator_guid: 0,
+        gift_creator_guid: 0,
         enchants: Vec::new(),
+        spell_0: false,
     });
     s.set_inventory_slots(inv);
     s.set_item_template(
@@ -419,7 +434,7 @@ fn shipped_merchant_row_raises_the_compare_plates() {
                and ShoppingTooltip1TextLeft2:GetText() == \"Old Loop\" \
                and ShoppingTooltip2TextLeft2:GetText() == \"Older Loop\" \
                and p1 == \"TOPLEFT\" and r1:GetName() == \"GameTooltip\" \
-               and rp1 == \"TOPRIGHT\" and x1 == 0 and y1 == -10 \
+               and rp1 == \"TOPRIGHT\" and x1 == 0 and math.abs(y1 + 10) < 1e-3 \
                and p2 == \"TOPLEFT\" and r2:GetName() == \"ShoppingTooltip1\" \
                and rp2 == \"TOPRIGHT\" and x2 == 0 and y2 == 0",
         )

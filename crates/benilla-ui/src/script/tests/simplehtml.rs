@@ -203,7 +203,7 @@ fn blocks_chain_bottom_to_top_and_are_flush_at_spacing_zero() {
     // The frame top is the screen top, 600; three 16 px lines run down to 552.
     measure_at_16px(&mut s);
     let tops = resolved_tops(&s, "Page");
-    assert_eq!(tops, [(600.0, 584.0), (584.0, 568.0), (568.0, 552.0)]);
+    crate::assert_near!(tops, vec![(600.0, 584.0), (584.0, 568.0), (568.0, 552.0)]);
     assert!(s.errors().is_empty(), "{:?}", s.errors());
 }
 
@@ -249,9 +249,9 @@ fn a_body_level_br_is_exactly_one_blank_line() {
         .unwrap();
     assert_eq!(texts(&s, "Page"), ["a", "\n", "b"]);
     measure_at_16px(&mut s);
-    assert_eq!(
+    crate::assert_near!(
         resolved_tops(&s, "Page"),
-        [(600.0, 584.0), (584.0, 568.0), (568.0, 552.0)],
+        vec![(600.0, 584.0), (584.0, 568.0), (568.0, 552.0)],
         "the BR block is one line tall and pushes `b` down by exactly that"
     );
 }
@@ -395,7 +395,7 @@ fn the_page_text_body_renders_the_block_list_a_reader_would_draw() {
     measure_at_16px(&mut s);
     let tops = resolved_tops(&s, "Page");
     assert_eq!(tops.first(), Some(&(600.0, 584.0)));
-    assert_eq!(tops.last(), Some(&(536.0, 520.0)));
+    crate::assert_near!(tops.last(), Some(&(536.0, 520.0)));
     assert!(s.errors().is_empty(), "{:?}", s.errors());
 }
 
@@ -556,7 +556,7 @@ fn the_books_unsized_crest_is_its_arts_texel_square_not_the_whole_page() {
     );
 
     let rect = resolved_rect(&s, "Page", img);
-    assert_eq!(
+    crate::assert_near!(
         (rect.right - rect.left, rect.top - rect.bottom),
         (128.0, 128.0),
         "a texel is a FrameXML unit: the 128x128 crest is a 128-unit square, not the page"
@@ -719,8 +719,8 @@ fn the_hyperlink_format_shapes_the_a_splice() {
         .unwrap();
     assert_eq!(texts(&s, "Page"), ["see |cff33ff99|Hitem:1|h[this]|h|r"]);
 
-    // A non-string argument raises the reference's usage string.
-    assert!(s.run("Page:SetHyperlinkFormat(7)").is_err());
+    // A value `lua_isstring` refuses raises the reference's usage line (`0x796bcc`).
+    assert!(s.run("Page:SetHyperlinkFormat({})").is_err());
 }
 
 #[test]
@@ -739,13 +739,25 @@ fn the_paint_setters_land_on_the_element_and_reach_the_next_parse() {
     assert_eq!(
         s.eval::<(f32, f32, f32, f32)>("return Page:GetTextColor(\"H1\")")
             .unwrap(),
-        (1.0, 0.0, 0.0, 1.0)
+        (
+            crate::color::quant::read32(1.0),
+            0.0,
+            0.0,
+            crate::color::quant::read32(1.0)
+        )
     );
     // `P` keeps the font object's colour: the element argument scoped the write.
     let (r, g, b, _) = s
         .eval::<(f32, f32, f32, f32)>("return Page:GetTextColor(\"P\")")
         .unwrap();
-    assert_eq!((r, g, b), (0.18, 0.12, 0.06));
+    assert_eq!(
+        (r, g, b),
+        (
+            crate::color::quant::read32(0.18),
+            crate::color::quant::read32(0.12),
+            crate::color::quant::read32(0.06)
+        )
+    );
     assert_eq!(
         s.eval::<(f32, f32)>("return Page:GetShadowOffset()")
             .unwrap(),
@@ -754,7 +766,7 @@ fn the_paint_setters_land_on_the_element_and_reach_the_next_parse() {
     assert_eq!(
         s.eval::<(f32, f32, f32, f32)>("return Page:GetShadowColor()")
             .unwrap(),
-        (0.0, 0.0, 0.0, 0.5)
+        (0.0, 0.0, 0.0, crate::color::quant::read32(0.5))
     );
 }
 
@@ -777,11 +789,16 @@ fn an_element_with_no_font_of_its_own_loses_its_own_colour_too() {
     assert_eq!(
         s.eval::<(f32, f32, f32, f32)>("return Page:GetTextColor(\"H1\")")
             .unwrap(),
-        (1.0, 0.0, 0.0, 1.0)
+        (
+            crate::color::quant::read32(1.0),
+            0.0,
+            0.0,
+            crate::color::quant::read32(1.0)
+        )
     );
     assert_eq!(
         block_color(&s, "Page", 0),
-        Some([0.18, 0.12, 0.06, 1.0]),
+        Some(crate::color::quant::drawn([0.18, 0.12, 0.06, 1.0])),
         "the block took elementFont[0] wholesale, so H1's red never reaches it"
     );
 
@@ -802,7 +819,11 @@ fn block_color(s: &UiScript, name: &str, i: usize) -> Option<[f32; 4]> {
     let model = lua.app_data_ref::<Model>().expect("model");
     let fh = model.arena.lookup(name).expect("frame");
     let st = model.simple_html.get(&fh).expect("state");
-    model.region_data.get(&st.blocks[i])?.vertex_color
+    model
+        .region_data
+        .get(&st.blocks[i])?
+        .vertex_color
+        .map(crate::color::Rgba8::to_f32)
 }
 
 /// `SetFontObject` on an element font: a re-point keeps what a local setter set (the inheritMask
@@ -830,7 +851,7 @@ fn set_font_object_keeps_local_overrides_and_the_nil_form_leaves_the_paint_stand
     assert_eq!(
         s.eval::<(f32, f32, f32)>("local r, g, b = H:GetTextColor(); return r, g, b")
             .unwrap(),
-        (0.0, 1.0, 0.0),
+        (0.0, crate::color::quant::read32(1.0), 0.0),
         "the colour was never set locally, so it re-reads from the new object"
     );
 
@@ -839,7 +860,7 @@ fn set_font_object_keeps_local_overrides_and_the_nil_form_leaves_the_paint_stand
     assert_eq!(
         s.eval::<(f32, f32, f32)>("local r, g, b = H:GetTextColor(); return r, g, b")
             .unwrap(),
-        (0.0, 1.0, 0.0),
+        (0.0, crate::color::quant::read32(1.0), 0.0),
         "severing the link leaves the resolved paint standing, it does not blank the element"
     );
 }
@@ -881,7 +902,7 @@ fn resolved_tops(s: &UiScript, name: &str) -> Vec<(f32, f32)> {
     st.blocks
         .iter()
         .map(|rh| {
-            let r = model.region_resolved.get(rh).expect("block rect");
+            let r = model.region_rect(*rh).expect("block rect");
             (r.top, r.bottom)
         })
         .collect()
@@ -892,7 +913,7 @@ fn maybe_resolved_rect(s: &UiScript, name: &str, block: usize) -> Option<crate::
     let model = lua.app_data_ref::<Model>().expect("model");
     let fh = model.arena.lookup(name).expect("frame");
     let st = model.simple_html.get(&fh).expect("state");
-    model.region_resolved.get(&st.blocks[block]).copied()
+    model.region_rect(st.blocks[block])
 }
 
 fn resolved_rect(s: &UiScript, name: &str, block: usize) -> crate::layout::Rect {
@@ -900,10 +921,7 @@ fn resolved_rect(s: &UiScript, name: &str, block: usize) -> crate::layout::Rect 
     let model = lua.app_data_ref::<Model>().expect("model");
     let fh = model.arena.lookup(name).expect("frame");
     let st = model.simple_html.get(&fh).expect("state");
-    *model
-        .region_resolved
-        .get(&st.blocks[block])
-        .expect("block rect")
+    model.region_rect(st.blocks[block]).expect("block rect")
 }
 
 /// The text of every quad the extract emits: what is on screen.
@@ -918,6 +936,27 @@ fn page_texts_on_screen(s: &UiScript) -> Vec<String> {
 }
 
 /// A Rust string as a Lua long-bracket literal, so quotes and backslashes need no second escape.
+/// The client's `[[` has no `=` levels, so the text must hold no bracket pair of its own.
 fn lua_str(s: &str) -> String {
-    format!("[==[{s}]==]")
+    assert!(
+        !s.contains("[[") && !s.contains("]]") && !s.starts_with('\n'),
+        "{s:?}"
+    );
+    format!("[[{s}]]")
+}
+
+/// `SetText` hands `lua_tostring(2)` to the parse (`0x796b1e`), which converts a number in place
+/// with `%.14g` (`0x6f7ca6`, `0x871960`): no f32 rounding, MSVC's three-digit exponent.
+#[test]
+fn a_number_parses_as_lua_number_text() {
+    let s = script();
+    page(&s);
+    for (code, want) in [
+        ("1/3", "0.33333333333333"),
+        ("123456789", "123456789"),
+        ("1e20", "1e+020"),
+    ] {
+        s.run(&format!("Page:SetText({code})")).unwrap();
+        assert_eq!(texts(&s, "Page"), [want], "{code}");
+    }
 }

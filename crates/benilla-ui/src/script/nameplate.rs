@@ -8,6 +8,8 @@
 //! Also the four verbs that switch plates on and off, which write two bits of the engine's
 //! runtime dword `[0xc4da34]` and nothing else.
 
+use std::collections::{HashSet, VecDeque};
+
 use mlua::Lua;
 
 use crate::layout::{Anchor, Anchors, Point};
@@ -28,8 +30,6 @@ pub const SKULL_TEXTURE: &str = "Interface\\TargetingFrame\\UI-TargetingFrame-Sk
 pub const RAID_ICON_TEXTURE: &str = "Interface\\TargetingFrame\\UI-RaidTargetingIcons";
 /// The health bar's fill, which `GetStatusBarTexture()` returns.
 pub const BAR_FILL_TEXTURE: &str = "Interface\\TargetingFrame\\UI-TargetingFrame-BarFill";
-/// `NAMEPLATE_FONT`: Friz Quadrata.
-pub const PLATE_FONT: &str = "Fonts\\FRIZQT__.TTF";
 
 /// The plate's level; the bar's is one less, set absolutely (`0x7cb33e` → `0x76a4f0`). The draw
 /// walks levels outermost and each level's layers inside (`0x765920`), so the whole bar draws
@@ -83,9 +83,9 @@ pub struct PlateState {
     pub level_colour: [f32; 3],
     /// The raid-target mark, 0-based, or `None`.
     pub raid_icon: Option<u8>,
-    /// The plate's alpha: exactly 1.0 for the target, dimmed otherwise. Addons find the target
+    /// The plate's alpha byte: 255 for the target, dimmed otherwise. Addons find the target
     /// plate by `GetAlpha() == 1`.
-    pub alpha: f32,
+    pub alpha: u8,
     /// Mouseover or target: the bar brightens.
     pub lit: bool,
     /// The pointer is on the plate: the name goes yellow (`0x7cb850`) and the glow region shows.
@@ -93,7 +93,7 @@ pub struct PlateState {
 }
 
 /// One pooled plate's widgets, in the reference's creation order.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Plate {
     frame: FrameHandle,
     border: RegionHandle,
@@ -119,13 +119,18 @@ impl Plate {
 
 /// The plate pool, grown on demand and never shrunk or reordered: addons scan only the children
 /// past the count they last saw, so a compacted list would hide every later plate from them.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct NamePlates {
     plates: Vec<Plate>,
     /// Each live unit's pool slot, by [`PlateState::key`]: the reference's `[unit+0xe60]`.
     assigned: std::collections::HashMap<u64, usize>,
     /// Frame to pool slot, never removed: plates are never destroyed.
     by_frame: std::collections::HashMap<FrameHandle, usize>,
+    /// World-render shows after the WORLD batch build; these plates join the next UI tick.
+    pending_paint: std::collections::HashSet<FrameHandle>,
+    /// Plates this sync hid while they were in the built batch: re-shown in the same pass, they
+    /// still draw from the records the batch copied (`0x772fd0`).
+    retired_in_batch: std::collections::HashSet<FrameHandle>,
     /// Completed clicks, drained by [`UiScript::take_nameplate_clicks`].
     clicks: Vec<NamePlateClick>,
     /// The hit-test veto (`0x7cba30`). Not the mouse-enabled bit: it leaves `IsMouseEnabled()`
@@ -135,9 +140,16 @@ pub(crate) struct NamePlates {
     /// The verbs' writes to the two script bits, drained by
     /// [`UiScript::take_nameplate_bit_writes`].
     bit_writes: PlateBitWrites,
+    /// The fills of the lit plates, which draw boosted ([`lit_fill_boost`]).
+    lit_fills: std::collections::HashSet<RegionHandle>,
 }
 
 impl NamePlates {
+    /// The next UI update precedes the next batch build (`0x764340`, `0x764347`).
+    pub(super) fn begin_update(&mut self) {
+        self.pending_paint.clear();
+    }
+
     /// Whether `frame` is a plate, whose leave publishes the empty mouseover (`0x7cb8b0`).
     pub(crate) fn is_plate(&self, frame: FrameHandle) -> bool {
         self.by_frame.contains_key(&frame)
@@ -245,13 +257,29 @@ impl UiScript {
     /// has its plate retired (hidden, never destroyed). An unchanged `geometry` costs nothing.
     pub fn sync_nameplates(&mut self, geometry: PlateGeometry, states: &[PlateState]) {
         let lua = self.lua();
+        // The constructor's two lookups (`0x7cb3f9`, `0x7cb49b`), for each plate about to be built
+        // and none for a built one. Done before the Model is borrowed: a lookup honours an `_G`
+        // `__index` (`lua_gettable` at `0x704373`), which may call any verb.
+        let mut fonts: VecDeque<Option<String>> = {
+            let built = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                // No WorldFrame, no plates, and no lookups for them.
+                if model.arena.lookup("WorldFrame").is_none() {
+                    return;
+                }
+                plates_to_build(&model, states)
+            };
+            (0..2 * built)
+                .map(|_| super::font::nameplate_font(lua))
+                .collect()
+        };
         let effects = {
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             // No WorldFrame (no interface loaded), no plates: no addon walks an invented root.
             let Some(world) = model.arena.lookup("WorldFrame") else {
                 return;
             };
-            sync(&mut model, world, geometry, states)
+            sync(&mut model, world, geometry, states, &mut fonts)
         };
         apply_visibility(lua, effects.visibility);
         for (bar, value) in effects.values {
@@ -350,17 +378,37 @@ pub(super) fn note_click(lua: &mlua::Lua, id: u32, button: &str) {
     });
 }
 
+/// How many new plates [`sync`] builds for `states`: the units without a plate, less the free
+/// slots, which are the retired ones and those the departing units are about to free.
+fn plates_to_build(model: &Model, states: &[PlateState]) -> usize {
+    let np = &model.nameplates;
+    let mut free = np.plates.iter().filter(|p| p.last.is_none()).count();
+    free += np
+        .assigned
+        .iter()
+        .filter(|(k, &i)| !states.iter().any(|s| s.key == **k) && np.plates[i].last.is_some())
+        .count();
+    let arriving: HashSet<u64> = states
+        .iter()
+        .map(|s| s.key)
+        .filter(|k| !np.assigned.contains_key(k))
+        .collect();
+    arriving.len().saturating_sub(free)
+}
+
 /// The per-frame drive: retire departed units, bind the rest, lay out, write what changed.
 fn sync(
     model: &mut Model,
     world: FrameHandle,
     geometry: PlateGeometry,
     states: &[PlateState],
+    fonts: &mut VecDeque<Option<String>>,
 ) -> SyncEffects {
     let mut effects = SyncEffects::default();
     let relayout = model.nameplates.geometry != Some(geometry);
     model.nameplates.geometry = Some(geometry);
 
+    model.nameplates.retired_in_batch.clear();
     // Retire first, so a departing unit's slot is free for an arriving one, as the reference
     // destroys then creates through one free list in the same tick.
     let gone: Vec<u64> = model
@@ -385,7 +433,7 @@ fn sync(
                 let free = (0..model.nameplates.plates.len())
                     .find(|i| model.nameplates.plates[*i].last.is_none());
                 let i = free.unwrap_or_else(|| {
-                    let plate = Plate::create(model, world);
+                    let plate = Plate::create(model, world, fonts);
                     model.nameplates.plates.push(plate);
                     model.nameplates.plates.len() - 1
                 });
@@ -413,7 +461,11 @@ fn sync(
 impl Plate {
     /// Build one plate: the Button, its six regions in the reference's order, and the health bar.
     /// Written once, so a region an addon blanks stays blank.
-    fn create(model: &mut Model, world: FrameHandle) -> Plate {
+    fn create(
+        model: &mut Model,
+        world: FrameHandle,
+        fonts: &mut VecDeque<Option<String>>,
+    ) -> Plate {
         // Anonymous, as the reference's name is zeroed (`0x76c50b`): plate addons reject a named
         // `WorldFrame` child.
         let frame = model.arena.create(FrameKind::Button, None, Some(world));
@@ -451,8 +503,10 @@ impl Plate {
             GLOW_TEXTURE,
             BlendMode::Add,
         );
-        let name = font_string(model, frame, JustifyV::Bottom);
-        let level = font_string(model, frame, JustifyV::Middle);
+        // Each FontString looks `NAMEPLATE_FONT` up itself, name then level (`0x7cb3f9`,
+        // `0x7cb49b`), at construction only.
+        let name = font_string(model, frame, JustifyV::Bottom, fonts.pop_front().flatten());
+        let level = font_string(model, frame, JustifyV::Middle, fonts.pop_front().flatten());
         let skull = texture(
             model,
             frame,
@@ -568,7 +622,7 @@ impl Plate {
         for rh in [name, level] {
             model.region_data.entry(rh).or_default().font_shadow = Some(FontShadow {
                 offset: [g.shadow_offset, -g.shadow_offset],
-                color: [0.0, 0.0, 0.0, 1.0],
+                color: crate::color::Rgba8::BLACK,
             });
         }
 
@@ -581,7 +635,6 @@ impl Plate {
             g.level_off_y,
         )]);
         level_data.font_height = Some(g.level_height);
-        level_data.font_explicit.height = true;
         model.touch_measure(level);
 
         let skull_data = model.region_data.entry(skull).or_default();
@@ -642,6 +695,10 @@ impl Plate {
         }
 
         if last.is_none() {
+            // WORLD batches precede the world callback's allocations (`0x765896`, `0x7658e2`).
+            if !model.nameplates.retired_in_batch.contains(&frame) {
+                model.nameplates.pending_paint.insert(frame);
+            }
             effects.visibility.push((frame, true));
         }
         if last.as_ref().is_none_or(|l| l.alpha != state.alpha) {
@@ -666,23 +723,32 @@ impl Plate {
             .as_ref()
             .is_none_or(|l| l.bar_colour != state.bar_colour || l.lit != state.lit)
         {
-            let boost = if state.lit { LIT_BOOST } else { 1.0 };
+            // The boost rides the draw ([`lit_fill_boost`]): it can pass 1, which the packed
+            // colour cannot hold.
+            if state.lit {
+                model.nameplates.lit_fills.insert(fill);
+            } else {
+                model.nameplates.lit_fills.remove(&fill);
+            }
             let c = state.bar_colour;
             model.region_data.entry(fill).or_default().vertex_color =
-                Some([c[0] * boost, c[1] * boost, c[2] * boost, 1.0]);
+                Some(crate::color::Rgba8::from_f32([c[0], c[1], c[2], 1.0]));
         }
 
         if last.as_ref().is_none_or(|l| l.name != state.name) {
-            model.region_data.entry(name).or_default().text = Some(state.name.clone());
+            // The name goes through `SetText` with its expand flag: `GetUnitName` takes the one
+            // stack argument and leaves the `push 1` ahead of it for the call (`0x7cb706`-`0x7cb718`).
+            let shown = model.localized_text(state.name.clone());
+            model.region_data.entry(name).or_default().text = Some(shown);
             model.touch_measure(name);
             // A new string clears the valid bit and invalidates (`0x771ea4`).
             model.clear_region_valid(name);
         }
         if last.as_ref().is_none_or(|l| l.hovered != state.hovered) {
             let c = if state.hovered {
-                [1.0, 1.0, 0.0, 1.0]
+                crate::color::Rgba8::rgba(255, 255, 0, 255)
             } else {
-                [1.0, 1.0, 1.0, 1.0]
+                crate::color::Rgba8::WHITE
             };
             model
                 .region_data
@@ -704,9 +770,13 @@ impl Plate {
                 }
                 (Some(n), false) => {
                     let c = state.level_colour;
+                    // The level goes through `SetText` with its expand flag (`0x7cbcca`).
+                    let shown = model.localized_text(n.to_string());
                     let data = model.region_data.entry(level).or_default();
-                    data.text = Some(n.to_string());
-                    data.set_vertex_color(Some([c[0], c[1], c[2], 1.0]));
+                    data.text = Some(shown);
+                    data.set_vertex_color(Some(crate::color::Rgba8::from_f32([
+                        c[0], c[1], c[2], 1.0,
+                    ])));
                     model.set_region_hidden(level, false);
                     model.set_region_hidden(skull, true);
                     model.touch_measure(level);
@@ -742,9 +812,30 @@ impl Plate {
             return;
         }
         let frame = model.nameplates.plates[i].frame;
+        if !model.nameplates.pending_paint.remove(&frame) {
+            model.nameplates.retired_in_batch.insert(frame);
+        }
         effects.visibility.push((frame, false));
         model.nameplates.plates[i].last = None;
     }
+}
+
+/// A newly shown plate and its children miss the WORLD batches already built (`0x765896`).
+pub(super) fn awaits_batch(model: &Model, target: crate::order::ZTarget) -> bool {
+    if model.nameplates.pending_paint.is_empty() {
+        return false;
+    }
+    let mut frame = match target {
+        crate::order::ZTarget::Frame(frame) => Some(frame),
+        crate::order::ZTarget::Region(region) => model.arena.region(region).map(|r| r.owner),
+    };
+    while let Some(owner) = frame {
+        if model.nameplates.pending_paint.contains(&owner) {
+            return true;
+        }
+        frame = model.arena.frame(owner).and_then(|f| f.parent);
+    }
+    false
 }
 
 /// One of the plate's textures, with its path and the blend mode the ctor sets (`0x7703f0`).
@@ -766,16 +857,23 @@ fn texture(
 }
 
 /// One of the plate's two FontStrings, OVERLAY as the ctor re-layers them (`0x7cb438`,
-/// `0x7cb4ea`). `justify_v` seats the name by its ink: our shaper's Friz line box is ascent-heavy
-/// and would drop it ~8 px below where the reference's metrics put it.
-fn font_string(model: &mut Model, frame: FrameHandle, justify_v: JustifyV) -> RegionHandle {
+/// `0x7cb4ea`), with the `NAMEPLATE_FONT` lookup's answer: `None` sets no font, as `SetFont`
+/// rejects the empty path (`0x44d05c`). `justify_v` seats the name by its ink: our shaper's Friz
+/// line box is ascent-heavy and would drop it ~8 px below where the reference's metrics put it.
+fn font_string(
+    model: &mut Model,
+    frame: FrameHandle,
+    justify_v: JustifyV,
+    font: Option<String>,
+) -> RegionHandle {
     let rh = model
         .arena
         .create_region(frame, RegionKind::FontString, DrawLayer::Overlay, 0)
         .expect("live plate");
     let data = model.region_data.entry(rh).or_default();
-    data.font_path = Some(PLATE_FONT.to_string());
-    data.font_explicit.face = true;
+    // The engine's own load (`0x7714f0`) clears no inherit bit, so a later `SetFontObject`
+    // repaints the plate's text as any FontString's.
+    data.font_path = font;
     data.justify.set_v(justify_v);
     rh
 }
@@ -793,6 +891,15 @@ pub(super) fn is_world_seated(model: &Model, frame: FrameHandle) -> bool {
 /// pipeline. The art has no alpha and is mostly black, so as BLEND it would be an opaque box.
 pub(super) fn is_unpainted_glow(data: &RegionData) -> bool {
     data.blend == BlendMode::Add && data.tex.path().as_deref() == Some(GLOW_TEXTURE)
+}
+
+/// The draw-time multiply of plate fill `rh`'s tint: [`LIT_BOOST`] while its plate is lit.
+pub(super) fn lit_fill_boost(model: &Model, rh: RegionHandle) -> Option<f32> {
+    model
+        .nameplates
+        .lit_fills
+        .contains(&rh)
+        .then_some(LIT_BOOST)
 }
 
 /// The lit bar's brighten, a multiply of the fill tint in encoded sRGB like the client's modulate:

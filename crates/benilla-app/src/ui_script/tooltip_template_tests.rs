@@ -55,6 +55,24 @@ fn drawn_textures(s: &mut UiScript) -> Vec<String> {
         .collect()
 }
 
+/// The stock template declares 30 `TextLeft`/`TextRight` pairs, the tooltip's line limit
+/// (`0x529650`, `0x530291`): the 31st `AddLine` adds nothing.
+#[test]
+fn a_stock_template_tooltip_holds_30_lines() {
+    benilla_formats::wow_data_or_skip!();
+    let s = harness();
+    s.run(
+        r#"
+        local tip = CreateFrame("GameTooltip", "CapTip", UIParent, "GameTooltipTemplate")
+        for i = 1, 40 do tip:AddLine("line " .. i) end
+        assert(tip:NumLines() == 30, tip:NumLines())
+        assert(CapTipTextLeft30:GetText() == "line 30")
+        assert(CapTipTextLeft31 == nil)
+    "#,
+    )
+    .unwrap();
+}
+
 /// An addon tooltip's lines are named after the caller (`MyTipTextLeft1`), never the template, so
 /// the corpus idiom `getglobal(tip:GetName().."TextLeft1")` resolves.
 #[test]
@@ -190,8 +208,8 @@ fn an_addon_may_call_gametooltip_onload_the_reference_way_with_no_argument() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 
     // The tint, quantized: `SetBackdropColor` (`0x777d30`) stores a byte per channel, truncating
-    // `x * 255 + 0.5`, so 0.09 reads back as 23/255.
-    let q = |x: f32| f32::from((x * 255.0 + 0.5) as u8) / 255.0;
+    // `x * 255 + 0.5`, and the getter reads the byte through the float scale (`0x777c98`).
+    let q = benilla_ui::color::quant::read32;
     let (r, g, b) = s
         .eval::<(f32, f32, f32)>("return MyTip:GetBackdropColor()")
         .unwrap();

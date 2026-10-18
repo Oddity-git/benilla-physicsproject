@@ -19,6 +19,7 @@ fn one_item_backpack(item_id: u32, name: &str, quality: u32) -> ContainerState {
             duration_ms: None,
             petition: None,
             already_bound: false,
+            occupied_seats: None,
             bonding: 0,
             use_spell: 0,
             bar_placeable: true,
@@ -35,8 +36,12 @@ fn one_item_backpack(item_id: u32, name: &str, quality: u32) -> ContainerState {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     ContainerState {
@@ -180,7 +185,7 @@ fn delete_item_confirm_no_clears_without_destroying() {
         "repaints = 0\n\
          local real = ContainerFrame_Update\n\
          ContainerFrame_Update = function(...) repaints = repaints + 1; \
-         return real(unpack(arg, 1, arg.n)) end",
+         return real(unpack(arg)) end",
     )
     .unwrap();
 

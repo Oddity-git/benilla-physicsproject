@@ -4,13 +4,17 @@
 //! what `config.toml` is composed from; the script VM keeps a mirror for Lua's synchronous
 //! `GetCVar`/`SetCVar` ([`benilla_ui::script::UiScript::seed_cvars`]) whose writes queue back here.
 //!
-//! - [`REGISTERED`] holds only vars something reads, a host knob or a Lua consumer. A row's default
-//!   is the reference's, and [`table::Registered::reference`] says where it stands against it.
+//! - [`REGISTERED`] holds the vars something reads, a host knob or a Lua consumer, and
+//!   [`inert::INERT`] the reference's other script-visible ones, which `GetCVar` and `SetCVar`
+//!   would otherwise raise on. A row's default is the reference's, and
+//!   [`table::Registered::reference`] says where it stands against it.
 //! - The change callback is a Bevy observer on [`CvarChanged`], beside the knob it writes; the
-//!   registry applies nothing itself.
+//!   registry applies nothing itself. A callback that can refuse a write is also the row's
+//!   [`CvarCheck`], which the registry and the VM's mirror run before storing.
 //! - A latched row's write is staged in [`Row::pending`] until [`Cvars::commit_latched`], the
-//!   reference's `0x639ec0` inside `RestartGx`. A stage never committed is dropped at exit, as the
-//!   reference's `SaveConfig` writes only the applied value (`rec+0x20`).
+//!   reference's `0x639ec0` inside `RestartGx`. A stage never committed is what the save writes,
+//!   as the reference's `SaveConfig` takes the latched text first (`rec+0x38`, `0x63da27`), so it
+//!   applies at the next launch.
 //! - Boot folds `benilla-config/config.toml` in and fires the observers before anything after
 //!   [`CvarLoad`]; each frame drains the VM's writes in and pushes the registry's out; a dirty
 //!   registry saves after one quiet second or at exit, writing only values off their default and
@@ -25,12 +29,21 @@ use std::time::Instant;
 use bevy::prelude::*;
 
 use crate::ui_script::VmMemo;
-use benilla_ui::script::{SeededCvar, UiScript};
+use benilla_ui::script::{CvarCheck, CvarWrite, SeededCvar, UiScript};
 
+#[cfg(test)]
+mod deviations_doc;
+mod inert;
+mod listing;
+#[cfg(test)]
+mod reference_table;
 mod table;
 #[cfg(test)]
+pub(crate) use listing::list_rank;
+pub(crate) use listing::reference_help;
+#[cfg(test)]
 use table::Reference;
-pub(crate) use table::{registered_pairs, REGISTERED};
+pub(crate) use table::{all_rows, registered_pairs, REGISTERED};
 
 /// `config.toml`: a `[cvars]` table of `Name = "value"` strings, sorted so every save is stable.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -62,16 +75,28 @@ impl CvarChanged {
         self.name.to_ascii_lowercase()
     }
 
-    /// The new value as a number; `0` on a string row, whose observer reads [`Self::new`]. The
-    /// registry refuses an unparseable write to a numeric row ([`Cvars::set`]).
+    /// The new value as the record's float (`rec+0x24`, `SStrToFloat` at `0x63e130`): text that
+    /// is no number reads as 0, and a string row's observer reads [`Self::new`].
     pub(crate) fn num(&self) -> f32 {
-        self.new.trim().parse().unwrap_or(0.0)
+        record_float(&self.new)
     }
 
-    /// The new value as the client's flag: int-parse, then `!= 0`.
+    /// The new value as the record's integer (`rec+0x28`, `SStrToInt` at `0x63e127`), `!= 0`.
     pub(crate) fn flag(&self) -> bool {
-        self.num() != 0.0
+        benilla_ui::script::s_str_to_int(&self.new) != 0
     }
+}
+
+/// A record's float as `InternalSet` stores it: `SStrToFloat` (`0x63e130`) kept as a single
+/// (`fstp dword [esi+0x24]`, `0x63e135`).
+pub(crate) fn record_float(text: &str) -> f32 {
+    benilla_ui::script::s_str_to_float(text) as f32
+}
+
+/// `SStrCmpI` (`0x64a4c0`), the compare `InternalSet` (`0x63e0ec`) and `SaveConfig` (`0x63da4a`)
+/// make: ASCII case-blind.
+fn same_text(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 /// One row of the live registry: the parts of the reference's `CVar` record benilla keeps.
@@ -86,16 +111,13 @@ pub(crate) struct Row {
     pub(crate) pending: Option<String>,
     /// The reference's flag bit1.
     pub(crate) latched: bool,
-    /// Declared by an addon's `RegisterCVar`: persisted like any row and re-seeded into every later
-    /// VM, so the addon's re-declaration is a no-op.
-    pub(crate) addon: bool,
-}
-
-impl Row {
-    /// A row whose default parses as a number refuses a write that does not ([`Cvars::set`]).
-    fn numeric(&self) -> bool {
-        self.default.trim().parse::<f32>().is_ok()
-    }
+    /// The change callback's refusal ([`table::Registered::check`]).
+    check: Option<CvarCheck>,
+    /// The reset text (`rec+0x34`) `cvar_reset` restores (`0x63dff0`): the value `config.toml`
+    /// held at start-up, as `Config.wtf`'s `set` makes the record with it (`0x63d582`) and the
+    /// registration keeps it (`0x63dc6c`); else the first value the CVar's own console command
+    /// stored (`0x63de23`); else none, and the default stands in.
+    pub(crate) reset: Option<String>,
 }
 
 /// What a write did.
@@ -103,8 +125,12 @@ impl Row {
 pub(crate) enum SetOutcome {
     /// No such row (warned).
     Unknown,
-    /// A numeric row and a value that does not parse: refused, the applied value stands (warned).
-    Refused,
+    /// The row is read-only (flag bit2, `CVar::SetReadOnly` `0x63e030`): `InternalSet` returns
+    /// before storing anything (`0x63e0ba`-`0x63e0c2`).
+    ReadOnly,
+    /// The row's change callback refused it ([`table::Registered::check`]): the applied value
+    /// stands, and the callback's own line says why.
+    Vetoed,
     /// Already the applied value (or already the staged one).
     Unchanged,
     /// A latched row: staged, not applied; nothing fires until the commit.
@@ -116,6 +142,9 @@ pub(crate) enum SetOutcome {
 /// The engine-side CVar table.
 #[derive(Resource)]
 pub(crate) struct Cvars {
+    /// The client's locale index (`[0xc0e080]`), which the register sites that pick their default
+    /// by it read ([`table::Reference::SameByLocale`]).
+    locale: usize,
     rows: Vec<Row>,
     /// Lowercased name → row.
     index: HashMap<String, usize>,
@@ -132,35 +161,89 @@ pub(crate) struct Cvars {
     /// A change since the last save; `last_change` drives the one-quiet-second debounce.
     dirty: bool,
     last_change: Option<Instant>,
+    /// Lines change callbacks and observers printed to the console (`0x63cb50`), which go to the
+    /// log, as the reference's go to a console screen nobody has open.
+    console: Vec<String>,
+    /// The CVars Lua's `RegisterCVar` created this process, the reference's `[0xb4e3c8]`: kept
+    /// here because it outlives every VM, and counted by the VM
+    /// ([`benilla_ui::script::LUA_CVAR_LIMIT`]).
+    lua_created: u32,
+    /// Lowercased names flagged read-only (flag bit2): the world session's
+    /// [`benilla_ui::script::IN_WORLD_READ_ONLY_CVARS`], flagged and cleared with the VM's copy.
+    read_only: HashSet<String>,
+    /// The old saved-account file, read into the `accountName` row at boot and deleted once a
+    /// save succeeds ([`Cvars::adopt_legacy_account`]).
+    legacy_account: Option<std::path::PathBuf>,
 }
 
 impl Default for Cvars {
+    /// The table as the install's locale registers it.
     fn default() -> Self {
+        Self::for_locale(crate::ui_script::client_locale().index())
+    }
+}
+
+impl Cvars {
+    /// The table as a client of this locale index registers it: each row at its
+    /// [`table::Registered::default_for`].
+    pub(crate) fn for_locale(locale: usize) -> Self {
         let mut cvars = Self {
-            rows: Vec::with_capacity(REGISTERED.len()),
-            index: HashMap::with_capacity(REGISTERED.len()),
+            locale,
+            rows: Vec::with_capacity(REGISTERED.len() + inert::INERT.len()),
+            index: HashMap::with_capacity(REGISTERED.len() + inert::INERT.len()),
             file: BTreeMap::new(),
             session_owned: HashSet::new(),
             events: Vec::new(),
             outbox: Vec::new(),
             dirty: false,
             last_change: None,
+            console: Vec::new(),
+            lua_created: 0,
+            read_only: HashSet::new(),
+            legacy_account: None,
         };
-        for r in REGISTERED {
+        for r in all_rows() {
+            let default = r.default_for(locale);
             cvars.insert_row(Row {
                 name: r.name.to_string(),
-                default: r.default.to_string(),
-                value: r.default.to_string(),
+                default: default.to_string(),
+                value: default.to_string(),
                 pending: None,
                 latched: r.latched,
-                addon: false,
+                check: r.check,
+                reset: None,
             });
         }
         cvars
     }
 }
 
+/// A row's registered default on a client of this locale index; `None` for a name no row has.
+pub(crate) fn registered_default(name: &str, locale: usize) -> Option<&'static str> {
+    all_rows()
+        .find(|r| r.name.eq_ignore_ascii_case(name))
+        .map(|r| r.default_for(locale))
+}
+
 impl Cvars {
+    /// Queue the move onto each row this locale registers off its base default
+    /// ([`table::Reference::SameByLocale`]), which a session does not own: a knob starts at the
+    /// base, and the reference's callback runs on the registered string (`0x63dc58`). Before the
+    /// file's own moves, so a saved value lands on top.
+    fn announce_locale_defaults(&mut self) {
+        for r in all_rows() {
+            let at = r.default_for(self.locale);
+            if at == r.default || self.session_owned.contains(&r.name.to_ascii_lowercase()) {
+                continue;
+            }
+            self.events.push(CvarChanged {
+                name: r.name.to_string(),
+                old: r.default.to_string(),
+                new: at.to_string(),
+            });
+        }
+    }
+
     fn insert_row(&mut self, row: Row) {
         let key = row.name.to_ascii_lowercase();
         debug_assert!(
@@ -182,27 +265,53 @@ impl Cvars {
     }
 
     /// Every row, in registration order.
+    #[cfg(test)]
     pub(crate) fn rows(&self) -> impl Iterator<Item = &Row> {
         self.rows.iter()
+    }
+
+    /// Every row in the registry's list order ([`listing`]), which `cvarlist` prints and a reset
+    /// of every row walks.
+    pub(crate) fn listed(&self) -> Vec<&Row> {
+        let mut rows: Vec<&Row> = self.rows.iter().collect();
+        rows.sort_by_key(|r| listing::list_rank(&r.name));
+        rows
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.row(name).map(|r| r.value.as_str())
     }
 
+    /// The applied value as the record's float ([`CvarChanged::num`]).
+    #[cfg(test)]
     pub(crate) fn num(&self, name: &str) -> Option<f32> {
-        self.get(name).and_then(|v| v.trim().parse().ok())
+        self.get(name).map(record_float)
     }
 
-    /// The applied value as the client's flag (int-parse, `!= 0`).
+    /// The applied value as the record's integer, `!= 0` ([`CvarChanged::flag`]).
     pub(crate) fn flag(&self, name: &str) -> Option<bool> {
-        self.num(name).map(|v| v != 0.0)
+        self.get(name)
+            .map(|v| benilla_ui::script::s_str_to_int(v) != 0)
     }
 
+    /// Flag a row read-only, or clear it: `CVar::SetReadOnly` (`0x63e030`). A flagged row takes no
+    /// host write ([`SetOutcome::ReadOnly`]); a Lua write meets the VM's copy of the flag first
+    /// ([`benilla_ui::script::UiScript::set_cvar_read_only`]).
+    pub(crate) fn set_read_only(&mut self, name: &str, read_only: bool) {
+        let key = name.to_ascii_lowercase();
+        if read_only {
+            self.read_only.insert(key);
+        } else {
+            self.read_only.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn default_of(&self, name: &str) -> Option<&str> {
         self.row(name).map(|r| r.default.as_str())
     }
 
+    #[cfg(test)]
     pub(crate) fn is_session_owned(&self, name: &str) -> bool {
         self.session_owned.contains(&name.to_ascii_lowercase())
     }
@@ -233,40 +342,50 @@ impl Cvars {
         value
     }
 
-    /// A write from either side of the VM boundary. A `from_vm` write is not echoed back, but a
-    /// refusal is, because the mirror already stored the refused value.
+    /// A write from either side of the VM boundary, `CVar::Set` (`0x63df50`) then `InternalSet`
+    /// (`0x63e0b0`): the text is stored as given, a number or not, and reads as its
+    /// `SStrToInt`/`SStrToFloat` forms. A `from_vm` write is not echoed back.
     fn write(&mut self, name: &str, value: &str, from_vm: bool) -> SetOutcome {
         let Some(i) = self.slot(name) else {
             warn!("cvar {name}: not registered — write ignored");
             return SetOutcome::Unknown;
         };
-        let row = &mut self.rows[i];
-        if row.numeric() && value.trim().parse::<f32>().is_err() {
-            warn!(
-                "cvar {}: unparseable value '{value}' refused (still {:?})",
-                row.name, row.value
-            );
-            if from_vm {
-                self.outbox.push((row.name.clone(), row.value.clone()));
+        // The change callback, before anything is stored (`0x63df7d`). A VM write was checked
+        // by the VM's own mirror, which refused it there or printed its line already.
+        if let (Some(check), false) = (self.rows[i].check, from_vm) {
+            let verdict = check(value, &self.rows[i].value, &|n| {
+                self.get(n).map(str::to_string)
+            });
+            self.console.extend(verdict.lines);
+            if !verdict.accept {
+                return SetOutcome::Vetoed;
             }
-            return SetOutcome::Refused;
         }
+        let row = &mut self.rows[i];
         if row.latched {
-            // The reference's `Set 0x63df50` on flag bit1 stores `latchedValue` and skips
-            // `InternalSet`: no dirty, no callback. The stage lives here, not in the mirror, which
-            // only ever learns applied values.
-            let staged = (value != row.value).then(|| value.to_string());
+            // The reference's `Set 0x63df50` on flag bit1 stores `latchedValue`, skips
+            // `InternalSet` and marks the config dirty (`0x63dfc4`), since the save writes the
+            // stage. The stage lives here, not in the mirror, which only ever learns applied
+            // values.
+            let staged = (!same_text(value, &row.value)).then(|| value.to_string());
             if row.pending == staged {
                 return SetOutcome::Unchanged;
             }
             row.pending = staged;
-            return if row.pending.is_some() {
+            let staged = row.pending.is_some();
+            self.touch();
+            return if staged {
                 SetOutcome::Staged
             } else {
                 SetOutcome::Unchanged // the stage cleared: the boundary has nothing to do
             };
         }
-        if row.value == value {
+        // The read-only flag stops a host write in `InternalSet`, after the callback ran; a VM
+        // write met the VM's copy of the flag.
+        if !from_vm && self.read_only.contains(&row.name.to_ascii_lowercase()) {
+            return SetOutcome::ReadOnly;
+        }
+        if same_text(&row.value, value) {
             return SetOutcome::Unchanged;
         }
         let old = std::mem::replace(&mut row.value, value.to_string());
@@ -294,6 +413,52 @@ impl Cvars {
         self.write(name, value, true)
     }
 
+    /// The reset text the VM's mirror filled ([`benilla_ui::script::CvarWrite::FillReset`]),
+    /// taken only into an empty slot, as the mirror's was.
+    fn fill_reset(&mut self, name: &str, value: &str) {
+        match self.slot(name) {
+            Some(i) => {
+                self.rows[i].reset.get_or_insert_with(|| value.to_string());
+            }
+            None => warn!("cvar {name}: not registered — reset text ignored"),
+        }
+    }
+
+    /// A `cvar_reset` or `cvar_default` the VM's mirror already made
+    /// ([`benilla_ui::script::CvarWrite::Restore`]): `InternalSet` called directly, so a latched
+    /// row takes the value at once and keeps its stage, and the config is dirty.
+    ///
+    /// A latched row fires nothing: the device runs on a working record only the gx callbacks
+    /// write (`0xc4eb98`, `gxWindow`'s `0x63b190`, `gxVSync`'s `0x63b160`), the record's value is
+    /// read only at device init (`0x63a41b`), and `RestartGx`'s commit (`0x639ec0`) reads only the
+    /// stage (`+0x38`). So the value reaches `GetCVar` and the save, and the knob at the next
+    /// launch.
+    ///
+    /// Deviation: for a row that is not latched the observers fire, where the reference runs no
+    /// callback here (`0x63dff0`, `0x63e010`), because a knob moves only through its
+    /// [`CvarChanged`] observer, which also stands in for the reference's direct reads of the
+    /// record; without it knob and value would disagree until the next write.
+    fn restore_from_vm(&mut self, name: &str, value: &str) -> SetOutcome {
+        let Some(i) = self.slot(name) else {
+            warn!("cvar {name}: not registered — restore ignored");
+            return SetOutcome::Unknown;
+        };
+        let row = &mut self.rows[i];
+        if same_text(&row.value, value) {
+            return SetOutcome::Unchanged;
+        }
+        let old = std::mem::replace(&mut row.value, value.to_string());
+        if !row.latched {
+            self.events.push(CvarChanged {
+                name: row.name.clone(),
+                old,
+                new: value.to_string(),
+            });
+        }
+        self.touch();
+        SetOutcome::Changed
+    }
+
     /// Follow a value the engine already applied, for a second spelling of one knob
     /// (`WorldDetail`/`frillDensity`): the row moves, persists and reaches the mirror, but no
     /// observer fires, since a full write would queue an event that lands a flush late and wins
@@ -304,7 +469,7 @@ impl Cvars {
             return false;
         };
         let row = &mut self.rows[i];
-        if row.value == value {
+        if same_text(&row.value, value) {
             return false;
         }
         row.value = value.to_string();
@@ -320,9 +485,9 @@ impl Cvars {
     /// moved.
     ///
     /// Only `gx*` rows: `SoundBufferSize`'s register site (`0x4571ca`) discards its record, so
-    /// nothing commits it and its stage is lost at exit, as in the reference. The reference runs a
-    /// gx callback at `SetCVar` time (`0x63df50`); ours fire here, before the device rebuild reads
-    /// them.
+    /// nothing commits it; its stage is saved (`0x63da27`) and the sound init reads it at the next
+    /// launch. The reference runs a gx callback at `SetCVar` time (`0x63df50`); ours fire here,
+    /// before the device rebuild reads them.
     pub(crate) fn commit_latched(&mut self) -> usize {
         let mut moved = 0;
         for row in &mut self.rows {
@@ -332,7 +497,7 @@ impl Cvars {
             let Some(staged) = row.pending.take() else {
                 continue;
             };
-            if staged == row.value {
+            if same_text(&staged, &row.value) {
                 continue;
             }
             let old = std::mem::replace(&mut row.value, staged.clone());
@@ -385,10 +550,12 @@ impl Cvars {
         self.insert_row(Row {
             name: name.to_string(),
             default: default.to_string(),
-            value: saved.unwrap_or_else(|| default.to_string()),
+            value: saved.clone().unwrap_or_else(|| default.to_string()),
             pending: None,
             latched: false,
-            addon: true,
+            check: None,
+            // The saved value is the reset text of the record its line made.
+            reset: saved,
         });
     }
 
@@ -406,15 +573,30 @@ impl Cvars {
                 info!("config: {name} is owned by this session, not the file (file value kept)");
                 continue;
             }
+            let verdict = self.rows[i].check.map(|check| {
+                check(value, &self.rows[i].value, &|n| {
+                    self.get(n).map(str::to_string)
+                })
+            });
             let row = &mut self.rows[i];
-            if row.numeric() && value.trim().parse::<f32>().is_err() {
-                warn!("config: {name}: unparseable value '{value}' ignored");
-                continue;
-            }
+            row.reset = Some(value.clone());
+            // The saved text stands as it is, a number or not: `set` made the record from it
+            // (`0x63d582`) and `Register` keeps it (`0x63dc6c`). The callback runs on the saved
+            // value and its answer is not tested: the file is read before these rows are
+            // registered (`0x402375`), and `CVar::Register` on the record it made calls the
+            // callback and ignores the result (`0x63dc58`), so the value stands. A refusing
+            // callback applied nothing, so no observer fires for it.
+            let applies = verdict.is_none_or(|verdict| {
+                self.console.extend(verdict.lines);
+                verdict.accept
+            });
             if row.value == *value {
                 continue;
             }
             let old = std::mem::replace(&mut row.value, value.clone());
+            if !applies {
+                continue;
+            }
             self.events.push(CvarChanged {
                 name: row.name.clone(),
                 old,
@@ -434,17 +616,76 @@ impl Cvars {
             .collect()
     }
 
-    /// The whole table as a VM's mirror is seeded from it.
+    /// Seed a new VM's mirror before anything registers in it: the file's unclaimed entries
+    /// first, so an addon's `RegisterCVar` starts at the saved value, then the table, then the
+    /// process's count of Lua-created CVars.
+    pub(crate) fn seed_vm(&self, script: &mut UiScript) {
+        script.set_cvar_saved_base(self.orphans());
+        script.seed_cvars(self.vm_seed());
+        script.set_cvar_lua_created(self.lua_created);
+    }
+
+    /// Take in a VM's registrations and writes, registrations first, since an addon declares a
+    /// row and sets it together; and its count of Lua-created CVars, which only grows.
+    fn drain_vm(&mut self, script: &mut UiScript) {
+        for (name, default) in script.take_cvar_registrations() {
+            self.learn_addon_row(&name, &default);
+        }
+        for write in script.take_cvar_writes() {
+            match write {
+                CvarWrite::Set { name, value } => {
+                    self.set_from_vm(&name, &value);
+                }
+                CvarWrite::FillReset { name, value } => self.fill_reset(&name, &value),
+                CvarWrite::Restore { name, value } => {
+                    self.restore_from_vm(&name, &value);
+                }
+            }
+        }
+        self.lua_created = self.lua_created.max(script.cvar_lua_created());
+        self.console.extend(script.take_cvar_console_lines());
+    }
+
+    /// The whole table as a VM's mirror is seeded from it, in list order.
     pub(crate) fn vm_seed(&self) -> Vec<SeededCvar> {
-        self.rows
-            .iter()
+        self.listed()
+            .into_iter()
             .map(|r| SeededCvar {
                 name: r.name.clone(),
                 value: r.value.clone(),
                 default: r.default.clone(),
                 latched: r.latched,
+                check: r.check,
+                reset: r.reset.clone(),
+                session: self.session_owned.contains(&r.name.to_ascii_lowercase()),
             })
             .collect()
+    }
+
+    /// The change callbacks' lines since the last call.
+    #[cfg(test)]
+    pub(crate) fn take_console_lines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.console)
+    }
+
+    fn has_console_lines(&self) -> bool {
+        !self.console.is_empty()
+    }
+
+    /// A line an observer prints to the console, such as `spellEffectLevel`'s "Spell effect level
+    /// set to %d." (`0x689537`-`0x689554`); logged with the callbacks' at the next sync.
+    pub(crate) fn print(&mut self, line: String) {
+        self.console.push(line);
+    }
+
+    /// Send the console's lines to the log.
+    fn log_console_lines(&mut self) {
+        if self.console.is_empty() {
+            return;
+        }
+        for line in self.console.drain(..) {
+            info!("console: {line}");
+        }
     }
 
     /// Read before taking, so a quiet frame never deref-muts the registry.
@@ -465,9 +706,9 @@ impl Cvars {
         std::mem::take(&mut self.outbox)
     }
 
-    /// The file to save: the previous file as the merge base, each row off its default at its
-    /// applied value (a staged one is not the player's yet), each at its default removed;
-    /// session-owned and unknown keys untouched.
+    /// The file to save, `SaveConfig` (`0x63d980`): the previous file as the merge base, each row
+    /// at its staged value, else its applied one (`0x63da27`-`0x63da2e`), and a row whose text is
+    /// its default removed; session-owned and unknown keys untouched.
     fn compose(&self) -> BTreeMap<String, String> {
         let mut out = self.file.clone();
         for row in &self.rows {
@@ -480,18 +721,56 @@ impl Cvars {
                 .keys()
                 .find(|k| k.eq_ignore_ascii_case(&row.name))
                 .cloned();
-            if row.value == row.default {
+            let text = row.pending.as_ref().unwrap_or(&row.value);
+            // `SaveConfig` skips a value equal to its default case-blind (`0x63da4a`).
+            if same_text(text, &row.default) {
                 if let Some(k) = existing {
                     out.remove(&k);
                 }
             } else {
-                out.insert(
-                    existing.unwrap_or_else(|| row.name.clone()),
-                    row.value.clone(),
-                );
+                out.insert(existing.unwrap_or_else(|| row.name.clone()), text.clone());
             }
         }
         out
+    }
+
+    /// The account name earlier builds kept in a file of its own
+    /// ([`crate::local_state::legacy_account_path`]), taken once into the `accountName` row (the
+    /// record `GetSavedAccountName` reads, `0x46cdd0`) when `config.toml` holds none: its value and
+    /// reset text, trimmed as the old reader trimmed it. The file goes only after the next save
+    /// succeeds ([`write_config`]), so a crash or a failed write leaves it for the next launch.
+    /// Beside a malformed `config.toml` (`can_save` false) the name only shows: nothing is
+    /// dirtied, so nothing saves over that file until a change, and the old file stays.
+    fn adopt_legacy_account(
+        &mut self,
+        path: Option<std::path::PathBuf>,
+        file_has_row: bool,
+        can_save: bool,
+    ) {
+        let Some(path) = path else {
+            return;
+        };
+        let name = match std::fs::read_to_string(&path) {
+            Ok(text) => text.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                warn!("config: cannot read {}: {e}", path.display());
+                return;
+            }
+        };
+        if !file_has_row && !name.is_empty() {
+            if let Some(i) = self.slot(CVAR_ACCOUNT_NAME) {
+                let row = &mut self.rows[i];
+                row.value = name.clone();
+                row.reset = Some(name.clone());
+                self.outbox.push((row.name.clone(), name));
+                info!("config: the saved account name moves into config.toml");
+            }
+        }
+        if can_save {
+            self.legacy_account = Some(path);
+            self.touch();
+        }
     }
 
     /// A registry already holding one stored value, as if `config.toml` said so.
@@ -503,6 +782,9 @@ impl Cvars {
         cvars
     }
 }
+
+/// The saved account name's row (`0x402bd2`), which the login screen fills its name from.
+const CVAR_ACCOUNT_NAME: &str = "accountName";
 
 /// How long a dirty config waits before saving: long enough to coalesce a slider drag.
 const SAVE_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
@@ -619,6 +901,15 @@ fn load_config(world: &mut World) {
         // `gxApi` is the render backend, a fact about the machine that `sync_cvars` pushes live, so
         // it is never persisted.
         cvars.own_for_session("gxApi", None);
+        cvars.announce_locale_defaults();
+        let (file_has_account, can_save) = match &stored {
+            StoredConfig::Table(t) => (
+                t.keys().any(|k| k.eq_ignore_ascii_case(CVAR_ACCOUNT_NAME)),
+                true,
+            ),
+            StoredConfig::Absent => (false, true),
+            StoredConfig::Bad(_) => (false, false),
+        };
         match stored {
             StoredConfig::Absent => {} // no file, hermetic capture, or no install
             StoredConfig::Bad(msg) => {
@@ -628,6 +919,12 @@ fn load_config(world: &mut World) {
             }
             StoredConfig::Table(table) => cvars.load_file(table),
         }
+        cvars.adopt_legacy_account(
+            crate::local_state::legacy_account_path(),
+            file_has_account,
+            can_save,
+        );
+        cvars.log_console_lines();
         cvars.take_events()
     };
     for event in events {
@@ -695,6 +992,9 @@ pub(crate) fn sync_cvars(
             cvars.own_for_session("gxApi", Some(backend));
         }
     }
+    if cvars.has_console_lines() {
+        cvars.log_console_lines();
+    }
     let Some(mut script) = script else {
         // Nothing to mirror into; a later VM is seeded from the table, which carries it all.
         if cvars.has_outbox() {
@@ -708,23 +1008,14 @@ pub(crate) fn sync_cvars(
         return;
     };
     // The VM's writes before the seed: an addon's `SetCVar` at load is already queued, and seeding
-    // first would overwrite the mirror with the older value. Registrations before writes, since an
-    // addon declares a row and sets it together.
-    let registrations = script.take_cvar_registrations();
-    let changes = script.take_cvar_changes();
-    if !registrations.is_empty() || !changes.is_empty() {
-        for (name, default) in registrations {
-            cvars.learn_addon_row(&name, &default);
-        }
-        for (name, value) in changes {
-            cvars.set_from_vm(&name, &value);
-        }
+    // first would overwrite the mirror with the older value. Read before taking, so a quiet frame
+    // never deref-muts the registry.
+    if script.has_cvar_traffic() || script.cvar_lua_created() != cvars.lua_created {
+        cvars.drain_vm(&mut script);
+        cvars.log_console_lines();
     }
     if seeded.claim(&script) {
-        // The file's unclaimed entries first, so an addon's `RegisterCVar` starts at the saved
-        // value; then the table.
-        script.set_cvar_saved_base(cvars.orphans());
-        script.seed_cvars(cvars.vm_seed());
+        cvars.seed_vm(&mut script);
         if cvars.has_outbox() {
             cvars.take_outbox(); // the seed just carried everything
         }
@@ -784,20 +1075,12 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
     if !world.contains_resource::<Cvars>() {
         return;
     }
-    let (registrations, changes) = {
+    let events = world.resource_scope(|world, mut cvars: Mut<Cvars>| {
         let Some(mut script) = world.get_non_send_resource_mut::<UiScript>() else {
-            return;
+            return Vec::new();
         };
-        (script.take_cvar_registrations(), script.take_cvar_changes())
-    };
-    let events = {
-        let mut cvars = world.resource_mut::<Cvars>();
-        for (name, default) in registrations {
-            cvars.learn_addon_row(&name, &default);
-        }
-        for (name, value) in changes {
-            cvars.set_from_vm(&name, &value);
-        }
+        cvars.drain_vm(&mut script);
+        cvars.log_console_lines();
         if cvars.has_outbox() {
             cvars.take_outbox(); // the VM this was for is going away
         }
@@ -806,7 +1089,7 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
         } else {
             Vec::new()
         }
-    };
+    });
     for event in events {
         world.trigger(event);
     }
@@ -862,6 +1145,13 @@ fn write_config(cvars: &mut Cvars) {
         Ok(()) => {
             cvars.file = file;
             cvars.dirty = false;
+            if let Some(old) = cvars.legacy_account.take() {
+                if let Err(e) = std::fs::remove_file(&old) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!("config: cannot remove {}: {e}", old.display());
+                    }
+                }
+            }
         }
         Err(e) => {
             warn!("config: cannot write {}: {e}", path.display());
@@ -894,7 +1184,7 @@ mod tests {
     use crate::chat_bubble::BubbleConfig;
     use crate::minimap::MinimapZoom;
     use crate::nameplates::NameConfig;
-    use crate::player::camera::{FollowConfig, FollowStyle, LookConfig, FOLLOW_SPEED_RANGE};
+    use crate::player::camera::{FollowConfig, FollowStyle, LookConfig};
     use crate::player::camera_zoom::ZoomLimit;
     use crate::portrait::PaneRate;
     use crate::sound::SoundConfig;
@@ -903,7 +1193,6 @@ mod tests {
     use crate::ui_script::{UiScaleCvar, DEFAULT_UI_SCALE};
     use crate::video::VideoConfig;
     use crate::world_backdrop::{RenderScale, RENDER_SCALE_RANGE};
-    use benilla_ui::widget::MINIMAP_ZOOM_LEVELS;
     use benilla_world::clutter::ClutterConfig;
     use benilla_world::view::{MsaaSetting, ViewDistance, FARCLIP_RANGE, MSAA_RANGE};
 
@@ -929,6 +1218,28 @@ mod tests {
                      a `deviates` row and owes a reason.",
                     row.default,
                 ),
+                Reference::SameByLocale { except } => {
+                    // Each exception is a locale the table has, once, and a different string
+                    // from the base: an entry that repeats the base is a plain `same` row.
+                    let mut seen = Vec::new();
+                    for (locale, value) in *except {
+                        assert!(*locale < 8, "{name}: no locale index {locale}");
+                        assert!(
+                            !seen.contains(locale),
+                            "{name}: locale {locale} listed twice"
+                        );
+                        seen.push(*locale);
+                        assert!(
+                            !agrees(row.default, value),
+                            "{name}: locale {locale} lists the base default {value:?}"
+                        );
+                        assert_eq!(row.default_for(*locale), *value, "{name}");
+                    }
+                    assert!(
+                        !except.is_empty(),
+                        "{name}: a `same_by_locale` row owes a locale"
+                    );
+                }
                 Reference::Deviates { value, why } => {
                     assert!(
                         !agrees(row.default, value),
@@ -957,6 +1268,83 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The three register sites that pick their default by locale (`0x603368`, `0x63a738`), at
+    /// all eight indices: AutoInteract is "1" on koKR (1) alone, gxWindow and gxMaximize "1" on
+    /// zhCN (4) alone, and every other row boots the same on every locale. The table and `Cvars`
+    /// agree at each index, and the default the registry restores is the locale's.
+    #[test]
+    fn the_locale_dependent_defaults_hold_at_every_index() {
+        assert_eq!(
+            benilla_formats::Locale::from_index(1).unwrap().name(),
+            "koKR"
+        );
+        assert_eq!(
+            benilla_formats::Locale::from_index(4).unwrap().name(),
+            "zhCN"
+        );
+        let on_at = [("AutoInteract", 1), ("gxWindow", 4), ("gxMaximize", 4)];
+        for locale in 0..8 {
+            let cvars = Cvars::for_locale(locale);
+            for (name, on) in on_at {
+                let want = if locale == on { "1" } else { "0" };
+                assert_eq!(cvars.get(name), Some(want), "{name} at locale {locale}");
+                assert_eq!(
+                    cvars.default_of(name),
+                    Some(want),
+                    "{name} at locale {locale}"
+                );
+                assert_eq!(registered_default(name, locale), Some(want));
+            }
+            for row in all_rows().filter(|r| !on_at.iter().any(|(n, _)| *n == r.name)) {
+                assert_eq!(
+                    row.default_for(locale),
+                    row.default,
+                    "{} must not depend on the locale",
+                    row.name
+                );
+            }
+        }
+    }
+
+    /// A locale that registers a row off its base moves the knob at load, so the state a player
+    /// sees (Click-to-Move, windowed, maximized) is the registered default and not the knob's own
+    /// initial value; a locale that does not leaves every knob where it was.
+    #[test]
+    fn a_locale_default_reaches_its_knob_at_load() {
+        let boot = |locale: usize| {
+            let mut app = cvar_app();
+            app.insert_resource(Cvars::for_locale(locale));
+            app.update();
+            let video = *res::<VideoConfig>(&app);
+            (
+                video.display,
+                video.maximize,
+                res::<crate::player::Approach>(&app).enabled,
+            )
+        };
+        use crate::video::DisplayMode::{Fullscreen, Windowed};
+        assert_eq!(boot(0), (Fullscreen, false, false), "enUS");
+        assert_eq!(boot(1), (Fullscreen, false, true), "koKR: Click-to-Move");
+        assert_eq!(
+            boot(4),
+            (Windowed, true, false),
+            "zhCN: windowed and maximized"
+        );
+        assert_eq!(boot(5), (Fullscreen, false, false), "zhTW is not zhCN");
+    }
+
+    /// A session-owned row stays the session's: the announce does not overwrite the value an
+    /// instrumented run pinned.
+    #[test]
+    fn a_session_owned_row_is_not_announced() {
+        let mut cvars = Cvars::for_locale(4);
+        cvars.own_for_session("gxWindow", Some("0"));
+        cvars.announce_locale_defaults();
+        let names: Vec<_> = cvars.take_events().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["gxMaximize"]);
+        assert_eq!(cvars.get("gxWindow"), Some("0"));
     }
 
     #[test]
@@ -1126,8 +1514,8 @@ mod tests {
         assert_eq!(d["ChatBubblesParty"] != 0.0, bubbles.party);
         assert!(bubbles.all && !bubbles.party, "the binary's own pair");
         let zoom = MinimapZoom::default();
-        assert_eq!(d["minimapZoom"], f32::from(zoom.outdoor));
-        assert_eq!(d["minimapInsideZoom"], f32::from(zoom.inside));
+        assert_eq!(d["minimapZoom"], zoom.outdoor as f32);
+        assert_eq!(d["minimapInsideZoom"], zoom.inside as f32);
         assert_eq!(zoom.outdoor, benilla_ui::widget::MINIMAP_DEFAULT_ZOOM);
         // `video::tests` welds `VideoConfig::vsync` to the window's boot present mode.
         assert_eq!(d["gxVSync"] != 0.0, VideoConfig::default().vsync);
@@ -1209,11 +1597,17 @@ mod tests {
             "elsewhere.example.org",
             "a known key with a bad value is consumed, and the resource keeps its truth",
         );
-        // Clamps are the knob's own: volume to [0,1], farclip to FARCLIP_RANGE.
+        // Volume clamps at the knob to [0,1]; `farclip` refuses outside [177, 777] (`0x688d40`)
+        // and the old value stands.
         apply(&mut app, "mastervolume", "7");
         assert_eq!(res::<SoundConfig>(&app).master, 1.0);
-        apply(&mut app, "farclip", "50");
-        assert_eq!(res::<ViewDistance>(&app).farclip, *FARCLIP_RANGE.start());
+        apply(&mut app, "farclip", "400");
+        assert_eq!(apply(&mut app, "farclip", "50"), SetOutcome::Vetoed);
+        assert_eq!(res::<ViewDistance>(&app).farclip, 400.0);
+        assert_eq!(res::<Cvars>(&app).get("farclip"), Some("400"));
+        assert_eq!(apply(&mut app, "farclip", "1000"), SetOutcome::Vetoed);
+        assert_eq!(res::<ViewDistance>(&app).farclip, 400.0);
+        assert!(FARCLIP_RANGE.contains(&res::<ViewDistance>(&app).farclip));
         // `nearclip` clamps to the callback's `[0.01, 0.33]` (`0x688d90`).
         apply(&mut app, "nearclip", "0.001");
         assert_eq!(
@@ -1305,13 +1699,25 @@ mod tests {
             FollowStyle::Smart,
             "and only that one"
         );
-        apply(&mut app, "cameraYawSmoothSpeed", "270");
-        assert_eq!(res::<FollowConfig>(&app).yaw_speed, 270.0);
-        apply(&mut app, "cameraYawSmoothSpeed", "9000");
-        assert_eq!(
-            res::<FollowConfig>(&app).yaw_speed,
-            *FOLLOW_SPEED_RANGE.end()
-        );
+        // The validator's [0.1, 360] (`0x50c000`) is the range, not the stock slider's 90 to 270:
+        // a value inside it is stored and used as is (`0x512d75`).
+        for (text, want) in [("270", 270.0), ("360", 360.0), ("0.2", 0.2), ("30", 30.0)] {
+            assert_eq!(
+                apply(&mut app, "cameraYawSmoothSpeed", text),
+                SetOutcome::Changed,
+                "{text}"
+            );
+            assert_eq!(res::<FollowConfig>(&app).yaw_speed, want, "{text}");
+        }
+        // Outside it: refused, and the last stored value stands.
+        for text in ["360.5", "400", "9000", "0", "0.05", "-30"] {
+            assert_eq!(
+                apply(&mut app, "cameraYawSmoothSpeed", text),
+                SetOutcome::Vetoed,
+                "{text}"
+            );
+            assert_eq!(res::<FollowConfig>(&app).yaw_speed, 30.0, "{text}");
+        }
         // The max orbit lands as yards on the knob: `cameraDistanceMax` x the factor, held to
         // [0, 50]; the factor is not held to its slider's 1 to 2.
         apply(&mut app, "cameraDistanceMaxFactor", "1");
@@ -1325,11 +1731,17 @@ mod tests {
         assert_eq!(res::<ZoomLimit>(&app).max, 50.0);
         apply(&mut app, "cameraDistanceMaxFactor", "-1");
         assert_eq!(res::<ZoomLimit>(&app).max, 0.0);
+        // `SStrToFloat` reads "nan" as 0; a NaN takes an exponent past 4932.
         apply(&mut app, "cameraDistanceMaxFactor", "nan");
+        assert_eq!(res::<ZoomLimit>(&app).max, 0.0);
+        apply(&mut app, "cameraDistanceMaxFactor", "0e5000");
         assert_eq!(res::<ZoomLimit>(&app).max, 50.0);
-        // Out of `cameraDistanceMax`'s validator range: refused at the knob, 25 stands.
+        // Out of `cameraDistanceMax`'s validator range (`0x50b310`): refused, 25 stands.
         apply(&mut app, "cameraDistanceMaxFactor", "1");
-        apply(&mut app, "cameraDistanceMax", "60");
+        assert_eq!(
+            apply(&mut app, "cameraDistanceMax", "60"),
+            SetOutcome::Vetoed
+        );
         assert_eq!(res::<ZoomLimit>(&app).max, 25.0);
         apply(&mut app, "autoLootDefault", "1");
         assert!(res::<LootConfig>(&app).auto_loot);
@@ -1354,7 +1766,7 @@ mod tests {
         assert_eq!(res::<ClutterConfig>(&app).density, 1.0);
         apply(&mut app, "worlddetail", "7");
         assert_eq!(res::<ClutterConfig>(&app).density, 3.0);
-        // `frillDensity` is the same field in cells per chunk, with its own clamp `[1, 256]`
+        // `frillDensity` is the same field in cells per chunk, refused outside `[1, 256]`
         // (`0x688de0`); the stops round-trip through both spellings.
         apply(&mut app, "frillDensity", "48");
         assert_eq!(res::<ClutterConfig>(&app).density, 3.0);
@@ -1363,11 +1775,17 @@ mod tests {
         // Past the top stop is honoured; pfUI's `hdgraphic` writes up to 256.
         apply(&mut app, "frillDensity", "256");
         assert_eq!(res::<ClutterConfig>(&app).density, 16.0);
-        // `0` is not clutter-off: the callback pins it to 1.
-        apply(&mut app, "frillDensity", "9000");
+        // Past either end is refused and the density stands; `0` is not clutter-off.
+        assert_eq!(apply(&mut app, "frillDensity", "9000"), SetOutcome::Vetoed);
         assert_eq!(res::<ClutterConfig>(&app).density, 16.0);
-        apply(&mut app, "frillDensity", "0");
+        assert_eq!(apply(&mut app, "frillDensity", "0"), SetOutcome::Vetoed);
+        assert_eq!(res::<ClutterConfig>(&app).density, 16.0);
+        assert_eq!(res::<Cvars>(&app).get("frillDensity"), Some("256"));
+        apply(&mut app, "frillDensity", "1");
         assert_eq!(res::<ClutterConfig>(&app).density, 1.0 / 16.0);
+        // The callback hands on `SStrToInt`'s integer (`0x688dfa`): 48.9 applies 48.
+        apply(&mut app, "frillDensity", "48.9");
+        assert_eq!(res::<ClutterConfig>(&app).density, 3.0);
         apply(&mut app, "WorldDetail", "1");
         assert_eq!(res::<ClutterConfig>(&app).density, 2.0);
         for (wrote, want) in [
@@ -1513,34 +1931,352 @@ mod tests {
             3,
             "the two indices are independent"
         );
+        // The zoom cell takes the record's integer raw (`0x6d9013`): past 5 and below 0 stand.
         apply(&mut app, "minimapinsidezoom", "9");
-        assert_eq!(res::<MinimapZoom>(&app).inside, MINIMAP_ZOOM_LEVELS - 1);
+        assert_eq!(res::<MinimapZoom>(&app).inside, 9);
         apply(&mut app, "minimapZoom", "-2");
-        assert_eq!(res::<MinimapZoom>(&app).outdoor, 0);
-        assert_eq!(apply(&mut app, "uiScale", "banana"), SetOutcome::Refused);
-        assert_eq!(res::<UiScaleCvar>(&app).0, 0.9);
+        assert_eq!(res::<MinimapZoom>(&app).outdoor, (-2_i32) as u32);
+        apply(&mut app, "minimapZoom", "4.9");
+        assert_eq!(
+            res::<MinimapZoom>(&app).outdoor,
+            4,
+            "SStrToInt stops at the point"
+        );
+        // Text that is no number is stored (`0x63e0b0`) and reads as the record's float, 0,
+        // which the knob holds to its floor.
+        assert_eq!(apply(&mut app, "uiScale", "banana"), SetOutcome::Changed);
+        assert_eq!(res::<UiScaleCvar>(&app).0, 0.5);
         assert_eq!(apply(&mut app, "bogus", "1"), SetOutcome::Unknown);
     }
 
     /// `/console spellEffectLevel 0` prints the handler's own line (`0x689537`-`0x689554`, format
-    /// `0x869f94`) with the level it clamped to; a Lua write logs it instead.
+    /// `0x869f94`) with the level it clamped to.
     #[test]
     fn the_spell_effect_level_handler_echoes_to_the_console() {
         let mut app = cvar_app();
-        app.init_resource::<crate::console::ConsoleEcho>();
         assert_eq!(
-            crate::console::execute(app.world_mut(), "spellEffectLevel 0"),
+            console_exec(&mut app, "spellEffectLevel 0"),
             ["Spell effect level set to 0."]
         );
         assert_eq!(
-            crate::console::execute(app.world_mut(), "spellEffectLevel 9"),
+            console_exec(&mut app, "spellEffectLevel 9"),
             ["Spell effect level set to 2."]
         );
         assert_eq!(res::<Cvars>(&app).get("spellEffectLevel"), Some("9"));
         assert_eq!(
-            crate::console::execute(app.world_mut(), "farclip 400"),
+            console_exec(&mut app, "farclip 400"),
             Vec::<String>::new(),
             "a callback that prints nothing adds nothing"
+        );
+    }
+
+    /// The video rows whose callbacks refuse (`SmallCull` `0x688b10`, `shadowLevel` `0x688c10`,
+    /// `texLodBias` `0x688c90`, `baseMip` `0x689090`, `farclip` `0x688d40`, `frillDensity`
+    /// `0x688de0`): `CVar::Set` keeps the old value
+    /// (`0x63df85`), and the console shows the callback's line, on the console and on a host write.
+    #[test]
+    fn a_refusing_callback_keeps_the_value_on_every_write() {
+        let mut app = cvar_app();
+        for (line, said, name, kept) in [
+            (
+                "SmallCull 5",
+                "SmallCull must be in range 0.001 - 2.0.",
+                "SmallCull",
+                "0.04",
+            ),
+            (
+                "shadowLevel 3",
+                "Shadow mip level must be in range 0 - 1.",
+                "shadowLevel",
+                "1",
+            ),
+            (
+                "texLodBias -2",
+                "TexLodBias must be in range -1.0 - 1.0.",
+                "texLodBias",
+                "0.0",
+            ),
+            ("baseMip 5", "BaseMip must be 0 or 1", "baseMip", "0"),
+            (
+                "farclip 1000",
+                "FarClip must be in range 177.0 - 777.0.",
+                "farclip",
+                "350",
+            ),
+            (
+                "frillDensity 0",
+                "Frill Density must be in range 1 - 256.",
+                "frillDensity",
+                "32",
+            ),
+            (
+                "gxTripleBuffer 2",
+                "TripleBuffer must be 0 or 1",
+                "gxTripleBuffer",
+                "0",
+            ),
+            (
+                "gxRefresh 144",
+                "unsupported refresh rate, must be one of \
+                 60, 70, 72, 75, 85, 90, 100, 120, 160, 180, 200",
+                "gxRefresh",
+                "75",
+            ),
+        ] {
+            assert_eq!(console_exec(&mut app, line), [said], "{line}");
+            assert_eq!(res::<Cvars>(&app).get(name), Some(kept), "{line}");
+        }
+        assert_eq!(
+            console_exec(&mut app, "baseMip 1"),
+            ["BaseMip level changed to 1"]
+        );
+        assert_eq!(
+            console_exec(&mut app, "baseMip 1"),
+            Vec::<String>::new(),
+            "the level it already has is taken silently"
+        );
+        assert_eq!(
+            console_exec(&mut app, "shadowLevel 0"),
+            ["Shadow mip level changed upon restart."]
+        );
+        assert_eq!(res::<Cvars>(&app).get("shadowLevel"), Some("0"));
+        // A latched row's callback runs before the stage (`0x63df7d`, ahead of `0x63df8e`): the
+        // refused rate stages nothing, a listed one stages and says so.
+        assert_eq!(
+            res::<Cvars>(&app).rows[res::<Cvars>(&app).slot("gxRefresh").unwrap()].pending,
+            None
+        );
+        assert_eq!(
+            console_exec(&mut app, "gxRefresh 60"),
+            ["set pending gxRestart"]
+        );
+
+        let mut cvars = Cvars::default();
+        assert_eq!(cvars.set("texLodBias", "1.5"), SetOutcome::Vetoed);
+        assert_eq!(cvars.get("texLodBias"), Some("0.0"));
+        assert!(!cvars.has_events() && !cvars.has_outbox() && !cvars.dirty);
+        assert_eq!(cvars.set("texLodBias", "-0.5"), SetOutcome::Changed);
+    }
+
+    /// The camera block's validator `0x50b330`, through its wrappers `0x50c000`, `0x50bfe0` and
+    /// `0x50c040`: an out-of-range rate, time or decay keeps the old value and prints the range
+    /// (`0x84fb00`), so a zero can no longer stall an ease or invert a clamp. A saved one stands
+    /// in the row but reaches no knob, as the callback that refused it applied nothing.
+    #[test]
+    fn the_camera_validators_refuse_out_of_range_rates_and_times() {
+        let mut app = cvar_app();
+        for (line, said, name, kept) in [
+            (
+                "cameraTerrainTiltTimeMax 0",
+                "Value out of range (0.001000 - 300.000000)",
+                "cameraTerrainTiltTimeMax",
+                "10.0",
+            ),
+            (
+                "cameraTargetSmoothSpeed 0",
+                "Value out of range (0.100000 - 360.000000)",
+                "cameraTargetSmoothSpeed",
+                "90.0",
+            ),
+            (
+                "cameraBobbingSmoothSpeed 0",
+                "Value out of range (0.002778 - 50.000000)",
+                "cameraBobbingSmoothSpeed",
+                "0.8",
+            ),
+            (
+                "cameraYawMoveSpeed 400",
+                "Value out of range (0.100000 - 360.000000)",
+                "cameraYawMoveSpeed",
+                "180.0",
+            ),
+            (
+                "cameraSmoothStyle 4",
+                "Value out of range (0.000000 - 3.000000)",
+                "cameraSmoothStyle",
+                "1",
+            ),
+            // A saved view's three, from `[0x84f790]`: `0x50b310`, `0x50b380`, `0x50b3c0`.
+            (
+                "cameraDistanceC 60",
+                "Value out of range (0.000000 - 50.000000)",
+                "cameraDistanceC",
+                "13.88",
+            ),
+            (
+                "cameraPitchB 100",
+                "Value out of range (-89.000000 - 89.000000)",
+                "cameraPitchB",
+                "20.0",
+            ),
+            (
+                "cameraYawA -10",
+                "Value out of range (0.000000 - 360.000000)",
+                "cameraYawA",
+                "0.0",
+            ),
+        ] {
+            assert_eq!(console_exec(&mut app, line), [said], "{line}");
+            assert_eq!(res::<Cvars>(&app).get(name), Some(kept), "{line}");
+        }
+        assert!(console_exec(&mut app, "cameraTerrainTiltTimeMax 20").is_empty());
+        assert_eq!(
+            res::<Cvars>(&app).get("cameraTerrainTiltTimeMax"),
+            Some("20")
+        );
+
+        let cvars = registry(&[("cameraTerrainTiltTimeMax", "0")]);
+        assert_eq!(cvars.get("cameraTerrainTiltTimeMax"), Some("0"));
+        assert!(!cvars.has_events(), "the refused value reaches no knob");
+    }
+
+    /// The config file is read before these rows are registered, and `CVar::Register` runs the
+    /// callback on the saved value without testing its answer (`0x63dc58`), so it stands.
+    #[test]
+    fn a_saved_value_a_callback_refuses_still_loads() {
+        let cvars = registry(&[
+            ("baseMip", "5"),
+            ("shadowLevel", "3"),
+            ("MaxLights", "9"),
+            ("ErrorFilter", "bogus"),
+        ]);
+        assert_eq!(cvars.get("baseMip"), Some("5"));
+        assert_eq!(cvars.get("shadowLevel"), Some("3"));
+        assert_eq!(cvars.get("MaxLights"), Some("9"));
+        assert_eq!(cvars.get("ErrorFilter"), Some("bogus"));
+    }
+
+    /// The reference's other refusing callbacks (#1340), run on the console's write and on a Lua
+    /// `SetCVar` alike: refused, the value stands and the callback's line is logged; taken, it is
+    /// stored. The two LOD distances never refuse.
+    #[test]
+    fn the_world_callbacks_refuse_on_every_write() {
+        let mut app = cvar_app();
+        for (name, bad, said, good) in [
+            ("MaxLights", "9", "MaxLights must be in range 1 - 4.", "2"),
+            ("mapObjLightLOD", "3", "MapObjLightLOD must be 0-2", "2"),
+            ("waterLOD", "1", "waterLOD fixed to 0", "0"),
+            (
+                "DistCull",
+                "900",
+                "DistCull must be in range 1.0 - 888.888916.",
+                "800",
+            ),
+            (
+                "particleDensity",
+                "0.1",
+                "Value must be between 0.25 and 1.0.",
+                "0.5",
+            ),
+            (
+                "unitDrawDist",
+                "50",
+                "Value must be between 100 and 300.",
+                "200",
+            ),
+            (
+                "targetNearestDistance",
+                "60",
+                "TargetNearestDistance must be between 1 and 50.000000",
+                "20",
+            ),
+            (
+                "targetNearestDistanceRadius",
+                "0",
+                "TargetNearestDistance must be between 1 and 50.000000",
+                "5",
+            ),
+            (
+                "horizonfarclip",
+                "800",
+                "HorizonFarClip must be in range 878.000000 - 2112.000000.",
+                "900",
+            ),
+            (
+                "footstepBias",
+                "2",
+                "Footstep bias must be in the range (0, 1)",
+                "0.5",
+            ),
+            (
+                "shadowBias",
+                "-1",
+                "Shadow bias must be in the range (0, 1)",
+                "0.5",
+            ),
+        ] {
+            let before = res::<Cvars>(&app).get(name).unwrap().to_string();
+            assert_eq!(
+                console_exec(&mut app, &format!("{name} {bad}")),
+                [said],
+                "{name}"
+            );
+            assert_eq!(console_exec(&mut app, &format!("SET {name} {bad}")), [said]);
+            assert_eq!(
+                res::<Cvars>(&app).get(name),
+                Some(before.as_str()),
+                "{name}"
+            );
+            console_exec(&mut app, &format!("{name} {good}"));
+            assert_eq!(res::<Cvars>(&app).get(name), Some(good), "{name}");
+            // A Lua `SetCVar` meets the same callback in the VM's mirror.
+            let mut script = UiScript::new().unwrap();
+            res::<Cvars>(&app).seed_vm(&mut script);
+            let read = script
+                .eval::<String>(&format!(
+                    "SetCVar({name:?}, {bad:?}) return GetCVar({name:?})"
+                ))
+                .unwrap();
+            assert_eq!(read, good, "{name}");
+        }
+        assert_eq!(
+            console_exec(&mut app, "ErrorFilter nonsense"),
+            [
+                "Unknown filter nonsense",
+                "Filters: general world ui animation models objects all",
+                "         use \"except\" to invert mask",
+                "         i.e.: all except objects",
+            ]
+        );
+        assert_eq!(res::<Cvars>(&app).get("ErrorFilter"), Some("all"));
+        assert_eq!(
+            console_exec(&mut app, "lodDist 9999"),
+            ["Lod distance must be in range 50.0f - 250.0f."]
+        );
+        assert_eq!(res::<Cvars>(&app).get("lodDist"), Some("9999"));
+        console_exec(&mut app, "textureLodDist 1");
+        assert_eq!(res::<Cvars>(&app).get("textureLodDist"), Some("1"));
+        // The horizon's lower bound follows the far clip.
+        console_exec(&mut app, "farclip 400");
+        assert_eq!(
+            console_exec(&mut app, "horizonfarclip 910"),
+            ["HorizonFarClip must be in range 928.000000 - 2112.000000."]
+        );
+    }
+
+    /// The VM's mirror carries the same callbacks, so a Lua `SetCVar` is refused at once and
+    /// `GetCVar` never answers the refused value.
+    #[test]
+    fn a_seeded_vm_refuses_what_the_registry_refuses() {
+        let mut cvars = registry(&[]);
+        let mut script = UiScript::new().unwrap();
+        cvars.seed_vm(&mut script);
+        script
+            .run(r#"SetCVar("shadowLevel", 3) SetCVar("baseMip", 1) ConsoleExec("SmallCull 9")"#)
+            .unwrap();
+        assert_eq!(script.cvar("shadowLevel").as_deref(), Some("1"));
+        assert_eq!(script.cvar("baseMip").as_deref(), Some("1"));
+        assert_eq!(script.cvar("SmallCull").as_deref(), Some("0.04"));
+        cvars.drain_vm(&mut script);
+        assert_eq!(cvars.get("baseMip"), Some("1"));
+        assert_eq!(
+            cvars.take_console_lines(),
+            [
+                "Shadow mip level must be in range 0 - 1.",
+                "BaseMip level changed to 1",
+                "SmallCull must be in range 0.001 - 2.0.",
+            ],
+            "each line once: the registry does not re-run a VM write's check"
         );
     }
 
@@ -1564,6 +2300,62 @@ mod tests {
         assert_eq!(out.get("uiScale").map(String::as_str), Some("0.8"));
         assert!(!out.contains_key("farclip"));
         assert_eq!(out.get("FutureKnob").map(String::as_str), Some("3"));
+    }
+
+    /// A reference CVar nothing here reads (pfUI's afkcam sets `cameraCustomViewSmoothing`,
+    /// `0x50bad0`) is found by Lua's lookup, so `SetCVar` neither raises nor warns; it persists as
+    /// a diff like any row, and its flag-bit1 neighbour stays latched.
+    #[test]
+    fn a_reference_cvar_nothing_reads_is_settable_and_persists_as_a_diff() {
+        let mut cvars = Cvars::default();
+        let mut script = UiScript::new().expect("VM");
+        script.seed_cvars(cvars.vm_seed());
+        script
+            .run(r#"SetCVar("cameraCustomViewSmoothing", "1") SetCVar("SoundOutputSystem", "1")"#)
+            .expect("both names are the reference's registered ones");
+        assert_eq!(
+            script
+                .eval::<String>(r#"return GetCVarDefault("cameraCustomViewSmoothing")"#)
+                .unwrap(),
+            "0"
+        );
+        assert_eq!(
+            script
+                .eval::<String>(r#"return GetCVar("cameraCustomViewSmoothing")"#)
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            script
+                .eval::<String>(r#"return GetCVar("SoundOutputSystem")"#)
+                .unwrap(),
+            "-1",
+            "flag bit1 keeps the write staged"
+        );
+        assert!(script.take_warnings().is_empty());
+        for (name, value) in script.take_cvar_changes() {
+            cvars.set_from_vm(&name, &value);
+        }
+        let out = cvars.compose();
+        assert_eq!(
+            out.get("cameraCustomViewSmoothing").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            cvars.get("SoundOutputSystem"),
+            Some("-1"),
+            "a stage is not applied"
+        );
+        assert_eq!(
+            out.get("SoundOutputSystem").map(String::as_str),
+            Some("1"),
+            "but it is saved (`0x63da27`)"
+        );
+        cvars.set("cameraCustomViewSmoothing", "0");
+        assert!(!cvars.compose().contains_key("cameraCustomViewSmoothing"));
+        // The camera block's range check rides along (`0x50c000`).
+        let rate = cvars.set("cameraFoVSmoothSpeed", "9000");
+        assert_eq!(rate, SetOutcome::Vetoed);
     }
 
     #[test]
@@ -1604,6 +2396,118 @@ mod tests {
         assert!(!app.world().resource::<Cvars>().dirty);
         assert!(app.should_exit().is_none());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The old `benilla-config/account` file moves into `config.toml`'s `accountName` once: the
+    /// first boot reads it, the save writes the row and only then deletes the file, and the next
+    /// boot reads the row.
+    #[test]
+    fn the_old_saved_account_file_moves_into_config_toml_once() {
+        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("benilla-cvar-acct-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _c = EnvGuard::unset("WOW_CAPTURE");
+        let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        let old = tmp.join("account");
+        std::fs::write(&old, "PLAYER\n").unwrap();
+
+        let mut app = cvar_app();
+        app.update();
+        assert_eq!(res::<Cvars>(&app).get("accountName"), Some("PLAYER"));
+        let glue = app
+            .world()
+            .non_send_resource::<UiScript>()
+            .eval::<String>("return GetCVar('accountName')")
+            .unwrap();
+        assert_eq!(glue, "PLAYER", "the VM's mirror has it");
+        assert!(old.exists(), "kept until the save");
+        app.world_mut().resource_mut::<Cvars>().last_change =
+            Instant::now().checked_sub(SAVE_QUIET * 2);
+        app.update();
+        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
+        assert!(text.contains("accountName = \"PLAYER\""), "{text}");
+        assert!(!old.exists(), "gone once the row is saved");
+
+        // The next boot reads the row; a stale file beside it is not read over it.
+        std::fs::write(&old, "STALE").unwrap();
+        let mut next = cvar_app();
+        next.update();
+        assert_eq!(res::<Cvars>(&next).get("accountName"), Some("PLAYER"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A save that fails keeps the old file, and a malformed `config.toml` is never saved over
+    /// for it: the name shows, and both files stay.
+    #[cfg(unix)]
+    #[test]
+    fn the_old_saved_account_file_outlives_a_failed_save() {
+        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+        use std::os::unix::fs::PermissionsExt;
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("benilla-cvar-acct2-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _c = EnvGuard::unset("WOW_CAPTURE");
+        let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        let old = tmp.join("account");
+        std::fs::write(&old, "PLAYER").unwrap();
+
+        let mut app = cvar_app();
+        app.update();
+        // The folder turns read-only: the write of `config.toml` fails (unless the run is root's,
+        // which no mode stops).
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let read_only = std::fs::write(tmp.join("probe"), "").is_err();
+        app.world_mut().resource_mut::<Cvars>().save();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if read_only {
+            assert!(!tmp.join("config.toml").exists());
+            assert!(old.exists(), "a failed save keeps the old file");
+        }
+        std::fs::remove_file(tmp.join("config.toml")).ok();
+        std::fs::write(&old, "PLAYER").unwrap();
+
+        std::fs::write(tmp.join("config.toml"), "not [ toml").unwrap();
+        let mut bad = cvar_app();
+        bad.update();
+        assert_eq!(res::<Cvars>(&bad).get("accountName"), Some("PLAYER"));
+        assert!(
+            !res::<Cvars>(&bad).dirty,
+            "nothing saves over the malformed file"
+        );
+        assert!(old.exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The saved account name is the `accountName` CVar: the login screen's write persists like
+    /// any CVar's, and a console write is what the login screen fills in next.
+    #[test]
+    fn the_saved_account_name_is_the_account_name_row() {
+        let mut app = cvar_app();
+        let world = app.world_mut();
+        let mut glue = UiScript::new_glue().unwrap();
+        world.resource::<Cvars>().seed_vm(&mut glue);
+        glue.run("SetSavedAccountName('Tester')").unwrap();
+        world.resource_mut::<Cvars>().drain_vm(&mut glue);
+        let cvars = world.resource::<Cvars>();
+        assert_eq!(cvars.get("accountName"), Some("Tester"));
+        assert_eq!(
+            cvars.compose().get("accountName").map(String::as_str),
+            Some("Tester")
+        );
+        console_exec(&mut app, "accountName Other");
+        let mut next = UiScript::new_glue().unwrap();
+        res::<Cvars>(&app).seed_vm(&mut next);
+        assert_eq!(
+            next.eval::<String>("return GetSavedAccountName()").unwrap(),
+            "Other"
+        );
     }
 
     #[test]
@@ -1711,6 +2615,7 @@ mod tests {
             .init_resource::<crate::perf::FpsJournalSetting>()
             .init_resource::<crate::text_filter::TextFilterSwitches>()
             .init_resource::<crate::game_tip::GameTipSetting>()
+            .init_resource::<crate::player::Approach>()
             .add_plugins(CvarPlugin);
         for observer in ALL_OBSERVERS {
             observer(&mut app);
@@ -1722,6 +2627,9 @@ mod tests {
     /// Every CVar observer in the crate; a new one is a line here and an `add_observer` in its
     /// plugin.
     const ALL_OBSERVERS: &[fn(&mut App)] = &[
+        |app| {
+            app.add_observer(crate::player::approach_on_cvar);
+        },
         |app| {
             app.add_observer(crate::sound::on_cvar);
         },
@@ -1805,90 +2713,126 @@ mod tests {
         outcome
     }
 
+    /// `ConsoleExec(line)` as the typed `/console` runs it: on a VM seeded from the app's registry,
+    /// its writes drained back and their observers run; the console lines the callbacks and the
+    /// observers printed.
+    fn console_exec(app: &mut App, line: &str) -> Vec<String> {
+        let world = app.world_mut();
+        let mut script = UiScript::new().unwrap();
+        world.resource::<Cvars>().seed_vm(&mut script);
+        script.run(&format!("ConsoleExec({line:?})")).unwrap();
+        let events = {
+            let mut cvars = world.resource_mut::<Cvars>();
+            cvars.drain_vm(&mut script);
+            cvars.take_events()
+        };
+        for event in events {
+            world.trigger(event);
+        }
+        world.resource_mut::<Cvars>().take_console_lines()
+    }
+
     fn res<T: Resource>(app: &App) -> &T {
         app.world().resource::<T>()
     }
 
-    /// The last character entered survives a quit: two launches over one `benilla-config/` with the
-    /// real [`CvarPlugin`] and [`crate::char_select`] systems, so the screen's host write must
-    /// reach the file through the registry's dirty/compose path.
+    /// `cvar_reset` restores the value `config.toml` held at start-up (`0x63dff0`, the reset text
+    /// `Config.wtf`'s `set` gave the record) and `cvar_default` the default (`0x63e010`); each moves
+    /// the knob and dirties the file.
     #[test]
-    fn entering_the_world_survives_the_quit_and_comes_back_selected() {
-        use crate::char_select::{ClientState, Roster};
-        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
-        let _l = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = std::env::temp_dir().join(format!("benilla-lastchar-{}", std::process::id()));
-        std::fs::remove_dir_all(&tmp).ok();
-        let _c = EnvGuard::unset("WOW_CAPTURE");
-        let _u = EnvGuard::unset("WOW_UI_SCALE");
-        let _f = EnvGuard::unset("WOW_FARCLIP");
-        let _d = EnvGuard::unset("WOW_CLUTTER_DENSITY");
-        let _w = EnvGuard::unset("WOW_CHAR");
-        let _s = EnvGuard::unset("WOW_CHARSELECT_PICK");
-        let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
-        let roster = || {
-            (1..=4)
-                .map(|g| crate::char_select::test_character(g, &format!("Char{g}")))
-                .collect::<Vec<_>>()
-        };
-
-        // ── Launch 1: the roster lands, and the player enters the world as the third row. ────
-        let (tx, _rx) = crossbeam_channel::unbounded();
+    fn the_reset_pair_restores_the_start_value_and_moves_the_knob() {
         let mut app = cvar_app();
-        app.add_plugins(bevy::state::app::StatesPlugin);
-        crate::char_select::add_test_systems(&mut app, tx);
-        app.update(); // Startup loads the (absent) file; the first Update seeds the VM table
-        app.world_mut().write_message(crate::net::CharListMessage {
-            characters: roster(),
-            realm: None,
-            cause: benilla_protocol::RosterCause::Park,
-            epoch: 0,
-            generation: 0,
-        });
-        app.update();
+        app.world_mut()
+            .insert_resource(Cvars::with_value("farclip", "400"));
+        apply(&mut app, "farclip", "500");
+        app.world_mut().resource_mut::<Cvars>().dirty = false;
+        assert!(console_exec(&mut app, "cvar_reset farclip").is_empty());
+        assert_eq!(res::<Cvars>(&app).get("farclip"), Some("400"));
+        assert_eq!(res::<ViewDistance>(&app).farclip, 400.0);
+        assert!(res::<Cvars>(&app).dirty);
+        console_exec(&mut app, "cvar_default farclip");
+        assert_eq!(res::<Cvars>(&app).get("farclip"), Some("350"));
+        assert_eq!(res::<ViewDistance>(&app).farclip, 350.0);
         assert_eq!(
-            app.world().resource::<Roster>().selected(),
-            Some(0),
-            "nothing remembered yet, so the first row — the behaviour that was already right",
+            console_exec(&mut app, "cvar_reset nosuch"),
+            ["No such cvar \"nosuch\""]
         );
-        app.world_mut().resource_mut::<Roster>().pending_pick = Some(3); // guid 3 = row 2
-        app.update();
-        app.world_mut().write_message(AppExit::Success);
-        app.update();
+    }
 
-        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
+    /// The first value the CVar's own command stores becomes its reset text (`0x63de1c`), and the
+    /// registry keeps it past the VM that typed it.
+    #[test]
+    fn a_typed_value_is_the_reset_text_across_vms() {
+        let mut app = cvar_app();
+        console_exec(&mut app, "farclip 500");
+        console_exec(&mut app, "farclip 600");
+        assert_eq!(
+            res::<Cvars>(&app).row("farclip").unwrap().reset.as_deref(),
+            Some("500")
+        );
+        console_exec(&mut app, "cvar_reset farclip");
+        assert_eq!(res::<Cvars>(&app).get("farclip"), Some("500"));
+        assert_eq!(res::<ViewDistance>(&app).farclip, 500.0);
+    }
+
+    /// A reset of a latched row moves the record, not the device: `GetCVar` and the save take
+    /// it, no observer fires, and a stage it found stays staged and is what the file holds.
+    #[test]
+    fn a_latched_reset_moves_the_value_and_not_the_window() {
+        let mut app = cvar_app();
+        app.world_mut()
+            .insert_resource(Cvars::with_value("gxVSync", "0"));
+        app.world_mut().resource_mut::<VideoConfig>().vsync = false;
+        console_exec(&mut app, "cvar_default gxVSync");
+        let cvars = res::<Cvars>(&app);
+        assert_eq!(cvars.get("gxVSync"), Some("1"));
+        assert!(!res::<VideoConfig>(&app).vsync, "the window is left alone");
+        assert!(cvars.dirty);
         assert!(
-            text.contains("lastCharacterIndex = \"2\""),
-            "entering the world must reach the file, 0-based like Config.wtf:\n{text}"
+            !cvars.compose().contains_key("gxVSync"),
+            "the file takes the default"
         );
+        // A staged row keeps its stage through the reset, and the save writes the stage.
+        app.world_mut()
+            .insert_resource(Cvars::with_value("gxResolution", "1024x768"));
+        app.world_mut()
+            .resource_mut::<Cvars>()
+            .set("gxResolution", "800x600");
+        let before = *res::<VideoConfig>(&app);
+        console_exec(&mut app, "cvar_default gxResolution");
+        let cvars = res::<Cvars>(&app);
+        let default = cvars.default_of("gxResolution").unwrap();
+        assert_eq!(cvars.get("gxResolution"), Some(default), "applied at once");
+        assert_eq!(
+            cvars.row("gxResolution").unwrap().pending.as_deref(),
+            Some("800x600")
+        );
+        assert_eq!(
+            cvars.compose().get("gxResolution").map(String::as_str),
+            Some("800x600"),
+            "the stage is saved"
+        );
+        assert_eq!(*res::<VideoConfig>(&app), before);
+    }
 
-        // ── Launch 2: a fresh client over the same folder, and the roster arrives. ───────────
-        let (tx, _rx2) = crossbeam_channel::unbounded();
+    /// A reset of every row passes the rows the session owns, which the env set and the file never
+    /// holds.
+    #[test]
+    fn a_reset_of_every_row_passes_the_sessions() {
         let mut app = cvar_app();
-        app.add_plugins(bevy::state::app::StatesPlugin);
-        crate::char_select::add_test_systems(&mut app, tx);
-        app.update();
-        app.world_mut().write_message(crate::net::CharListMessage {
-            characters: roster(),
-            realm: None,
-            cause: benilla_protocol::RosterCause::Park,
-            epoch: 0,
-            generation: 0,
-        });
-        app.update();
-
+        {
+            let mut cvars = app.world_mut().resource_mut::<Cvars>();
+            cvars.own_for_session("uiScale", Some("1.2"));
+            cvars.set("farclip", "500");
+            cvars.take_events();
+        }
         assert_eq!(
-            app.world().resource::<Roster>().selected(),
-            Some(2),
-            "the second launch must stand the SAME character on the stage — the whole report",
+            console_exec(&mut app, "cvar_default"),
+            ["Restoring all cvars"]
         );
-        assert_eq!(
-            *app.world().resource::<State<ClientState>>().get(),
-            ClientState::CharSelect,
-        );
-        std::fs::remove_dir_all(&tmp).ok();
+        let cvars = res::<Cvars>(&app);
+        assert_eq!(cvars.get("farclip"), Some("350"));
+        assert_eq!(cvars.get("uiScale"), Some("1.2"));
     }
 
     #[test]
@@ -1968,8 +2912,8 @@ mod tests {
     }
 
     /// The string-valued rows, a closed list, each default checked on its own terms: `realmName`
-    /// (the reference's registered `""`, `0x882748`) and `gxApi` are empty until the session writes
-    /// them; `gxResolution` and `realmList` pass their observers' parsers
+    /// and `accountName` (the reference's registered `""`, `0x882748`) and `gxApi` are empty until
+    /// the session or the login screen writes them; `gxResolution` and `realmList` pass their observers' parsers
     /// ([`crate::video::parse_resolution`], [`crate::realmlist::normalize`]).
     #[test]
     fn the_string_valued_cvars_are_the_realm_and_the_windowed_size() {
@@ -1981,7 +2925,13 @@ mod tests {
         strings.sort_unstable(); // the list is the claim, not where the rows sit in the table
         assert_eq!(
             strings,
-            vec!["gxApi", "gxResolution", "realmList", "realmName"]
+            vec![
+                "accountName",
+                "gxApi",
+                "gxResolution",
+                "realmList",
+                "realmName"
+            ]
         );
         let default_of = |name: &str| {
             REGISTERED
@@ -1991,6 +2941,7 @@ mod tests {
                 .expect("registered")
         };
         assert_eq!(default_of("realmName"), "");
+        assert_eq!(default_of("accountName"), "");
         assert_eq!(default_of("gxApi"), "");
         assert_eq!(
             crate::video::parse_resolution(default_of("gxResolution")),
@@ -2014,9 +2965,9 @@ mod tests {
         cvars
     }
 
-    /// A latched row's write is staged: the applied value stands and nothing fires or dirties (the
-    /// reference's `Set 0x63df50` stores `latchedValue` and skips `InternalSet`) until the commit
-    /// (`0x63e060`) applies, fires, persists and mirrors it.
+    /// A latched row's write is staged: the applied value stands and nothing fires (the
+    /// reference's `Set 0x63df50` stores `latchedValue`, skips `InternalSet` and dirties the file)
+    /// until the commit (`0x63e060`) applies, fires and mirrors it.
     #[test]
     fn a_latched_row_stages_the_write_until_the_boundary_commits_it() {
         let mut cvars = Cvars::default();
@@ -2028,15 +2979,16 @@ mod tests {
         assert_eq!(cvars.get("gxVSync"), Some("1"), "applied value stands");
         assert_eq!(cvars.row("gxVSync").unwrap().pending.as_deref(), Some("0"));
         assert!(!cvars.has_events(), "nothing fires before the boundary");
-        assert!(!cvars.dirty, "nothing to save before the boundary");
+        assert!(cvars.dirty, "the stage is saved (`0x63dfc4`)");
         assert_eq!(
             cvars.set("gxVSync", "0"),
             SetOutcome::Unchanged,
             "same stage"
         );
-        assert!(
-            !cvars.compose().contains_key("gxVSync"),
-            "a stage that is never committed never reaches the file"
+        assert_eq!(
+            cvars.compose().get("gxVSync").map(String::as_str),
+            Some("0"),
+            "the save takes the stage first (`0x63da27`)"
         );
         assert_eq!(cvars.commit_latched(), 1);
         assert_eq!(cvars.get("gxVSync"), Some("0"));
@@ -2070,34 +3022,159 @@ mod tests {
             cvars.row("SoundBufferSize").unwrap().pending.as_deref(),
             Some("200")
         );
-        assert!(!cvars.compose().contains_key("SoundBufferSize"));
+        assert_eq!(
+            cvars.compose().get("SoundBufferSize").map(String::as_str),
+            Some("200")
+        );
         assert_eq!(cvars.set("MusicVolume", "0.7"), SetOutcome::Changed);
         assert_eq!(cvars.get("MusicVolume"), Some("0.7"));
         assert_eq!(cvars.take_events().len(), 1);
     }
 
+    /// A stage never committed is saved (`SaveConfig` takes `rec+0x38` first, `0x63da27`), so the
+    /// next launch boots at it; staging back to the applied value takes it out of the file.
     #[test]
-    fn a_numeric_row_refuses_what_does_not_parse_and_corrects_the_mirror() {
-        let mut cvars = Cvars::default();
-        assert_eq!(cvars.set_from_vm("uiScale", "banana"), SetOutcome::Refused);
-        assert_eq!(cvars.get("uiScale"), Some("0.9"));
-        assert!(!cvars.has_events());
-        assert!(!cvars.dirty);
-        assert_eq!(
-            cvars.take_outbox(),
-            vec![("uiScale".to_string(), "0.9".to_string())],
-            "the VM stored 'banana' synchronously; the host writes the truth back"
+    fn a_stage_never_committed_is_saved_and_boots_the_next_launch() {
+        let mut cvars = registry(&[("gxVSync", "1")]);
+        cvars.set("gxVSync", "0");
+        cvars.set("SoundBufferSize", "200");
+        let file = cvars.compose();
+        assert_eq!(file.get("gxVSync").map(String::as_str), Some("0"));
+        assert_eq!(file.get("SoundBufferSize").map(String::as_str), Some("200"));
+        let next = registry(
+            &file
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
         );
-        assert_eq!(cvars.set("uiScale", "banana"), SetOutcome::Refused);
+        assert_eq!(next.get("gxVSync"), Some("0"), "applied at the next launch");
+        assert_eq!(next.get("SoundBufferSize"), Some("200"));
+        assert_eq!(next.row("gxVSync").unwrap().pending, None);
+        cvars.dirty = false;
+        cvars.set("gxVSync", "1");
+        assert!(cvars.dirty, "an unstage is a change to save");
+        assert!(
+            !cvars.compose().contains_key("gxVSync"),
+            "back at its default"
+        );
+    }
+
+    /// `InternalSet` (`0x63e0b0`) has no parse check: text that is no number is stored as it is,
+    /// on either side of the VM boundary, and reads as the record's `SStrToFloat`/`SStrToInt`
+    /// forms (`0x63e130`, `0x63e127`). A saved one loads, as `set` made the record from it.
+    #[test]
+    fn a_numeric_row_keeps_text_that_is_no_number() {
+        let mut cvars = Cvars::default();
+        assert_eq!(cvars.set_from_vm("uiScale", "banana"), SetOutcome::Changed);
+        assert_eq!(cvars.get("uiScale"), Some("banana"));
+        assert_eq!(cvars.num("uiScale"), Some(0.0));
         assert!(
             cvars.take_outbox().is_empty(),
-            "a host write has no mirror to correct"
+            "the mirror already holds it"
         );
         assert_eq!(
-            cvars.set("realmList", "not an address"),
-            SetOutcome::Changed
+            cvars.compose().get("uiScale").map(String::as_str),
+            Some("banana")
+        );
+        assert_eq!(cvars.set("MusicVolume", "wat"), SetOutcome::Changed);
+        assert_eq!(
+            cvars.take_outbox(),
+            vec![("MusicVolume".to_string(), "wat".to_string())]
         );
         assert_eq!(cvars.set("nosuchrow", "1"), SetOutcome::Unknown);
+
+        let cvars = registry(&[("MasterVolume", "wat"), ("farclip", " 400")]);
+        assert_eq!(cvars.get("MasterVolume"), Some("wat"), "a saved text loads");
+        assert_eq!(cvars.num("MasterVolume"), Some(0.0));
+        assert_eq!(cvars.get("farclip"), Some(" 400"));
+        assert_eq!(cvars.num("farclip"), Some(0.0), "no whitespace skip");
+    }
+
+    /// The numeric readers are the record's: `SStrToFloat` for the float, `SStrToInt != 0` for a
+    /// flag, so "0.5" is off where a float test would call it on, and "12abc" is 12.
+    #[test]
+    fn the_numeric_readers_are_the_records_own() {
+        let event = |new: &str| CvarChanged {
+            name: "x".into(),
+            old: String::new(),
+            new: new.into(),
+        };
+        assert!(!event("0.5").flag());
+        assert!(event("1.0").flag());
+        assert!(event("-1").flag());
+        assert!(!event(" 1").flag());
+        assert_eq!(event("12abc").num(), 12.0);
+        assert_eq!(event("+5").num(), 0.0);
+        assert_eq!(event("nan").num(), 0.0);
+        let cvars = registry(&[("autoClearAFK", "0.5"), ("farclip", "400yd")]);
+        assert_eq!(cvars.flag("autoClearAFK"), Some(false));
+        assert_eq!(cvars.num("farclip"), Some(400.0));
+    }
+
+    /// `InternalSet` compares with `SStrCmpI` (`0x63e0ec`): a change of case only is no change,
+    /// so nothing is stored, fired, mirrored or saved; `SaveConfig` skips a value equal to its
+    /// default case-blind (`0x63da4a`), so a saved spelling of the default leaves the file.
+    #[test]
+    fn a_change_of_case_only_is_no_change() {
+        let mut cvars = Cvars::default();
+        cvars.learn_addon_row("myAddonKnob", "foo");
+        assert_eq!(cvars.set("myAddonKnob", "FOO"), SetOutcome::Unchanged);
+        assert_eq!(
+            cvars.set_from_vm("MYADDONKNOB", "Foo"),
+            SetOutcome::Unchanged
+        );
+        assert_eq!(cvars.get("myAddonKnob"), Some("foo"));
+        assert!(!cvars.has_events() && !cvars.has_outbox() && !cvars.dirty);
+        assert_eq!(cvars.set("gxVSync", "0"), SetOutcome::Staged);
+        assert_eq!(
+            cvars.set(
+                "gxResolution",
+                &cvars.get("gxResolution").unwrap().to_uppercase()
+            ),
+            SetOutcome::Unchanged,
+            "a stage of the applied value in another case stages nothing"
+        );
+
+        let mut cvars = registry(&[("realmName", "Nostalrius")]);
+        cvars.learn_addon_row("myAddonKnob", "foo");
+        assert_eq!(cvars.set("realmName", "NOSTALRIUS"), SetOutcome::Unchanged);
+        assert_eq!(cvars.get("realmName"), Some("Nostalrius"));
+        let mut cvars = registry(&[("myAddonKnob", "FOO")]);
+        cvars.learn_addon_row("myAddonKnob", "foo");
+        assert_eq!(
+            cvars.get("myAddonKnob"),
+            Some("FOO"),
+            "the saved text loads"
+        );
+        assert!(
+            !cvars.compose().contains_key("myAddonKnob"),
+            "and leaves the file, equal to its default case-blind"
+        );
+    }
+
+    /// Flag bit2 (`CVar::SetReadOnly` `0x63e030`) stops every host write in `InternalSet`
+    /// (`0x63e0ba`), after the callback ran. A VM write (`SetCVar`, `ConsoleExec`) met the VM's own
+    /// copy of the flag, so the registry takes it.
+    #[test]
+    fn a_read_only_row_takes_no_host_write() {
+        let mut app = cvar_app();
+        app.world_mut()
+            .resource_mut::<Cvars>()
+            .set_read_only("realmList", true);
+        let before = res::<Cvars>(&app).get("realmList").unwrap().to_string();
+        assert_eq!(
+            apply(&mut app, "REALMLIST", "x.example.org"),
+            SetOutcome::ReadOnly
+        );
+        let cvars = res::<Cvars>(&app);
+        assert_eq!(cvars.get("realmList"), Some(before.as_str()));
+        assert!(!cvars.has_events() && !cvars.has_outbox() && !cvars.dirty);
+
+        let mut cvars = Cvars::default();
+        cvars.set_read_only("realmName", true);
+        assert_eq!(cvars.set_from_vm("realmName", "Here"), SetOutcome::Changed);
+        cvars.set_read_only("realmName", false);
+        assert_eq!(cvars.set("realmName", "There"), SetOutcome::Changed);
     }
 
     #[test]
@@ -2139,6 +3216,31 @@ mod tests {
             cvars.compose().get("FutureKnob").map(String::as_str),
             Some("3")
         );
+    }
+
+    /// `RegisterCVar`'s count (`[0xb4e3c8]`) is the process's, so it outlives the VM: a
+    /// `ReloadUI`'s VM is seeded with it, and its re-declarations find their rows and count nothing.
+    #[test]
+    fn the_lua_registration_count_survives_a_vm_replacement() {
+        let mut cvars = registry(&[]);
+        let mut first = UiScript::new().unwrap();
+        cvars.seed_vm(&mut first);
+        for i in 0..benilla_ui::script::LUA_CVAR_LIMIT {
+            first.run(&format!("RegisterCVar('knob{i}', '1')")).unwrap();
+        }
+        cvars.drain_vm(&mut first);
+        assert_eq!(cvars.lua_created, benilla_ui::script::LUA_CVAR_LIMIT);
+
+        let mut second = UiScript::new().unwrap();
+        cvars.seed_vm(&mut second);
+        let err = second.run("RegisterCVar('knob0', '1')").unwrap_err();
+        // Through `luaL_error` (`0x488b34`), at the caller's line.
+        assert_eq!(
+            benilla_ui::script::lua_message(&err),
+            "[string \"(chunk)\"]:1: Attempted to register too many CVars",
+            "at the limit even a re-declaration raises"
+        );
+        assert!(second.run("RegisterCVar('knob31', '1')").is_err());
     }
 
     #[test]
@@ -2230,6 +3332,10 @@ mod tests {
                 "GameTooltip's binding-line gate, stock and pfUI",
             ),
             ("gxApi", "pfUI's system tooltip names the backend"),
+            (
+                "cameraPitchSmoothSpeed",
+                "UIOptionsFrame.lua's Save writes it at a quarter of the Auto Follow Speed slider",
+            ),
             (
                 "useUiScale",
                 "UIOptionsFrame.lua and OptionsFrame.lua branch on it to gate the uiScale slider",

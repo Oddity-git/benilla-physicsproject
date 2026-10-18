@@ -82,7 +82,7 @@ fn a_landmark_draws_its_poi_icon_at_its_map_position() {
     s.set_world_map_landmark_sources(vec![landmark("Stormwind Warrior Trainer", 6, (0.25, 0.5))]);
     s.run("WorldMapFrame_Update()").unwrap();
 
-    assert_eq!(
+    benilla_ui::assert_near!(
         s.eval::<i64>("return GetNumMapLandmarks()").unwrap(),
         1,
         "the host reports the one landmark"
@@ -98,7 +98,7 @@ fn a_landmark_draws_its_poi_icon_at_its_map_position() {
     let (l, t, _, b, r, ..): (f32, f32, f32, f32, f32, f32, f32, f32) = s
         .eval("return WorldMapFramePOI1Texture:GetTexCoord()")
         .unwrap();
-    assert_eq!(
+    benilla_ui::assert_near!(
         (l, r, t, b),
         (0.75, 0.875, 0.0, 0.125),
         "POIIcons cell 6 — the red flag"
@@ -111,7 +111,7 @@ fn a_landmark_draws_its_poi_icon_at_its_map_position() {
              return ox, oy",
         )
         .unwrap();
-    assert_eq!((x, y), (0.25 * 1002.0, -0.5 * 668.0));
+    benilla_ui::assert_near!((x, y), (0.25 * 1002.0, -0.5 * 668.0));
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
@@ -730,6 +730,80 @@ fn the_real_feralas_catalog_names_dire_maul_under_the_cursor() {
     );
 }
 
+/// The real catalog at the world level: the cursor over Kalimdor puts its `Map.dbc` name in the
+/// label and shows `Interface\WorldMap\Kalimdor\KalimdorHighlight` over its sheet rect, from its
+/// `WorldMapContinent` row (`0x4a83b9`): tiles 23..=48 by 9..=52 at scale 0.75, so 26 by 44 tiles
+/// of the 62.625 by 41.75 sheet, the texture's left 26/44 drawn.
+#[test]
+fn hovering_a_continent_on_the_world_map_lights_it() {
+    let data = benilla_formats::wow_data_or_skip!();
+    let mut s = harness();
+
+    let mut chain = benilla_formats::open_chain(&data).expect("chain");
+    for file in ["Kalimdor", "Azeroth"] {
+        let path = format!("Interface\\WorldMap\\{file}\\{file}Highlight.blp");
+        assert!(chain.contains(&path), "{path} ships");
+    }
+    let areas = benilla_formats::load_area_table_catalog(&mut chain).expect("AreaTable");
+    let maps =
+        benilla_assets::MapCatalogRes(benilla_formats::load_map_catalog(&mut chain).expect("Map"));
+    let (views, _) =
+        crate::ui_world_map::build_catalog(&mut chain, &areas, &maps).expect("the real catalog");
+    // Every continent has its row, so no stock data reaches the rowless branch.
+    assert!(views.iter().all(|c| c.sheet.is_some()));
+    let kalimdor = views
+        .iter()
+        .find(|c| c.map_file == "Kalimdor")
+        .expect("Kalimdor is in the catalog");
+    let row = kalimdor
+        .sheet
+        .expect("Kalimdor has its WorldMapContinent row");
+    assert_eq!((row.tiles, row.scale), ((23, 48, 9, 52), 0.75));
+    s.set_world_map_catalog(views);
+    s.run("ToggleWorldMap()").unwrap();
+    s.run("SetMapZoom(0)").unwrap();
+    s.resolve();
+
+    let (l, r, t, b, eff) = s
+        .eval::<(f32, f32, f32, f32, f32)>(
+            "return WorldMapButton:GetLeft(), WorldMapButton:GetRight(), WorldMapButton:GetTop(), \
+             WorldMapButton:GetBottom(), WorldMapButton:GetEffectiveScale()",
+        )
+        .unwrap();
+    let (x, y) = ((l + (r - l) * 0.25) * eff, (t - (t - b) * 0.45) * eff);
+    s.mouse_move(x, y);
+    update(&mut s);
+    s.resolve();
+
+    assert_eq!(
+        s.eval::<String>("return WorldMapFrameAreaLabel:GetText()")
+            .unwrap(),
+        "Kalimdor"
+    );
+    let (shown, texture, w, h, dx, dy) = s
+        .eval::<(bool, String, f32, f32, f32, f32)>(
+            "return WorldMapHighlight:IsShown() == 1, WorldMapHighlight:GetTexture(), \
+             WorldMapHighlight:GetWidth(), WorldMapHighlight:GetHeight(), \
+             WorldMapHighlight:GetLeft() - WorldMapDetailFrame:GetLeft(), \
+             WorldMapDetailFrame:GetTop() - WorldMapHighlight:GetTop()",
+        )
+        .unwrap();
+    assert!(shown, "the stock OnUpdate shows the quad for a fileName");
+    assert!(
+        texture
+            .to_ascii_lowercase()
+            .ends_with("worldmap\\kalimdor\\kalimdorhighlight"),
+        "{texture}"
+    );
+    let (bw, bh) = (r - l, t - b);
+    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+    assert!(near(w, 19.5 / 62.625 * bw), "width {w}");
+    assert!(near(h, 33.0 / 41.75 * bh), "height {h}");
+    // Seated on `WorldMapDetailFrame`'s top-left, in the button's own units.
+    assert!(near(dx, 5.5625 / 62.625 * bw), "left {dx}");
+    assert!(near(dy, 3.302_502 / 41.75 * bh), "top {dy}");
+}
+
 /// An addon that windows the map (Cartographer's `LookNFeel`) stamps userPlaced through a drag
 /// (`0x7652b0`, at `0x7652e5`). The layout cache gates both ends on `movable|resizable` too, as the
 /// reference does (writer `0x490e97`; apply `0x490600`, `0x490689`), and stock `WorldMapFrame` has
@@ -774,7 +848,7 @@ fn a_stale_layout_row_cannot_seat_a_stock_frame() {
              GetScreenWidth(), GetScreenHeight()",
         )
         .unwrap();
-    assert_eq!(
+    benilla_ui::assert_near!(
         (w, h),
         (sw, sh),
         "the stale row seated nothing — the map is still the screen, as its setAllPoints authored it"
@@ -797,7 +871,7 @@ fn a_stale_layout_row_cannot_seat_a_stock_frame() {
     let (w, h) = s
         .eval::<(f64, f64)>("return WorldMapFrame:GetWidth(), WorldMapFrame:GetHeight()")
         .unwrap();
-    assert_eq!(
+    benilla_ui::assert_near!(
         (w, h),
         (1024.0, 768.0),
         "a movable+resizable frame takes it"
@@ -808,7 +882,7 @@ fn a_stale_layout_row_cannot_seat_a_stock_frame() {
         "and the position arm stamps the bit it was written under"
     );
     let saved = s.user_placed_layouts();
-    assert_eq!(saved.len(), 1, "which is what puts the row back: {saved:?}");
+    benilla_ui::assert_near!(saved.len(), 1, "which is what puts the row back: {saved:?}");
     assert_eq!(
         benilla_ui::script::FrameLayout {
             level: None,
@@ -843,7 +917,7 @@ fn the_fullscreen_quads_follow_a_resize() {
     s.resolve();
 
     let width = |s: &UiScript, f: &str| s.eval::<f64>(&format!("return {f}:GetWidth()")).unwrap();
-    assert_eq!(width(&s, "BlackoutWorld"), 1600.0, "the load edge sized it");
+    benilla_ui::assert_near!(width(&s, "BlackoutWorld"), 1600.0, "the load edge sized it");
 
     // Grown, still wider than 4:3, so all three take their recompute branch.
     assert!(s.set_screen_size(1920.0, 1080.0), "the size changed");
@@ -851,15 +925,15 @@ fn the_fullscreen_quads_follow_a_resize() {
     s.resolve();
 
     let screen = s.eval::<f64>("return GetScreenWidth()").unwrap();
-    assert_eq!(screen, 1920.0);
+    benilla_ui::assert_near!(screen, 1920.0);
     for quad in ["BlackoutWorld", "UpperBlackBar", "LowerBlackBar"] {
-        assert_eq!(
+        benilla_ui::assert_near!(
             width(&s, quad),
             screen,
             "{quad} still spans the OLD screen after a resize — the world shows through beside it"
         );
     }
-    assert_eq!(
+    benilla_ui::assert_near!(
         s.eval::<f64>("return BlackoutWorld:GetHeight()").unwrap(),
         1080.0,
         "…and the blackout is the new height too"

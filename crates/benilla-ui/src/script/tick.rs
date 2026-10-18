@@ -81,7 +81,7 @@ impl Model {
 }
 
 /// What a [`verb`] segment raised, in order.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Raised {
     /// An event, with its arguments.
     Event(String, Vec<ScriptValue>),
@@ -154,46 +154,91 @@ fn set_lock_bit(model: &mut Model, guid: u64, locked: bool) {
     }
 }
 
-/// [`UiScript::fire_event`] for a caller holding `&Lua`, such as a Lua binding.
+/// The ten `arg1..arg10` of a `CHAT_MSG_SYSTEM` line with no sender: the text, five empty
+/// strings, two zeros, an empty string and a zero, the shape the app's chat feed gives its own
+/// system lines.
+pub fn system_chat_args(text: String) -> Vec<ScriptValue> {
+    let empty = || ScriptValue::Str(String::new());
+    vec![
+        ScriptValue::Str(text),
+        empty(),
+        empty(),
+        empty(),
+        empty(),
+        empty(),
+        ScriptValue::Int(0),
+        ScriptValue::Int(0),
+        empty(),
+        ScriptValue::Int(0),
+    ]
+}
+
+/// `0x496720` on a chat-kind catalog row from inside a verb: the line reaches the chat frames at
+/// once, as `CHAT_MSG_SYSTEM` (`0x496842` into `0x49a870`, whose event is `0x49ac9a`), and waits
+/// with its key for the app's log files and the row's sound ([`UiScript::take_shown_chat_lines`]).
+pub(crate) fn show_chat_line_into(lua: &Lua, key: &'static str, text: String) {
+    fire_event_into(lua, "CHAT_MSG_SYSTEM", system_chat_args(text.clone()));
+    lua.app_data_mut::<Model>()
+        .expect("model app_data set")
+        .shown_chat_lines
+        .push((key, text));
+}
+
+/// [`UiScript::fire_event`] for a caller holding `&Lua`: `SignalEvent` (`0x703e50`, with args
+/// `0x703f50`). An event with no listener touches nothing; otherwise `event` is set once before
+/// the walk (`0x703ea4`) and the earlier value put back after it (`0x703f04`), so a handler's
+/// assignment to it reaches the next listener. The walk takes each listener's successor before
+/// its call (`0x703ee8`): one appended meanwhile is reached unless the running one was the tail.
 pub(crate) fn fire_event_into(lua: &Lua, event: &str, args: Vec<ScriptValue>) {
     let model_mut = || lua.app_data_mut::<Model>().expect("model app_data set");
-    if !model_mut().vm.fires(event) {
+    let mut at = {
+        let model = model_mut();
+        model
+            .event_to_frames
+            .get(event)
+            .and_then(|l| l.first().copied())
+    };
+    if at.is_none() {
         return;
     }
-    {
-        let mut at = {
-            let model = model_mut();
-            model
-                .event_to_frames
-                .get(event)
-                .and_then(|l| l.first().copied())
-        };
-        while let Some(h) = at {
-            let mut model = model_mut();
-            // A saved next that the previous handler unregistered ends the walk.
-            let Some(pos) = model
-                .event_to_frames
-                .get(event)
-                .and_then(|l| l.iter().position(|&x| x == h))
-            else {
-                break;
-            };
-            let next = model
-                .event_to_frames
-                .get(event)
-                .and_then(|l| l.get(pos + 1).copied());
-            let id = model.frame_id(h);
-            drop(model);
-            if let Err(e) = event::fire_event_handler(lua, id, event, &args) {
-                model_mut().record_lua_error(&e);
-            }
-            at = next;
-        }
+    let globals = lua.globals();
+    let saved = globals.get::<mlua::Value>("event").ok();
+    if let Ok(name) = lua.create_string(event) {
+        let _ = globals.set("event", name);
     }
-    event::fire_all_event_listeners(lua, event, &args);
+    while let Some(h) = at {
+        let mut model = model_mut();
+        // A saved next that the previous handler unregistered ends the walk.
+        let Some(pos) = model
+            .event_to_frames
+            .get(event)
+            .and_then(|l| l.iter().position(|&x| x == h))
+        else {
+            break;
+        };
+        let next = model
+            .event_to_frames
+            .get(event)
+            .and_then(|l| l.get(pos + 1).copied());
+        let id = model.frame_id(h);
+        drop(model);
+        if let Err(e) = event::fire_event_handler(lua, id, &args) {
+            model_mut().record_lua_error(&e);
+        }
+        at = next;
+    }
+    if let Some(saved) = saved {
+        let _ = globals.set("event", saved);
+    }
 }
 
 impl super::UiScript {
+    /// The catalog lines a verb showed in chat since the last call, by message key, for the log
+    /// files and the sound the app keeps.
+    pub fn take_shown_chat_lines(&mut self) -> Vec<(&'static str, String)> {
+        std::mem::take(&mut self.model_mut().shown_chat_lines)
+    }
+
     /// Advance a frame: the `GetTime()` clock and queued events, then the pump `0x765650` and the
     /// draw pass `0x7657d0`, in that order (`0x764340`, `0x764347`). The pump drains the layout
     /// queue (`0x768ed0`, at `0x7656ba`), whose rect applications fire `OnSizeChanged`; runs the
@@ -203,11 +248,16 @@ impl super::UiScript {
     /// range); drains the layout again (`0x765799`); then re-picks the hover against those rects
     /// (`0x7657be`). The draw pass fires `OnUpdateModel`.
     pub fn tick(&mut self, elapsed: f32) {
+        self.model_mut().nameplates.begin_update();
         self.model_mut().now += f64::from(elapsed);
         // Events queued since the last tick fire before this tick's OnUpdate.
         let pending = std::mem::take(&mut self.model_mut().pending_events);
         for (event, args) in pending {
             self.fire_event(&event, args);
+        }
+        // The item tooltips the caches answered since the last tick rebuild (`0x52e530`).
+        for e in super::tooltip_item::build::answer_item_caches(&self.lua) {
+            self.push_error(e);
         }
         self.resolve();
         self.update_walk(elapsed);
@@ -277,11 +327,11 @@ impl UiScript {
     /// stratum hid still paints this frame; only the callback's own gates ([`paints`]) are read at
     /// the call. The rects are the ones the pump's last drain (`0x765799`) left: the paint reads
     /// them through `0x768320`, which never resolves.
+    ///
+    /// A character pane's paint then runs its turn timer (`0x505c50`, after the root step
+    /// `0x76d1a0` that fires `OnUpdateModel`), whether or not it has the handler.
     fn paint_model_panes(&mut self) {
         let mut model = self.model_mut();
-        if model.on_update_model_frames.is_empty() {
-            return;
-        }
         // Kept by `SetScript`; a destroyed frame's handle compacts out on its first miss.
         if model
             .on_update_model_frames
@@ -297,23 +347,49 @@ impl UiScript {
                 .collect();
             model.on_update_model_frames = live;
         }
+        // The character panes paint whether or not a script listens: their turn timer runs on
+        // whatever `+0x318` holds.
+        let copies: Vec<FrameHandle> = model
+            .arena
+            .model_kinds()
+            .iter()
+            .copied()
+            .filter(|&h| {
+                model
+                    .arena
+                    .frame(h)
+                    .is_some_and(|f| f.effective_visible && is_character(f) && has_model_file(f))
+            })
+            .collect();
+        if model.on_update_model_frames.is_empty() && copies.is_empty() {
+            return;
+        }
         drop(model);
         for stratum in crate::order::Strata::ALL {
-            let panes: Vec<FrameHandle> = {
+            let panes: Vec<(FrameHandle, bool)> = {
                 let model = self.model_ref();
-                let mut panes: Vec<(u16, u64, FrameHandle)> = model
-                    .on_update_model_frames
+                let scripted = &model.on_update_model_frames;
+                let mut panes: Vec<(u16, u64, FrameHandle, bool)> = scripted
                     .iter()
+                    .chain(copies.iter().filter(|h| !scripted.contains(h)))
                     .filter_map(|&h| {
                         let f = model.arena.frame(h)?;
-                        (f.strata == stratum && f.effective_visible && has_model_file(f))
-                            .then_some((f.level, u64::from(f.insertion_seq), h))
+                        (f.strata == stratum && f.effective_visible && has_model_file(f)).then(
+                            || {
+                                (
+                                    f.level,
+                                    u64::from(f.insertion_seq),
+                                    h,
+                                    scripted.contains(&h),
+                                )
+                            },
+                        )
                     })
                     .collect();
-                panes.sort_unstable_by_key(|&(level, seq, _)| (level, seq));
-                panes.into_iter().map(|(_, _, h)| h).collect()
+                panes.sort_unstable_by_key(|&(level, seq, _, _)| (level, seq));
+                panes.into_iter().map(|(_, _, h, s)| (h, s)).collect()
             };
-            for h in panes {
+            for (h, scripted) in panes {
                 let id = {
                     let mut model = self.model_mut();
                     match model.arena.frame(h) {
@@ -321,21 +397,50 @@ impl UiScript {
                         _ => continue,
                     }
                 };
-                if let Err(e) =
-                    event::fire_widget_handler(&self.lua, id, "OnUpdateModel", Vec::new())
+                if scripted {
+                    if let Err(e) =
+                        event::fire_widget_handler(&self.lua, id, "OnUpdateModel", Vec::new())
+                    {
+                        self.push_error(e);
+                    }
+                }
+                // The turn timer, against the latch the handler may just have set.
+                // It reads whatever `+0x318` holds, a file included.
+                let mut model = self.model_mut();
+                let now_ms = model.now_ms();
+                let path = match model.arena.frame(h).map(|f| &f.kind_state) {
+                    Some(crate::widget::KindState::Model(m)) if m.character.is_some() => {
+                        m.path.clone()
+                    }
+                    _ => continue,
+                };
+                let facts = path.and_then(|p| model.model_facts_for(&p));
+                if let Some(crate::widget::KindState::Model(m)) =
+                    model.arena.frame_mut(h).map(|f| &mut f.kind_state)
                 {
-                    self.push_error(e);
+                    m.turn_paint(now_ms, facts.as_deref());
                 }
             }
         }
     }
 }
 
-/// A Model-family pane with a file set, resident or streaming (`[widget+0x318] ≠ 0`), which its
-/// layer emit and its render callback both require (`0x76d24c`); on any other kind
-/// `OnUpdateModel` is inert.
+/// A `PlayerModel`, `DressUpModel` or `TabardModel`.
+fn is_character(f: &crate::widget::Frame) -> bool {
+    matches!(&f.kind_state, crate::widget::KindState::Model(m) if m.character.is_some())
+}
+
+/// A character pane whose copy sits at `+0x318`, rather than a file `SetModel` put there.
+fn holds_copy(f: &crate::widget::Frame) -> bool {
+    matches!(&f.kind_state, crate::widget::KindState::Model(m)
+        if m.path.is_none() && m.character.as_ref().is_some_and(|c| c.copy.is_some()))
+}
+
+/// A Model-family pane with a model at `[widget+0x318]` (`0x76d24c`), which its layer emit and its
+/// render callback both require: a file set, resident or streaming, or a character pane's copy.
+/// On any other kind `OnUpdateModel` is inert.
 fn has_model_file(f: &crate::widget::Frame) -> bool {
-    matches!(&f.kind_state, crate::widget::KindState::Model(m) if m.path.is_some())
+    holds_copy(f) || matches!(&f.kind_state, crate::widget::KindState::Model(m) if m.path.is_some())
 }
 
 /// The paint callback's gates ahead of `OnUpdateModel` (`0x76d240`, firing at `0x76d5ea`): a model
@@ -348,7 +453,7 @@ fn paints(model: &super::Model, h: FrameHandle, f: &crate::widget::Frame) -> boo
     if !has_model_file(f) {
         return false;
     }
-    let Some(r) = model.resolved.get(&h) else {
+    let Some(r) = model.frame_rect(h) else {
         return false;
     };
     let screen = model.screen;

@@ -1,10 +1,11 @@
 use mlua::{ObjectLike, Table};
 
 use crate::framexml::{self, Element};
+use crate::script::binding_abi::s_str_to_int;
 use crate::script::LabelFont;
 
 use super::regions::FontAttrs;
-use super::{abs_dim, abs_value, children_named, children_named_any, color_of, Loader};
+use super::{children_named, children_named_any, color_of, Levels, Loader};
 
 impl Loader<'_> {
     /// `<ScrollFrame>`'s `<ScrollChild>` (`LoadXML 0x786bc0`): after the base load (`0x769820`) it
@@ -32,8 +33,7 @@ impl Loader<'_> {
                 ));
                 continue;
             };
-            let expanded = self.expand(child);
-            let Some(child_wrapper) = self.materialize(&expanded, Some(wrapper), self_name) else {
+            let Some(child_wrapper) = self.materialize(child, Some(wrapper), self_name) else {
                 continue; // materialize already reported why
             };
             if let Err(e) = wrapper.call_method::<()>("SetScrollChild", child_wrapper) {
@@ -42,30 +42,19 @@ impl Loader<'_> {
         }
     }
 
-    /// `<StatusBar>` (`0x782ef0`): a reversed `minValue`/`maxValue` pair is swapped, as
-    /// `SetMinMaxValues` also does; `drawLayer` is the bar texture's layer, ARTWORK by default.
+    /// `<StatusBar>` (`0x782ef0`): the `<BarTexture>`, built on `drawLayer` (ARTWORK by default),
+    /// and `<BarColor>`, then for each level ([`Loader::levels`]) its range, its value and its
+    /// orientation.
     pub(super) fn apply_statusbar(
         &mut self,
         el: &Element,
+        levels: &Levels,
         wrapper: &Table,
         self_name: &str,
         dbg: &str,
     ) {
         if !el.tag.eq_ignore_ascii_case("StatusBar") {
             return;
-        }
-        let parse = |attr: &str| el.attr(attr).and_then(|v| v.trim().parse::<f32>().ok());
-        let (min, max) = (parse("minValue"), parse("maxValue"));
-        if min.is_some() || max.is_some() {
-            self.call(
-                wrapper,
-                "SetMinMaxValues",
-                (min.unwrap_or(0.0), max.unwrap_or(0.0)),
-                dbg,
-            );
-        }
-        if let Some(o) = el.attr("orientation") {
-            self.call(wrapper, "SetOrientation", o.to_string(), dbg);
         }
         let layer = el.attr("drawLayer");
         for bar in children_named(el, "BarTexture") {
@@ -77,11 +66,41 @@ impl Loader<'_> {
             }
         }
         for bc in children_named(el, "BarColor") {
-            let c = color_of(bc);
-            self.call(wrapper, "SetStatusBarColor", (c[0], c[1], c[2], c[3]), dbg);
+            self.call(wrapper, "SetStatusBarColor", color_of(bc).fractions(), dbg);
         }
-        if let Some(v) = parse("defaultValue") {
-            self.call(wrapper, "SetValue", v, dbg);
+        for level in levels {
+            // Each value with `SStrToFloat`, present and non-empty: the range needs both bounds on the
+            // node, and `defaultValue` is read only after it (`0x782fb0`-`0x783021`). The setter
+            // `0x783270` clamps a min above the max down to it.
+            let value = |attr: &str| {
+                level
+                    .attr(attr)
+                    .filter(|v| !v.is_empty())
+                    .map(super::xml_float)
+            };
+            if let (Some(min), Some(max)) = (value("minValue"), value("maxValue")) {
+                self.call(wrapper, "SetMinMaxValues", (min, max), dbg);
+                if let Some(v) = value("defaultValue") {
+                    self.call(wrapper, "SetValue", v, dbg);
+                }
+            }
+            // `orientation` through the token parse `0x6f1a20`: empty is skipped, a miss logged
+            // (`0x87a3c4`) and never raised (`0x783064`), where the Lua setter raises.
+            if let Some(token) = level.attr("orientation").filter(|v| !v.is_empty()) {
+                match crate::script::region::orientation(token) {
+                    Some(vertical) => {
+                        let o = if vertical { "VERTICAL" } else { "HORIZONTAL" };
+                        self.call(wrapper, "SetOrientation", o, dbg);
+                    }
+                    None => {
+                        let name = self.object_name(wrapper);
+                        self.status_warning(format!(
+                            "Frame {name}: Unknown orientation {token} in element {}",
+                            level.tag
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -91,6 +110,7 @@ impl Loader<'_> {
     pub(super) fn apply_button(
         &mut self,
         el: &Element,
+        levels: &Levels,
         wrapper: &Table,
         self_name: &str,
         dbg: &str,
@@ -137,11 +157,15 @@ impl Loader<'_> {
                 FontAttrs::Own
             };
             // `SetText` creates the label even with no text, so its layout lands on a real region;
-            // `text=` is a global-string key (`0x703bf0`).
-            let label = match bt.attr("text") {
-                Some(raw) => self.resolve_text(raw, dbg),
-                None => String::new(),
-            };
+            // `text=` is each level's, a global-string key (`0x703bf0`), an empty one skipped
+            // (`0x77101b`).
+            let label_levels = self.fontstring_levels(bt);
+            let mut label = String::new();
+            for level in &label_levels {
+                if let Some(raw) = level.attr("text").filter(|t| !t.is_empty()) {
+                    label = self.resolve_text(raw, dbg);
+                }
+            }
             // A named label is created as a named region, not aliased after `SetText`, so its
             // `GetName()` answers.
             let bt_name = bt.name().map(|raw| framexml::resolve_name(raw, self_name));
@@ -162,10 +186,19 @@ impl Loader<'_> {
                 // `0x778b96`); the button's own adopter anchor never fires on them (`0x778d5f`).
                 // On `<NormalText>` the justify is the Normal font's, so the implicit anchor reads
                 // the ctor's CENTER (`0x212`); the justify still reaches the paint (`0x784111`).
+                // Both load as any FontString does (`0x6f2780` → `0x770f40`, `0x778b8f`), each
+                // level in turn; `<NormalText>` skips its font attributes (`0x778b7b`).
                 self.call_region(&region, "ClearAllPoints", (), dbg);
-                self.apply_region_layout(bt, &region, self_name, dbg, font_attrs);
+                for level in &label_levels {
+                    self.load_fontstring_level(level, &region, self_name, font_attrs, false, dbg);
+                }
                 if let Err(e) = crate::script::implicit_creation_anchor_lua(self.lua, &region) {
                     self.report.fault(format!("{dbg}: implicit anchor: {e}"));
+                }
+                // Then the install's refresh (`0x778daa`): the label follows the state's font,
+                // not the font its own `inherits=` or `font=` linked.
+                if let Err(e) = crate::script::refresh_label_lua(self.lua, wrapper) {
+                    self.report.fault(format!("{dbg}: label refresh: {e}"));
                 }
                 // Published both ways, like a named state texture.
                 if let Some(rname) = bt_name {
@@ -190,55 +223,127 @@ impl Loader<'_> {
                 self.call(wrapper, "SetChecked", checked, dbg);
             }
         }
-        if let Some(text) = el.attr("text") {
-            // A global-string key (`0x703bf0`): `text="DELETE"` reads "Delete".
-            let text = self.resolve_text(text, dbg);
-            self.call(wrapper, "SetText", text, dbg);
+        // Each level's `text=`, a global-string key (`0x703bf0`, `text="DELETE"` reads "Delete"),
+        // an empty one skipped (`0x778c1a`).
+        for level in levels {
+            if let Some(text) = level.attr("text").filter(|t| !t.is_empty()) {
+                let text = self.resolve_text(text, dbg);
+                self.call(wrapper, "SetText", text, dbg);
+            }
         }
-        // The per-state fonts, two spellings each; every occurrence applies, in document order.
-        for (children, method, which) in [
-            (
-                ["NormalFont", "NormalText"],
-                "SetTextFontObject",
-                LabelFont::Normal,
-            ),
-            (
-                ["HighlightFont", "HighlightText"],
-                "SetHighlightFontObject",
-                LabelFont::Highlight,
-            ),
-            (
-                ["DisabledFont", "DisabledText"],
-                "SetDisabledFontObject",
-                LabelFont::Disabled,
-            ),
-        ] {
-            for f in children_named_any(el, &children) {
-                // `<Font>`-typed elements (`0x778bf4` → `0x783c30`): `inherits=` and `font=` land
-                // in one slot and `font=` wins (`0x783d22`). `style=` is not 1.12 and is not read.
-                for attr in ["inherits", "font"] {
-                    if let Some(name) = f.attr(attr) {
-                        self.call(wrapper, method, name.to_string(), dbg);
+        // `<PushedTextOffset>` (`0x778aec`): the dimension read (`0x6f1eb0`), stored as
+        // `SetPushedTextOffset` does (`0x778b24`) only when it succeeds (`0x778b0c`).
+        for el in children_named(el, "PushedTextOffset") {
+            let d = self.dimension(el);
+            if d.ok {
+                self.call(wrapper, "SetPushedTextOffset", (d.v[0], d.v[1]), dbg);
+            }
+        }
+        // The three embedded fonts and their colours, in document order (`0x7788c0`): each font
+        // element, two spellings each, loads into its font as a `<Font>` does (`0x778baf`,
+        // `0x778bf4` → `0x783c30`); each colour element (`0x6f23d0`) is that font's text colour.
+        // Deviation: `<HighlightColor>` and `<DisabledColor>` colour their own fonts; 1.12.1 sends
+        // both to the normal colour setter (`0x778aa4`, `0x778ada` call `0x778e20`), so neither
+        // could reach its state.
+        for child in &el.children {
+            let tag = child.tag.as_str();
+            let font = [
+                ("NormalFont", LabelFont::Normal),
+                ("NormalText", LabelFont::Normal),
+                ("HighlightFont", LabelFont::Highlight),
+                ("HighlightText", LabelFont::Highlight),
+                ("DisabledFont", LabelFont::Disabled),
+                ("DisabledText", LabelFont::Disabled),
+            ]
+            .into_iter()
+            .find(|(t, _)| tag.eq_ignore_ascii_case(t));
+            if let Some((_, which)) = font {
+                match crate::script::state_font_lua(self.lua, wrapper, which) {
+                    Ok(id) => self.load_font_node(child, id, "<unnamed>"),
+                    Err(e) => self.report.fault(format!("{dbg}: <{tag}>: {e}")),
+                }
+                continue;
+            }
+            let color = [
+                ("NormalColor", "SetTextColor"),
+                ("HighlightColor", "SetHighlightTextColor"),
+                ("DisabledColor", "SetDisabledTextColor"),
+            ]
+            .into_iter()
+            .find(|(t, _)| tag.eq_ignore_ascii_case(t));
+            if let Some((_, method)) = color {
+                self.call(wrapper, method, color_of(child).fractions(), dbg);
+            }
+        }
+    }
+
+    /// `font=` on an EditBox, a MessageFrame or a ScrollingMessageFrame (`0x779fcb`, `0x78592b`,
+    /// `0x787b3b`): a non-empty name found in the font table (`0x783870`) links the frame's own
+    /// font to it (`0x770c60`); any other is logged as `%s %s: Couldn't find font object named %s`
+    /// (`0x879bc8`) with the frame's type (vtable slot 7), its name or `<unnamed>`, and the value.
+    pub(super) fn apply_frame_font(&mut self, el: &Element, wrapper: &Table, dbg: &str) {
+        let Some(font) = el.attr("font").filter(|f| !f.is_empty()) else {
+            return;
+        };
+        let to = self.model().fonts.id(font);
+        if let Some(to) = to {
+            match crate::script::own_font_lua(self.lua, wrapper) {
+                Ok(Some(own)) => self.link_font_node(own, to, "<unnamed>"),
+                Ok(None) => {}
+                Err(e) => self.report.fault(format!("{dbg}: font=: {e}")),
+            }
+        } else {
+            let kind: String = wrapper
+                .call_method("GetObjectType", ())
+                .unwrap_or_else(|_| el.tag.clone());
+            let name = self.object_name(wrapper);
+            self.status_warning(format!(
+                "{kind} {name}: Couldn't find font object named {font}"
+            ));
+        }
+    }
+
+    /// An EditBox's, a MessageFrame's or a ScrollingMessageFrame's `<FontString>` children, each
+    /// loaded into the frame's own font by the Font loader (`0x783c30` at `0x77a220`, `0x785af5`,
+    /// `0x787cfe`), never a region: one over a font that already follows another first logs
+    /// `%s: FontString element overriding font %s` (`0x879b3c`) with the frame's name and the
+    /// followed font's. An EditBox's then caps its bytes (`0x77a225`).
+    pub(super) fn apply_text_font_children(&mut self, el: &Element, wrapper: &Table, dbg: &str) {
+        for child in children_named(el, "FontString") {
+            let own = match crate::script::own_font_lua(self.lua, wrapper) {
+                Ok(Some(own)) => own,
+                Ok(None) => return,
+                Err(e) => {
+                    self.report.fault(format!("{dbg}: <FontString>: {e}"));
+                    return;
+                }
+            };
+            let followed = {
+                let model = self.model();
+                model.fonts.get(own).parent.map(|p| {
+                    model
+                        .fonts
+                        .get(p)
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "<unnamed>".to_string())
+                })
+            };
+            if let Some(font) = followed {
+                let name = self.object_name(wrapper);
+                self.status_warning(format!("{name}: FontString element overriding font {font}"));
+            }
+            self.load_font_node(child, own, "<unnamed>");
+            if el.tag.eq_ignore_ascii_case("EditBox") {
+                let text = crate::script::editbox_text_region_wrapper(self.lua(), wrapper);
+                if let Some(text) = text {
+                    if let Err(e) = crate::script::adopt_text_region(self.lua(), wrapper, &text) {
+                        self.report.fault(format!("{dbg}: adopt text region: {e}"));
                     }
                 }
-                // A `justifyH` here is a local write on that state's font, never the label
-                // (`0x783c30`); the button reads it to anchor a label it makes later (`0x778d20`).
-                if let Some(j) = f.attr("justifyH") {
-                    match crate::justify::parse_h(j) {
-                        crate::justify::Set::To(jh) => {
-                            if let Err(e) = crate::script::set_label_font_justify_h_lua(
-                                self.lua, wrapper, which, jh,
-                            ) {
-                                self.report
-                                    .fault(format!("{dbg}: <{}> justifyH: {e}", f.tag));
-                            }
-                        }
-                        // Reported, not modelled: the reference clears the axis on a cross-axis
-                        // token and raises on a non-token.
-                        _ => self.report.warnings.push(format!(
-                            "{dbg}: <{}> justifyH=\"{j}\" is not a horizontal token — ignored",
-                            f.tag
-                        )),
+                if let Some(bytes) = child.attr("bytes") {
+                    if let Err(e) = crate::script::apply_xml_bytes(self.lua(), wrapper, bytes) {
+                        self.report.fault(format!("{dbg}: FontString bytes: {e}"));
                     }
                 }
             }
@@ -253,33 +358,32 @@ impl Loader<'_> {
         if !el.tag.eq_ignore_ascii_case("EditBox") {
             return;
         }
-        if let Some(n) = el
-            .attr("letters")
-            .and_then(|v| v.trim().parse::<i64>().ok())
-        {
-            self.call(wrapper, "SetMaxLetters", n, dbg);
+        // Each non-empty: `letters` through `SStrToInt` (`0x77a05c`), `blinkSpeed` through
+        // `SStrToFloat` and stored as 0 unless above it (`0x77a07f`-`0x77a09f`), `historyLines`
+        // through `SStrToInt` and 0 unless above it (`0x77a175`-`0x77a18d`).
+        if let Some(v) = el.attr("letters").filter(|v| !v.is_empty()) {
+            self.call(wrapper, "SetMaxLetters", s_str_to_int(v), dbg);
         }
-        if let Some(n) = el
-            .attr("historyLines")
-            .and_then(|v| v.trim().parse::<i64>().ok())
-        {
-            self.call(wrapper, "SetHistoryLines", n, dbg);
+        if let Some(v) = el.attr("historyLines").filter(|v| !v.is_empty()) {
+            self.call(wrapper, "SetHistoryLines", s_str_to_int(v).max(0), dbg);
         }
-        if let Some(s) = el
-            .attr("blinkSpeed")
-            .and_then(|v| v.trim().parse::<f32>().ok())
-        {
-            self.call(wrapper, "SetBlinkSpeed", s, dbg);
+        if let Some(v) = el.attr("blinkSpeed").filter(|v| !v.is_empty()) {
+            let s = super::xml_float(v);
+            self.call(wrapper, "SetBlinkSpeed", if s > 0.0 { s } else { 0.0 }, dbg);
         }
-        if let Some(ins) = children_named(el, "TextInsets").next() {
-            let src = children_named(ins, "AbsInset").next().unwrap_or(ins);
-            let get = |k: &str| {
-                src.attr(k)
-                    .and_then(|v| v.trim().parse::<f32>().ok())
-                    .unwrap_or(0.0)
-            };
-            let (l, r, t, b) = (get("left"), get("right"), get("top"), get("bottom"));
-            self.call(wrapper, "SetTextInsets", (l, r, t, b), dbg);
+        // Each `<TextInsets>` in the child loop (`0x77a2a9`), the last winning, through the inset
+        // read (`0x77a2d5`), set when it succeeds (`0x77a2da`).
+        for ins in children_named(el, "TextInsets") {
+            if let Some([l, r, t, b]) = self.inset(ins) {
+                self.call(wrapper, "SetTextInsets", (l, r, t, b), dbg);
+            }
+        }
+        // Each `<HighlightColor>` in turn, the last winning (`0x77a277`): the `<Color>` reader
+        // (`0x6f23d0`, `0x77a292`), then the selection's setter (`0x77a2a2`).
+        for hc in children_named(el, "HighlightColor") {
+            if let Err(e) = crate::script::set_selection_color(self.lua, wrapper, color_of(hc)) {
+                self.report.fault(format!("{dbg}: <HighlightColor>: {e}"));
+            }
         }
         for (attr, method) in [
             ("autoFocus", "SetAutoFocus"),
@@ -296,7 +400,8 @@ impl Loader<'_> {
     }
 
     /// `<Minimap>` (`0x4ee2b0`): the two model files for the ctor's nine `Model` children, each
-    /// the stock model when the attribute is absent, as the reference reads a default string.
+    /// the stock model when the attribute is absent, as the reference reads a default string, and
+    /// its log line for a model that does not load.
     pub(super) fn apply_minimap(&mut self, el: &Element, wrapper: &Table, dbg: &str) {
         if !el.tag.eq_ignore_ascii_case("Minimap") {
             return;
@@ -309,11 +414,16 @@ impl Loader<'_> {
             .attr("minimapPlayerModel")
             .filter(|s| !s.is_empty())
             .unwrap_or(crate::widget::MINIMAP_DEFAULT_PLAYER_MODEL);
-        if let Err(e) = crate::script::apply_minimap_model_attrs(self.lua, wrapper, arrow, player) {
-            self.warn_once(
+        match crate::script::apply_minimap_model_attrs(self.lua, wrapper, arrow, player) {
+            Ok(failed) => {
+                for line in failed {
+                    self.report.warnings.push(format!("{dbg}: {line}"));
+                }
+            }
+            Err(e) => self.warn_once(
                 "minimap:models",
                 format!("{dbg}: <Minimap> model attributes: {e}"),
-            );
+            ),
         }
     }
 
@@ -327,49 +437,63 @@ impl Loader<'_> {
         if !scrolling && !plain {
             return;
         }
+        // A non-empty `maxLines` through `SStrToInt`, above 0 (`0x787c5e`-`0x787c71`).
         if scrolling {
-            if let Some(n) = el
-                .attr("maxLines")
-                .and_then(|v| v.trim().parse::<i64>().ok())
-            {
+            if let Some(v) = el.attr("maxLines").filter(|v| !v.is_empty()) {
+                let n = s_str_to_int(v);
                 if n > 0 {
                     self.call(wrapper, "SetMaxLines", n, dbg);
                 }
             }
         }
+        // A non-empty `insertMode` is BOTTOM when it equals "BOTTOM" whole and without case, and
+        // TOP otherwise, never a raise (`0x785a46`-`0x785a68`).
         if plain {
-            if let Some(mode) = el.attr("insertMode") {
-                self.call(wrapper, "SetInsertMode", mode.trim().to_string(), dbg);
+            if let Some(mode) = el.attr("insertMode").filter(|m| !m.is_empty()) {
+                let mode = if mode.eq_ignore_ascii_case("BOTTOM") {
+                    "BOTTOM"
+                } else {
+                    "TOP"
+                };
+                self.call(wrapper, "SetInsertMode", mode, dbg);
             }
         }
-        if let Some(s) = el
-            .attr("displayDuration")
-            .and_then(|v| v.trim().parse::<f32>().ok())
-        {
-            if s > 0.0 {
-                self.call(wrapper, "SetTimeVisible", s, dbg);
-            }
-        }
-        if let Some(s) = el
-            .attr("fadeDuration")
-            .and_then(|v| v.trim().parse::<f32>().ok())
-        {
-            if s > 0.0 {
-                self.call(wrapper, "SetFadeDuration", s, dbg);
+        // Each a non-empty value through `SStrToFloat`, above 0 (`0x7859de`, `0x785a15`).
+        for (attr, verb) in [
+            ("displayDuration", "SetTimeVisible"),
+            ("fadeDuration", "SetFadeDuration"),
+        ] {
+            if let Some(v) = el.attr(attr).filter(|v| !v.is_empty()) {
+                let s = super::xml_float(v);
+                if s > 0.0 {
+                    self.call(wrapper, verb, s, dbg);
+                }
             }
         }
         // `0x6f1b30`, a missing or empty one skipped (`0x7859b2`-`0x7859bd`).
         if let Some(on) = el.attr_bool_opt("fade") {
             self.call(wrapper, "SetFading", on, dbg);
         }
+        // Each `<TextInsets>` in the child loop, through the inset read, set when it succeeds
+        // (`0x785b49`-`0x785b65`, `0x787d52`-`0x787d6e`).
+        for ins in children_named(el, "TextInsets") {
+            if let Some(insets) = self.inset(ins) {
+                if let Err(e) = crate::script::set_message_xml_insets(self.lua, wrapper, insets) {
+                    self.report.fault(format!("{dbg}: <TextInsets>: {e}"));
+                }
+            }
+        }
     }
 
-    /// `<Slider>` (`0x789580`), VERTICAL from the ctor: the range, `valueStep` and `defaultValue`
-    /// apply only when both bounds are present, and a reversed pair is not swapped; `drawLayer` is
+    /// `<Slider>` (`0x789580`), VERTICAL from the ctor. Its frame load (`0x769820`) first re-enters
+    /// the virtual `LoadXML` on the `inherits` node (`0x76985c`), so for each level
+    /// ([`Loader::levels`]), the template first, the range, `valueStep` and `defaultValue` apply
+    /// only when both bounds are on that node, and a reversed pair is not swapped; `drawLayer` is
     /// the thumb's layer, OVERLAY by default.
     pub(super) fn apply_slider(
         &mut self,
         el: &Element,
+        levels: &Levels,
         wrapper: &Table,
         self_name: &str,
         dbg: &str,
@@ -377,17 +501,41 @@ impl Loader<'_> {
         if !el.tag.eq_ignore_ascii_case("Slider") {
             return;
         }
-        if let Some(o) = el.attr("orientation") {
-            self.call(wrapper, "SetOrientation", o.to_string(), dbg);
-        }
-        let parse = |attr: &str| el.attr(attr).and_then(|v| v.trim().parse::<f32>().ok());
-        if let (Some(min), Some(max)) = (parse("minValue"), parse("maxValue")) {
-            self.call(wrapper, "SetMinMaxValues", (min, max), dbg);
-            if let Some(step) = parse("valueStep") {
-                self.call(wrapper, "SetValueStep", step, dbg);
+        for level in levels {
+            // Each value through `SStrToFloat` (`0x64aaa0`), present and non-empty, so `"100%"`
+            // is 100: the range needs both bounds on the node, and `valueStep` and `defaultValue`
+            // are read only after it (`0x789605`-`0x7896a2`).
+            let value = |attr: &str| {
+                level
+                    .attr(attr)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| crate::script::binding_abi::s_str_to_float(v) as f32)
+            };
+            if let (Some(min), Some(max)) = (value("minValue"), value("maxValue")) {
+                self.call(wrapper, "SetMinMaxValues", (min, max), dbg);
+                if let Some(step) = value("valueStep") {
+                    self.call(wrapper, "SetValueStep", step, dbg);
+                }
+                if let Some(v) = value("defaultValue") {
+                    self.call(wrapper, "SetValue", v, dbg);
+                }
             }
-            if let Some(v) = parse("defaultValue") {
-                self.call(wrapper, "SetValue", v, dbg);
+            // `orientation` through the token parse `0x6f1a20`: empty is skipped, a miss logged
+            // (`0x87a3c4`, `0x78970d`) and never raised, where the Lua setter raises.
+            if let Some(token) = level.attr("orientation").filter(|v| !v.is_empty()) {
+                match crate::script::region::orientation(token) {
+                    Some(vertical) => {
+                        let o = if vertical { "VERTICAL" } else { "HORIZONTAL" };
+                        self.call(wrapper, "SetOrientation", o, dbg);
+                    }
+                    None => {
+                        let name = self.object_name(wrapper);
+                        self.status_warning(format!(
+                            "Frame {name}: Unknown orientation {token} in element {}",
+                            level.tag
+                        ));
+                    }
+                }
             }
         }
         let layer = el.attr("drawLayer");
@@ -473,7 +621,7 @@ impl Loader<'_> {
     }
 
     /// One `<SimpleHTML>` font child's element font, with the same `font=` gate as
-    /// [`Self::apply_fontstring_font`].
+    /// [`Self::load_fontstring_level`].
     fn apply_element_font(&mut self, el: &Element, wrapper: &Table, elem: usize, dbg: &str) {
         let name = ["P", "H1", "H2", "H3"][elem];
         if let Some(inherits) = el.attr("inherits").filter(|n| !n.is_empty()) {
@@ -487,14 +635,24 @@ impl Loader<'_> {
                 self.call(wrapper, "SetFontObject", (name, f.to_string()), dbg);
             }
             Some(path) => {
-                let height = children_named(el, "FontHeight").last().and_then(abs_value);
+                // As a FontString's file, `CSimpleFont::LoadXML` needs a height above 0
+                // (`0x783d6d`-`0x783d78`); else it reports `0x87a4f0` and returns (`0x783dae`)
+                // before `outline=`, `<Color>`, `<Shadow>`, the justifies and `spacing=`.
+                let height = children_named(el, "FontHeight")
+                    .last()
+                    .map(|h| self.value(h))
+                    .filter(|h| *h > 0.0);
+                let Some(height) = height else {
+                    self.report_missing_font_height("Font", "<unnamed>", &el.tag);
+                    return;
+                };
                 let outline = el.attr("outline").map(str::to_string);
                 if let Err(e) = crate::script::apply_simplehtml_font_parts(
                     self.lua,
                     wrapper,
                     elem,
                     Some(path.to_string()),
-                    height,
+                    Some(height),
                     outline,
                 ) {
                     self.report
@@ -504,24 +662,17 @@ impl Loader<'_> {
             None => {}
         }
         if let Some(c) = children_named(el, "Color").last().map(color_of) {
-            self.call(wrapper, "SetTextColor", (name, c[0], c[1], c[2], c[3]), dbg);
+            let (r, g, b, a) = c.fractions();
+            self.call(wrapper, "SetTextColor", (name, r, g, b, a), dbg);
         }
         if let Some(sh) = children_named(el, "Shadow").last() {
             if let Some(c) = children_named(sh, "Color").next().map(color_of) {
-                self.call(
-                    wrapper,
-                    "SetShadowColor",
-                    (name, c[0], c[1], c[2], c[3]),
-                    dbg,
-                );
+                let (r, g, b, a) = c.fractions();
+                self.call(wrapper, "SetShadowColor", (name, r, g, b, a), dbg);
             }
-            if let Some((x, y)) = children_named(sh, "Offset").next().map(abs_dim) {
-                self.call(
-                    wrapper,
-                    "SetShadowOffset",
-                    (name, x.unwrap_or(0.0), y.unwrap_or(0.0)),
-                    dbg,
-                );
+            if let Some(o) = children_named(sh, "Offset").next() {
+                let [x, y] = self.dimension(o).v;
+                self.call(wrapper, "SetShadowOffset", (name, x, y), dbg);
             }
         }
         if let Some(j) = el.attr("justifyH") {

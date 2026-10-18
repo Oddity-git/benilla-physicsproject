@@ -2,11 +2,11 @@
 
 use mlua::{Lua, MultiValue, Table, Value};
 
-use crate::script::binding_abi::bool_or_default;
+use crate::script::binding_abi::{self, bool_or_default};
 
 use crate::script::region_map::{set_shared, Side};
 
-use crate::order::Strata;
+use crate::order::{DrawLayer, Strata};
 use crate::script::{visibility, Backdrop, Insets, Model};
 use crate::widget::FrameKind;
 
@@ -131,22 +131,9 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         "IsObjectType",
         |lua, (this, want): (Table, Value)| {
             let chain = chain_of(lua, &this)?;
-            let want = match &want {
-                Value::String(s) => s.to_str()?.to_string(),
-                Value::Number(n) => n.to_string(),
-                Value::Integer(i) => i.to_string(),
-                _ => {
-                    let h = frame_handle_of(lua, &this)?;
-                    let model = lua.app_data_ref::<Model>().expect("model");
-                    let who = model
-                        .arena
-                        .frame(h)
-                        .and_then(|f| f.name.clone())
-                        .unwrap_or_else(|| "<unnamed>".to_string());
-                    return Err(mlua::Error::runtime(format!(
-                        "Usage: {who}:IsObjectType(\"TYPE\")"
-                    )));
-                }
+            let Some(want) = binding_abi::optional_string(lua, &want) else {
+                frame_handle_of(lua, &this)?;
+                return Err(binding_abi::usage(lua, &this, "IsObjectType(\"TYPE\")"));
             };
             Ok(if chain.iter().any(|t| want.eq_ignore_ascii_case(t)) {
                 Value::Number(1.0)
@@ -159,8 +146,9 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
     // ── GetFrameType / IsFrameType ──
     //
     // The frame script's own spellings of the pair above (`GetFrameType 0x773640`, `IsFrameType
-    // 0x773700`), reading the same per-class type slot: one name, or 1 or nil. An absent argument
-    // raises `Usage:` like `IsObjectType`; the reference's absent-argument branch is untraced.
+    // 0x773700`), reading the same per-class type slot: one name, or 1 or nil. A value
+    // `lua_isstring` refuses, none included (`0x77378c`), raises IsObjectType's own line,
+    // `Usage: %s:IsObjectType("TYPE")` (`0x8794e4`, pushed at `0x7737af`).
     m.set(
         "GetFrameType",
         lua.create_function(|lua, this: Table| {
@@ -171,22 +159,9 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         "IsFrameType",
         lua.create_function(|lua, (this, want): (Table, Value)| {
             let chain = chain_of(lua, &this)?;
-            let want = match &want {
-                Value::String(s) => s.to_str()?.to_string(),
-                Value::Number(n) => n.to_string(),
-                Value::Integer(i) => i.to_string(),
-                _ => {
-                    let h = frame_handle_of(lua, &this)?;
-                    let model = lua.app_data_ref::<Model>().expect("model");
-                    let who = model
-                        .arena
-                        .frame(h)
-                        .and_then(|f| f.name.clone())
-                        .unwrap_or_else(|| "<unnamed>".to_string());
-                    return Err(mlua::Error::runtime(format!(
-                        "Usage: {who}:IsFrameType(\"TYPE\")"
-                    )));
-                }
+            let Some(want) = binding_abi::optional_string(lua, &want) else {
+                frame_handle_of(lua, &this)?;
+                return Err(binding_abi::usage(lua, &this, "IsObjectType(\"TYPE\")"));
             };
             Ok(if chain.iter().any(|t| want.eq_ignore_ascii_case(t)) {
                 Value::Number(1.0)
@@ -264,14 +239,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
                 _ => return Err(mlua::Error::runtime("expected a frame")),
             };
             let h = frame_handle_of(lua, &this)?;
-            let who = {
-                let model = lua.app_data_ref::<Model>().expect("model");
-                model
-                    .arena
-                    .frame(h)
-                    .and_then(|f| f.name.clone())
-                    .unwrap_or_else(|| "<unnamed>".to_string())
-            };
+            let who = binding_abi::frame_name(&lua.app_data_ref::<Model>().expect("model"), h);
             let parent_arg = it.next();
             // `_G[name]` is read with no guard alive and no `$parent` expansion: `0x7a1550` calls
             // `0x76c760` directly, and only the layout path's `0x76c700` expands the token.
@@ -322,11 +290,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
             if let Some(np) = new_parent {
                 let model = lua.app_data_ref::<Model>().expect("model");
                 if np == h || model.arena.is_ancestor(h, np) {
-                    let pname = model
-                        .arena
-                        .frame(np)
-                        .and_then(|f| f.name.clone())
-                        .unwrap_or_else(|| "<unnamed>".to_string());
+                    let pname = binding_abi::frame_name(&model, np);
                     return Err(mlua::Error::runtime(format!(
                         "{who}:SetParent(): Would create a loop parenting to {pname}"
                     )));
@@ -365,13 +329,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
             // A name off the table raises, naming the frame or `<unnamed>` (`0x774450`), and the
             // stratum stays.
             let Some(s) = strata_from_str(&strata) else {
-                let name = lua
-                    .app_data_ref::<Model>()
-                    .expect("model")
-                    .arena
-                    .frame(h)
-                    .and_then(|f| f.name.clone())
-                    .unwrap_or_else(|| "<unnamed>".to_string());
+                let name = binding_abi::name_of(lua, &this);
                 return Err(mlua::Error::runtime(format!(
                     "{name}:SetFrameStrata(): Unknown frame strata: {strata}"
                 )));
@@ -418,11 +376,23 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
     )?;
     m.set(
         "SetScale",
-        lua.create_function(|lua, (this, scale): (Table, f32)| {
+        lua.create_function(|lua, (this, scale): (Table, Value)| {
             let h = frame_handle_of(lua, &this)?;
+            // `0x775140`: `lua_isnumber` else the usage line (`0x775250`); a scale below 0 or NaN
+            // (`fcomp 0.0; test ah,1`, `0x7751e9`, on the double) raises and stores nothing
+            // (`0x77520b`); 0 passes. The store is the f32 (`0x7751e6`).
+            let Some(scale) = lua.coerce_number(scale)? else {
+                return Err(binding_abi::usage(lua, &this, "SetScale(scale)"));
+            };
+            if scale < 0.0 || scale.is_nan() {
+                return Err(mlua::Error::runtime(format!(
+                    "{}:SetScale(): Scale must be > 0",
+                    binding_abi::name_of(lua, &this)
+                )));
+            }
             lua.app_data_mut::<Model>()
                 .expect("model")
-                .set_frame_scale(h, scale);
+                .set_frame_scale(h, scale as f32, false);
             Ok(())
         })?,
     )?;
@@ -436,13 +406,17 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
     )?;
     m.set(
         "SetAlpha",
-        lua.create_function(|lua, (this, alpha): (Table, f32)| {
+        lua.create_function(|lua, (this, alpha): (Table, Value)| {
             let h = frame_handle_of(lua, &this)?;
-            // The reference clamps to 0..1; stock fade code passing a 0..255 alpha relies on it.
+            // `0x774e90`: `lua_isnumber` else the usage line (`0x774f76`), then the clamped,
+            // truncated byte; stock fade code passing a 0..255 alpha relies on the clamp.
+            let Some(alpha) = lua.coerce_number(alpha)? else {
+                return Err(binding_abi::usage(lua, &this, "SetAlpha(alpha 0 to 1)"));
+            };
             lua.app_data_mut::<Model>()
                 .expect("model")
                 .arena
-                .set_alpha(h, alpha.clamp(0.0, 1.0));
+                .set_alpha(h, crate::color::frame_alpha_byte(alpha));
             Ok(())
         })?,
     )?;
@@ -451,7 +425,10 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(model.arena.frame(h).map(|f| f.alpha).unwrap_or(1.0))
+            Ok(model
+                .arena
+                .frame(h)
+                .map_or(1.0, |f| crate::color::alpha_f64(f.alpha)))
         })?,
     )?;
     // `SetBackdrop(table|nil)` (`0x7776e0` → `0x76a5d0`) installs or removes the tiled background
@@ -550,15 +527,12 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            match model.backdrops.get(&h).map(|i| &i.spec) {
-                Some(bd) => Ok((
-                    bd.bg_color[0],
-                    bd.bg_color[1],
-                    bd.bg_color[2],
-                    bd.bg_color[3],
-                )),
-                None => Ok((1.0, 1.0, 1.0, 1.0)),
-            }
+            // No backdrop pushes nothing (`0x777c68`/`0x778008`: `+0x1ac` null returns 0).
+            // With one, each byte times the float at `0x81c6b4` (`0x777c98`).
+            Ok(match model.backdrops.get(&h).map(|i| &i.spec) {
+                Some(bd) => crate::script::object::colour_values(bd.bg_color),
+                None => mlua::MultiValue::new(),
+            })
         })?,
     )?;
     m.set(
@@ -566,15 +540,11 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            match model.backdrops.get(&h).map(|i| &i.spec) {
-                Some(bd) => Ok((
-                    bd.border_color[0],
-                    bd.border_color[1],
-                    bd.border_color[2],
-                    bd.border_color[3],
-                )),
-                None => Ok((1.0, 1.0, 1.0, 1.0)),
-            }
+            // No backdrop pushes nothing (`0x777c68`/`0x778008`: `+0x1ac` null returns 0).
+            Ok(match model.backdrops.get(&h).map(|i| &i.spec) {
+                Some(bd) => crate::script::object::colour_values(bd.border_color),
+                None => mlua::MultiValue::new(),
+            })
         })?,
     )?;
     // Mouse interaction: `EnableMouse` gates hit-testing.
@@ -621,18 +591,18 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
             ))
         })?,
     )?;
-    // EnableDrawLayer / DisableDrawLayer (`0x7755b0`/`0x775680`): the frame's layer mask. An
-    // unknown layer name is a no-op here; the reference's handling of one is untraced.
+    // EnableDrawLayer / DisableDrawLayer (`0x7755b0`/`0x775680`): the frame's layer mask. The
+    // layer starts at ARTWORK (`0x775640`) and a string naming a layer replaces it (`0x775662`
+    // writes only on a hit), so a missing, unknown or non-string argument means ARTWORK. A
+    // number passes `lua_isstring` but its text names no layer.
     for (name, disable) in [("EnableDrawLayer", false), ("DisableDrawLayer", true)] {
         m.set(
             name,
             lua.create_function(move |lua, (this, layer): (Table, Value)| {
-                let Some(l) = layer
+                let l = layer
                     .as_string()
                     .and_then(|s| s.to_str().ok().and_then(|s| draw_layer_from_str(&s)))
-                else {
-                    return Ok(());
-                };
+                    .unwrap_or(DrawLayer::Artwork);
                 let h = frame_handle_of(lua, &this)?;
                 let mut model = lua.app_data_mut::<Model>().expect("model");
                 if let Some(frame) = model.arena.frame_mut(h) {
@@ -815,29 +785,13 @@ fn regions_of(lua: &Lua, this: &Table) -> mlua::Result<Vec<u32>> {
     Ok(live.into_iter().map(|r| model.region_id(r)).collect())
 }
 
-/// One backdrop colour channel as `SetBackdropColor` (`0x777d30`) and `SetBackdropBorderColor`
-/// (`0x7780d0`) convert it: r, g, b through a bare `lua_tonumber` (nil is 0), alpha gated by
-/// `lua_isnumber` with 1.0 staged (`0x778220`, `0x778227`); clamped to 0..1 with NaN at 1, then
-/// stored as a byte, rounded half up (`×255 + 0.5`, `__ftol`).
-fn backdrop_channel(lua: &Lua, v: Option<Value>, gated: bool) -> f32 {
-    let x = if gated {
-        v.and_then(|v| lua.coerce_number(v).ok().flatten())
-            .unwrap_or(1.0)
-    } else {
-        crate::script::binding_abi::coerced_number(lua, v)
-    };
-    let clamped = if x.is_nan() { 1.0 } else { x.clamp(0.0, 1.0) };
-    let byte = (clamped * 255.0 + 0.5) as u8;
-    f32::from(byte) / 255.0
-}
-
-/// A backdrop colour setter's four channels; a missing argument and an explicit nil read alike.
-fn backdrop_color(lua: &Lua, args: mlua::MultiValue) -> [f32; 4] {
+/// A backdrop colour setter's four channels (`SetBackdropColor` `0x777d30`,
+/// `SetBackdropBorderColor` `0x7780d0`): r, g and b through a bare `lua_tonumber` (nil is 0),
+/// alpha gated by `lua_isnumber` over a staged 1.0 (`0x778220`, `0x778227`), packed as every
+/// colour setter packs ([`crate::color::Rgba8::pack`]). A missing argument and an explicit nil
+/// read alike.
+fn backdrop_color(lua: &Lua, args: mlua::MultiValue) -> crate::color::Rgba8 {
     let a: Vec<Value> = args.into_iter().collect();
-    [
-        backdrop_channel(lua, a.first().cloned(), false),
-        backdrop_channel(lua, a.get(1).cloned(), false),
-        backdrop_channel(lua, a.get(2).cloned(), false),
-        backdrop_channel(lua, a.get(3).cloned(), true),
-    ]
+    let arg = |i: usize| a.get(i).cloned().unwrap_or(Value::Nil);
+    crate::script::object::colour_args(lua, &arg(0), &arg(1), &arg(2), &arg(3))
 }

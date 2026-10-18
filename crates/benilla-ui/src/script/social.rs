@@ -81,6 +81,9 @@ pub enum SocialRequest {
     Who(String),
     /// `SortWho(sortType)`, the raw argument; the binding has already sorted the snapshot.
     SortWho(String),
+    /// `LFGQuery(type, entry)` that passed its bounds: `MSG_LOOKING_FOR_GROUP` with the criterion
+    /// word and the class.
+    LfgQuery { criterion: u32, class: u32 },
     /// `SetWhoToUI(flag)`: the next `/who` answer goes to the Who frame (true) or chat (false).
     SetWhoToUi(bool),
 }
@@ -209,12 +212,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 *slot = ((ty as u32) << 24) & (entry as i64 as u32);
             }
             let comment = match arg(4) {
-                Value::Integer(_) | Value::Number(_) | Value::String(_) => match arg(7) {
-                    Value::String(s) => Some(s.to_string_lossy()),
-                    Value::Integer(i) => Some(i.to_string()),
-                    Value::Number(n) => Some(n.to_string()),
-                    _ => None,
-                },
+                // `lua_tostring(7)` (`0x4e9741`): a number is its `%.14g` text.
+                Value::Integer(_) | Value::Number(_) | Value::String(_) => {
+                    crate::script::binding_abi::optional_string(lua, &arg(7))
+                }
                 _ => None,
             };
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");

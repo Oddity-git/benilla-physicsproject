@@ -37,11 +37,18 @@ half = "2"
 include_dir = "0.7"
 # The 1.12 chat filters (`text_filter`), with one `RegexSet` for the any-match pass per line.
 regex = "1"
+# The same filters' word boundaries: `regex` has no look-around, and the client's word class is
+# its own table, not Unicode's.
+fancy-regex = { version = "0.18", default-features = false, features = ["std", "unicode", "perf"] }
 # `getrusage` for perf CPU time; `localtime_r` for the log stamp; the audio clock and render
 # thread's realtime policy on macOS.
 libc = "0.2"
 # PNG encoding only: the macOS cursor's NSImage data and screenshots.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# The "no WoW install" error dialog (`no_install`): AppKit, Win32 and, on Linux, `zenity`; no GTK.
+# `xdg-portal` is the Linux backend that carries the message dialog; `wayland` is its file-dialog
+# parent handle, which a message dialog without a parent never reads.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # Thread-to-ECS channels: crossbeam's `Receiver` is `Sync`, so it is a resource without a mutex.
 crossbeam-channel = "0.5"
 benilla-assets = { path = "../benilla-assets", default-features = false }
@@ -55,6 +62,8 @@ toml = "0.8"
 avian3d = "0.6"
 # Shapes and rasterizes `FontString` text standalone (`ui_text`), at bevy_text's own 0.16.
 cosmic-text = "0.16"
+# The smooth scan converter `ui_text` rasterizes anti-aliased glyphs with; `swash`'s own version.
+zeno = "0.3.3"
 # The layout's unshifted character per key (`KeyEventExtModifierSupplement`), which bevy's
 # `KeyboardInput` drops; bevy_winit's own 0.30, whose features it sets.
 winit = { version = "0.30", default-features = false }
@@ -115,5 +124,15 @@ windows-sys = { version = "0.59", features = [
 # The login cycle's fake realmd runs the server half of SRP6 (`net::io::cycle_tests`).
 [dev-dependencies]
 benilla-srp = { path = "../benilla-srp" }
+# The UI's geometry comparisons (`benilla_ui::assert_near!`).
+benilla-ui = { path = "../benilla-ui", features = ["test-support"] }
 num-bigint = "0.4.6"
 sha1.workspace = true
+
+# The shader translation test writes the backend this platform renders with, through the naga
+# bevy already builds (`shaders.rs`).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+naga = { version = "27.0.3", features = ["msl-out"] }
+
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
+naga = { version = "27.0.3", features = ["spv-out"] }

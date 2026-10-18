@@ -32,6 +32,14 @@ pub struct ItemTemplateView {
     /// prerequisite, or its postrequisite when the prerequisite is -1. A weapon with only the
     /// alternate's bit reds the slot cell, not the type cell.
     pub proficiency_alt: Option<u32>,
+    /// `ItemSubClass.dbc`'s prerequisite proficiency alone (row `+0x08`, `None` for -1):
+    /// `GetTradeSkillItemStats` reads this field where the tooltip walks on to the postrequisite.
+    pub proficiency_prereq: Option<u32>,
+    /// The template's item level (`+0x38`).
+    pub item_level: u32,
+    /// `(spell name, charges)` for each of the five spell slots whose id names a `Spell.dbc` row,
+    /// in slot order (`+0x11c`, `+0x144`): `GetTradeSkillItemStats`' `ITEM_SPELL_EFFECT` lines.
+    pub spell_slots: Vec<(String, i32)>,
     /// `ItemSubClass.dbc` displayFlags bit 0: the type cell never prints (rings, trinkets, …).
     pub hide_subclass: bool,
     /// Template flags; `0x2` prints "Conjured Item".
@@ -241,11 +249,13 @@ pub struct ItemSetView {
 }
 
 impl super::UiScript {
-    /// Stores or replaces an item's template view, clearing its ask.
+    /// Stores or replaces an item's template view, clearing its ask and its read.
     pub fn set_item_template(&mut self, item_id: u32, view: ItemTemplateView) {
         let mut model = self.model_mut();
         model.item_stat_asks.remove(&item_id);
+        model.item_stat_reads.remove(&item_id);
         model.item_templates.insert(item_id, view);
+        model.quest_store.item_landed(item_id);
     }
 
     /// Asks for the templates of `ids` the store lacks, for the trade-skill and craft lists,
@@ -259,9 +269,25 @@ impl super::UiScript {
         }
     }
 
-    /// Drains the ids read or asked for that the store did not hold.
+    /// Drains the ids asked for that the store did not hold.
     pub fn take_item_stat_asks(&mut self) -> Vec<u32> {
         self.model_mut().item_stat_asks.drain().collect()
+    }
+
+    /// Drains the guids an item build missed in the name cache: a creator or a giver.
+    pub fn take_item_name_asks(&mut self) -> Vec<u64> {
+        self.model_mut().item_name_asks.drain().collect()
+    }
+
+    /// Drains the charter item guids an item build missed the petition record or owner of.
+    pub fn take_petition_asks(&mut self) -> Vec<u64> {
+        self.model_mut().petition_asks.drain().collect()
+    }
+
+    /// Drains the ids `GetItemInfo` read that the store did not hold, which the app serves from
+    /// its cache and never asks the server for.
+    pub fn take_item_stat_reads(&mut self) -> Vec<u32> {
+        self.model_mut().item_stat_reads.drain().collect()
     }
 
     /// Stores or replaces a set's view, re-pushed as member names resolve.
@@ -387,7 +413,7 @@ fn parse_item_arg(v: &Value) -> mlua::Result<(i64, u32, u32, u32)> {
     let mut fields = rest
         .splitn(4, ':')
         .map(crate::script::binding_abi::s_str_to_int);
-    let id = fields.next().unwrap_or(0);
+    let id = i64::from(fields.next().unwrap_or(0));
     let mut next = || u32::try_from(fields.next().unwrap_or(0)).unwrap_or(0);
     Ok((id, next(), next(), next()))
 }
@@ -420,8 +446,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // is the bare template name, where the reference appends the random suffix (`0x5d8b00`); the
     // link is the item string (`0x48e1c9`, literal `0x842d4c`), not a hyperlink; the level is the
     // required one (`[record+0x3c]`; `ItemLevel` at `+0x38` is never pushed). An uncached
-    // template answers no values and records the ask, as the reference's lookup (`0x55ba30`)
-    // queries and returns null, sending the binding to `xor eax,eax; ret`.
+    // template answers no values and asks nothing: the lookup passes no callback (`0x48e172`), so
+    // the cache (`0x55ba30`) returns null without a query (`0x55baac`), sending the binding to
+    // `xor eax,eax; ret`. The miss is recorded as a read, which the app answers from its cache.
     lua.globals().set(
         "GetItemInfo",
         lua.create_function(|lua, arg: Value| {
@@ -433,7 +460,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 let v = model.item_templates.get(&item_id).cloned();
                 if v.is_none() && item_id != 0 {
-                    model.item_stat_asks.insert(item_id);
+                    model.item_stat_reads.insert(item_id);
                 }
                 v
             };
@@ -559,11 +586,14 @@ mod tests {
         assert!(item_usable(&v, &PlayerReqState::default(), knows_none));
     }
 
+    /// A miss records a read, never an ask: `GetItemInfo`'s lookup passes no callback
+    /// (`0x48e172`).
     #[test]
-    fn miss_records_ask_and_push_serves_the_stats() {
+    fn miss_records_a_read_and_push_serves_the_stats() {
         let mut s = UiScript::new().unwrap();
         assert!(s.eval::<bool>("return GetItemInfo(25) == nil").unwrap());
-        assert_eq!(s.take_item_stat_asks(), vec![25]);
+        assert_eq!(s.take_item_stat_reads(), vec![25]);
+        assert!(s.take_item_stat_asks().is_empty(), "no ask of the server");
 
         s.set_item_template(
             25,
@@ -582,10 +612,10 @@ mod tests {
             .eval("local n, _, q = GetItemInfo(25) return n, q")
             .unwrap();
         assert_eq!((name.as_str(), quality), ("Worn Shortsword", 1));
-        assert!(s.take_item_stat_asks().is_empty(), "push cleared the ask");
-        // Id 0 records no ask.
+        assert!(s.take_item_stat_reads().is_empty(), "push cleared the read");
+        // Id 0 records no read.
         assert!(s.eval::<bool>("return GetItemInfo(0) == nil").unwrap());
-        assert!(s.take_item_stat_asks().is_empty());
+        assert!(s.take_item_stat_reads().is_empty());
     }
 }
 
@@ -719,7 +749,7 @@ mod get_item_info_tests {
     }
 
     #[test]
-    fn an_uncached_id_returns_nothing_and_records_the_ask() {
+    fn an_uncached_id_returns_nothing_and_records_a_read() {
         let mut s = UiScript::new().unwrap();
         assert_eq!(
             s.arity("GetItemInfo(2589)").unwrap(),
@@ -727,7 +757,12 @@ mod get_item_info_tests {
             "an unseen template returns NO values"
         );
         assert!(s.eval::<bool>("return (GetItemInfo(2589)) == nil").unwrap());
-        assert_eq!(s.take_item_stat_asks(), vec![2589], "the ask was recorded");
+        assert_eq!(
+            s.take_item_stat_reads(),
+            vec![2589],
+            "the read was recorded"
+        );
+        assert!(s.take_item_stat_asks().is_empty(), "and no ask");
 
         s.set_item_template(
             2589,

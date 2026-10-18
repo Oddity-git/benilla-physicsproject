@@ -1,5 +1,5 @@
 //! The 1.12 surface as a gate: every global the engine puts in a bare VM is one the 1.12.1 client
-//! has (`reference/1.12-globals.tsv`) or a commented entry on [`BEYOND_1_12`], since addons branch
+//! has (`reference/lua_globals.tsv`) or a commented entry on [`BEYOND_1_12`], since addons branch
 //! on a global's presence; no prefix excuses an engine name, as a host seam belongs in Rust. The
 //! production load, core and layer, is `benilla-app`'s `ui_script::surface_gate`; what 1.12 has
 //! and benilla lacks is `scripts/api-coverage.sh`'s count.
@@ -9,25 +9,18 @@ use std::collections::HashSet;
 use super::common::script;
 
 /// Globals the engine exposes that 1.12 does not, each with its reason. The list is exact.
-const BEYOND_1_12: &[&str] = &[
-    // Our Lua runtime is 5.1 where 1.12's is 5.0: 1.12's base library does not export `_G` (an
-    // addon reaches the globals with `getfenv(0)`); ours does, as our `getglobal`/`setglobal` are
-    // written over it.
-    "_G",
-];
+const BEYOND_1_12: &[&str] = &[];
 
-/// `reference/1.12-globals.tsv`'s names.
+/// `reference/lua_globals.tsv`'s names.
 fn reference() -> HashSet<String> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../reference/1.12-globals.tsv"
+        "/../../reference/lua_globals.tsv"
     );
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        panic!("reading {path}: {e} — regenerate with scripts/gen-reference-globals.py")
-    });
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
     let names: HashSet<String> = text
         .lines()
-        .filter(|l| !l.starts_with('#'))
+        .skip(1)
         .filter_map(|l| l.split('\t').next().map(str::to_string))
         .collect();
     assert!(
@@ -339,7 +332,11 @@ fn region_shadow_accessors_round_trip_four_values() {
     let (r, g, b, a) = s
         .eval::<(f32, f32, f32, f32)>("return SHFText:GetShadowColor()")
         .unwrap();
-    assert_eq!((r, g, b, a), (0.0, 0.0, 0.0, 0.3), "the alpha survives");
+    assert_eq!(
+        (r, g, b, a),
+        (0.0, 0.0, 0.0, crate::color::quant::read32(0.3)),
+        "the alpha survives"
+    );
     assert_eq!(
         s.eval::<(f32, f32)>("return SHFText:GetShadowOffset()")
             .unwrap(),
@@ -350,7 +347,7 @@ fn region_shadow_accessors_round_trip_four_values() {
     assert_eq!(
         s.eval::<f32>("local _,_,_,a = SHFText:GetShadowColor() return a")
             .unwrap(),
-        0.3,
+        crate::color::quant::read32(0.3),
         "setting the offset alone keeps the colour"
     );
 }
@@ -388,7 +385,7 @@ fn region_set_parent_relinks_the_draw_owner_and_leaves_anchors_alone() {
     s.resolve();
     // A is [bottom 0, left 0, top 50, right 100]: TOPLEFT +(4,-4), 24x24 ⇒ 4..28 x 22..46.
     let before = tex_rect(&s, "SPGlow").expect("the spark draws under A");
-    assert_eq!(before, crate::layout::Rect::new(22.0, 4.0, 46.0, 28.0));
+    crate::assert_near!(before, crate::layout::Rect::new(22.0, 4.0, 46.0, 28.0));
 
     assert_eq!(
         s.arity("Spark:SetParent(B)").unwrap(),
@@ -494,7 +491,7 @@ fn button_set_font_returns_nothing_and_is_a_no_op_without_a_label() {
     assert_eq!(
         s.eval::<String>("local _, _, flags = SFBare:GetFont() return flags")
             .unwrap(),
-        "THICKOUTLINE"
+        "OUTLINE, THICKOUTLINE"
     );
     // Both arguments are required (`lua_isstring` + `lua_isnumber`, else the usage error).
     assert!(s.run(r#"SFBare:SetFont("Fonts\\SKURRI.TTF")"#).is_err());
@@ -537,10 +534,11 @@ fn button_set_font_returns_nothing_and_is_a_no_op_without_a_label() {
     );
 }
 
-/// FontString's `SetNonSpaceWrap`/`CanNonSpaceWrap` (`0x79e9f0`/`0x79ead0`): on by default, the
-/// getter answers `1` or nil, and a bare `SetNonSpaceWrap()` turns it on.
+/// FontString's `SetNonSpaceWrap`/`CanNonSpaceWrap` (`0x79e9f0`/`0x79ead0`): off from the
+/// constructor (`0x770dd3` stores `0x212`), the getter answers `1` or nil, and a bare
+/// `SetNonSpaceWrap()` turns it on.
 #[test]
-fn non_space_wrap_defaults_on_and_answers_one_or_nil() {
+fn non_space_wrap_defaults_off_and_answers_one_or_nil() {
     let s = crate::script::UiScript::new().unwrap();
     s.run(r#"f = CreateFrame("Frame", "NSF") fs = f:CreateFontString("NSFText", "ARTWORK")"#)
         .unwrap();
@@ -548,8 +546,16 @@ fn non_space_wrap_defaults_on_and_answers_one_or_nil() {
     assert_eq!(
         s.eval::<Option<i64>>("return NSFText:CanNonSpaceWrap()")
             .unwrap(),
+        None,
+        "off from the constructor, answered nil"
+    );
+
+    s.run("NSFText:SetNonSpaceWrap()").unwrap();
+    assert_eq!(
+        s.eval::<Option<i64>>("return NSFText:CanNonSpaceWrap()")
+            .unwrap(),
         Some(1),
-        "default on, answered as 1"
+        "a bare SetNonSpaceWrap() turns it ON, answered as 1"
     );
     assert!(
         !s.eval::<bool>("return NSFText:CanNonSpaceWrap() == true")
@@ -563,14 +569,6 @@ fn non_space_wrap_defaults_on_and_answers_one_or_nil() {
             .unwrap(),
         None,
         "off answers nil, not 0 and not false"
-    );
-
-    s.run("NSFText:SetNonSpaceWrap()").unwrap();
-    assert_eq!(
-        s.eval::<Option<i64>>("return NSFText:CanNonSpaceWrap()")
-            .unwrap(),
-        Some(1),
-        "a bare SetNonSpaceWrap() turns it ON"
     );
 }
 
@@ -696,7 +694,7 @@ fn editbox_font_block_return_shapes_are_the_shared_implementations() {
     assert_eq!(
         s.eval::<(f32, f32, f32, f32)>("return EBShape:GetShadowColor()")
             .unwrap(),
-        (0.0, 0.0, 0.0, 0.3)
+        (0.0, 0.0, 0.0, crate::color::quant::read32(0.3))
     );
     assert_eq!(
         s.eval::<(f32, f32)>("return EBShape:GetShadowOffset()")
@@ -744,7 +742,14 @@ fn the_dewdrop_editbox_font_shape_resolves_and_paints() {
     let (r, g, b, _) = s
         .eval::<(f32, f32, f32, f32)>("return DewdropEBFrame.editBox:GetTextColor()")
         .unwrap();
-    assert_eq!((r, g, b), (0.9, 0.9, 0.9));
+    assert_eq!(
+        (r, g, b),
+        (
+            crate::color::quant::read32(0.9),
+            crate::color::quant::read32(0.9),
+            crate::color::quant::read32(0.9)
+        )
+    );
 
     // `AceGUIWidget-Slider.lua:204-210` ends the same shape with this.
     s.run(r#"DewdropEBFrame.editBox:SetJustifyH("CENTER")"#)
@@ -886,7 +891,12 @@ fn set_desaturated_reports_shader_support_and_does_not_raise() {
         .eval::<(f32, f32, f32)>("return DsTex:GetVertexColor()")
         .unwrap();
     assert!(
-        (r - 0.65).abs() < 1e-6 && (g - 0.65).abs() < 1e-6 && (b - 0.65).abs() < 1e-6,
+        (r, g, b)
+            == (
+                crate::color::quant::read32(0.65),
+                crate::color::quant::read32(0.65),
+                crate::color::quant::read32(0.65)
+            ),
         "the shader arm keeps the caller's tint, got {r},{g},{b}"
     );
 

@@ -52,7 +52,9 @@ impl super::UiScript {
 
     /// The world-enter cascade's events (`0x4908c0`): `PLAYER_LOGIN` (270, `0x490959`) only if a
     /// load armed it (read at `0x49094b`, cleared at `0x49095e`), then `PLAYER_ENTERING_WORLD`
-    /// (272, `0x49096a`) every time. The cascade runs with the player object in the world, so its
+    /// (272, `0x49096a`) every time, then the minimap's zoom reseed
+    /// ([`Self::minimap_enter_world`]) and the quest log's rebuild and its `QUEST_LOG_UPDATE`
+    /// ([`Self::quest_log_enter_world`]). The cascade runs with the player object in the world, so its
     /// caller seats `"player"` first, and inside its own sound-suppression bracket (`0x4908d5` to
     /// `0x490a56`), so a handler's `PlaySound` is dropped.
     pub fn fire_world_enter(&mut self) {
@@ -62,6 +64,10 @@ impl super::UiScript {
             self.fire_event("PLAYER_LOGIN", Vec::new());
         }
         self.fire_event("PLAYER_ENTERING_WORLD", Vec::new());
+        // The calls after the signal, inside the bracket: the minimap initializer first
+        // (`0x49096f`), then among the rest the quest log's set-up (`0x4909a1`).
+        self.minimap_enter_world();
+        self.quest_log_enter_world();
         self.pop_sound_suppression();
     }
 }
@@ -81,6 +87,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         g.set(
             name,
             lua.create_function(move |lua, ()| {
+                // `ReloadUI` (`0x4884d0`) sets the reload byte only if `CGGameUI::Reload`'s gate
+                // (`0x491380`, tag 10) allows: a script's own call needs an input event, and is
+                // otherwise ignored with no message.
+                if request == SessionRequest::ReloadUi
+                    && !super::protected::gate(lua, super::protected::Tag::RELOAD)
+                {
+                    return Ok(());
+                }
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 model.session_requests.push(request);
                 Ok(())

@@ -3,7 +3,7 @@
 
 use bevy::prelude::*;
 
-use benilla_ui::script::sstr_to_int;
+use benilla_ui::script::s_str_to_int;
 
 use crate::net::ChatKind;
 
@@ -16,11 +16,13 @@ pub(crate) enum SendType {
     Whisper,
     Party,
     Raid,
+    /// `RAID` sent by the group leader (`0x49f3bf`); no token names it.
     RaidLeader,
     RaidWarning,
     Guild,
     Officer,
     Battleground,
+    /// `BATTLEGROUND` sent by the group leader (`0x49f48b`); no token names it.
     BattlegroundLeader,
     Afk,
     Dnd,
@@ -28,9 +30,10 @@ pub(crate) enum SendType {
 }
 
 impl SendType {
-    /// The `SendChatMessage` chat-type token; `None` for a made-up one, reported rather than sent
-    /// as SAY. `AFK` and `DND` are sends: types `0x14`/`0x15` carrying the away message, which the
-    /// server turns into the flag (vmangos `ChatHandler.cpp:611-648`).
+    /// The `SendChatMessage` chat-type token, one of [`benilla_ui::script::SEND_CHAT_TOKENS`]
+    /// (the table `0x49f7a0`); `None` for any other. `AFK` and `DND` are sends: types
+    /// `0x14`/`0x15` carrying the away message, which the server turns into the flag (vmangos
+    /// `ChatHandler.cpp:611-648`).
     pub(crate) fn from_token(token: &str) -> Option<SendType> {
         Some(match token {
             "SAY" => SendType::Say,
@@ -39,12 +42,10 @@ impl SendType {
             "WHISPER" => SendType::Whisper,
             "PARTY" => SendType::Party,
             "RAID" => SendType::Raid,
-            "RAID_LEADER" => SendType::RaidLeader,
             "RAID_WARNING" => SendType::RaidWarning,
             "GUILD" => SendType::Guild,
             "OFFICER" => SendType::Officer,
             "BATTLEGROUND" => SendType::Battleground,
-            "BATTLEGROUND_LEADER" => SendType::BattlegroundLeader,
             "AFK" => SendType::Afk,
             "DND" => SendType::Dnd,
             "CHANNEL" => SendType::Channel,
@@ -202,7 +203,7 @@ impl ChannelState {
     /// (`0x49be50`), and a hole, an out-of-range number or a suspended slot make the whole call a
     /// no-op (`None`). Anything else is already the wire name.
     pub(crate) fn leave_target(&self, arg: &str) -> Option<String> {
-        match sstr_to_int(arg) {
+        match s_str_to_int(arg) {
             0 => Some(arg.to_string()),
             n => self.confirmed_slot_name(n).map(str::to_string),
         }
@@ -212,7 +213,7 @@ impl ChannelState {
     /// `0x49be50`, with no name leg, so only a number naming a confirmed slot sends, and the
     /// packet carries that slot's name. Anything else, a name included, sends nothing.
     pub(crate) fn send_target(&self, arg: &str) -> Option<String> {
-        self.confirmed_slot_name(sstr_to_int(arg))
+        self.confirmed_slot_name(s_str_to_int(arg))
             .map(str::to_string)
     }
 

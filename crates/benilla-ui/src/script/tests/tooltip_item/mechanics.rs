@@ -54,7 +54,7 @@ fn bag_item_money_law_and_fallback() {
         r#"
         money_fired = nil
         local a = CreateFrame("Button", "Slot3"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetScript("OnTooltipAddMoney", function() local self = this money_fired = arg1 end)
         -- No merchant: no money handler fires.
         tt:SetOwner(a, "ANCHOR_RIGHT")
@@ -101,12 +101,17 @@ fn bag_item_money_law_and_fallback() {
     assert!(s.take_errors().is_empty());
 }
 
-/// A wrap line's first measure asks with the wrap column, so one pass answers the wrapped size,
-/// and the size holds while the hover clears and rebuilds the content every frame.
+/// A wrapped description is sized in the builder's show (`0x52e15c` → `0x530640`): split at 230.4
+/// into its widest piece, and the size holds while the hover clears and rebuilds the content every
+/// frame, measuring nothing past the first.
 #[test]
-fn wrap_lines_measure_wrapped_in_one_pass_and_survive_the_reenter_loop() {
+fn a_wrapped_description_sizes_in_the_show_and_survives_the_reenter_loop() {
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    s.set_text_measurer(Box::new(crate::script::tests::tooltip_size::Mono(
+        calls.clone(),
+    )));
     s.set_item_template(
         7,
         ItemTemplateView {
@@ -122,44 +127,26 @@ fn wrap_lines_measure_wrapped_in_one_pass_and_survive_the_reenter_loop() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot4"); a:SetPoint("TOPLEFT", 10, -10); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         SetItemByIdForTest(tt, 7)
     "#,
     )
     .unwrap();
+    // The stand-in engine's 5 per byte: the quoted description, 405 wide, splits at 230.4 into
+    // rows of 230 and 170, the first piece 235 with the space its wrap skipped (`0x530884`); name
+    // 14 + gap 2 + charges 12 + gap 2 + two rows of 12 + 2·10.24.
+    let size =
+        |s: &UiScript| -> (f64, f64) { s.eval("return TT:GetWidth(), TT:GetHeight()").unwrap() };
+    let want = (
+        f64::from(2.0 * 10.24f32 + 0.0 + 235.0),
+        f64::from(2.0 * 10.24f32 + 54.0),
+    );
+    let near = |(w, h): (f64, f64)| (w - want.0).abs() < 1e-4 && (h - want.1).abs() < 1e-4;
+    assert!(near(size(&s)), "sized in the show: {:?}", size(&s));
+    s.tick(0.016);
     s.resolve();
-    // One measure pass: the wrap-flagged description asks with the wrap column, others without.
-    let answer = |s: &mut UiScript| {
-        let reqs = s.fontstrings_needing_measure();
-        let answers: Vec<(u32, f32, f32, u64)> = reqs
-            .iter()
-            .map(|r| {
-                if r.text.starts_with('"') {
-                    assert_eq!(
-                        r.wrap_width,
-                        Some(crate::widget::TOOLTIP_WRAP_WIDTH),
-                        "a wrap line's FIRST ask carries the wrap column"
-                    );
-                    (r.id, 250.0, 36.0, r.key) // wrapped: 3 rows tall, inside the column
-                } else {
-                    (r.id, 60.0, 14.0, r.key)
-                }
-            })
-            .collect();
-        s.set_measured_text_unwrapped(&answers);
-        s.resolve();
-    };
-    answer(&mut s);
-    // name 14 + gap 2 + the charges line 14 + gap 2 + description 36 + 2·pad 20 = 88.
-    s.run(
-        r#"
-        assert(TT:GetWidth() == 270, "wrap column + padding, got " .. TT:GetWidth())
-        assert(TT:GetHeight() == 88, "wrap rows counted, got " .. TT:GetHeight())
-    "#,
-    )
-    .unwrap();
-    // Clear, rebuild and measure once per frame for three frames: the size holds.
+    let measured = calls.get();
     for _ in 0..3 {
         s.run(
             r#"
@@ -168,16 +155,11 @@ fn wrap_lines_measure_wrapped_in_one_pass_and_survive_the_reenter_loop() {
         "#,
         )
         .unwrap();
+        s.tick(0.016);
         s.resolve();
-        answer(&mut s);
-        s.run(
-            r#"
-            assert(TT:GetWidth() == 270 and TT:GetHeight() == 88,
-                   "re-enter holds the wrapped size, got " .. TT:GetWidth() .. "x" .. TT:GetHeight())
-        "#,
-        )
-        .unwrap();
+        assert!(near(size(&s)), "re-enter holds the size: {:?}", size(&s));
     }
+    assert_eq!(calls.get(), measured, "the re-enter loop re-measured");
     assert!(s.take_errors().is_empty());
 }
 
@@ -210,7 +192,7 @@ fn item_render_hides_the_unit_health_bar() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot6"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "GameTooltip"); tt:Hide()
+        local tt = CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate"); tt:Hide()
         local bar = CreateFrame("StatusBar", "GameTooltipStatusBar", tt)
         bar:SetPoint("TOPLEFT", tt, "BOTTOMLEFT", 2, -1); bar:SetWidth(100); bar:SetHeight(8)
         -- The stock default anchor owns the plate; an unowned one's show hides it.
@@ -270,7 +252,7 @@ fn real_instance_hover_renders_live_durability() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         tt:SetBagItem(0, 2)
         found = nil
@@ -329,7 +311,7 @@ fn broken_instance_hover_renders_zero_durability() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         tt:SetBagItem(0, 1)
         found = nil
@@ -399,7 +381,7 @@ fn an_enchanted_instance_renders_its_enchant_line_before_durability() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         tt:SetBagItem(0, 1)
     "#,
@@ -492,7 +474,7 @@ fn enchant_line_colour_is_per_slot_and_sign() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         tt:SetBagItem(0, 1)
     "#,
@@ -573,7 +555,7 @@ fn temporary_enchant_line_carries_its_countdown_and_charges() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         tt:SetBagItem(0, 1)
     "#,
@@ -651,7 +633,7 @@ fn a_looted_roll_shows_its_lines_and_never_the_placeholder() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         tt:SetLootItem(1)
     "#,
@@ -707,7 +689,7 @@ fn a_looted_item_with_no_roll_shows_neither_line_nor_placeholder() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         tt:SetLootItem(1)
     "#,
@@ -756,7 +738,7 @@ fn a_linked_roll_shows_its_lines_and_never_the_placeholder() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         tt:SetHyperlink("|cff1eff00|Hitem:8888:0:584:0|h[Bloodrazor of the Monkey]|h|r")
     "#,
@@ -799,7 +781,7 @@ fn random_property_template_hover_shows_the_placeholder() {
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(Slot, "ANCHOR_RIGHT")
         SetItemByIdForTest(tt, 8888)
     "#,
@@ -855,7 +837,7 @@ fn an_uncached_item_hides_and_un_owns_until_the_next_hover() {
         r#"
         shows = 0
         UncSlot = CreateFrame("Button", "UncSlot")
-        UncTip = CreateFrame("GameTooltip", "UncTip")
+        UncTip = CreateFrame("GameTooltip", "UncTip", nil, "TestTooltipTemplate")
         UncTip:SetScript("OnShow", function() shows = shows + 1 end)
         UncTip:SetOwner(UncSlot, "ANCHOR_RIGHT")
         SetItemByIdForTest(UncTip, 4242)

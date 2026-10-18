@@ -11,13 +11,16 @@ use crate::ui_pass::{UiQuad, UvRect};
 use super::engine::{GlyphRef, TextEngine};
 use super::markup::{fontstring_lines, ColorRun};
 
+mod breaks;
 mod measure;
 mod overflow;
 mod wrap;
+#[cfg(test)]
+mod wrap_laws;
 
 pub(crate) use measure::{
-    ellipsize_to_fit, line_advances, line_origin, line_rows, measure_text, measure_wrapped_rows,
-    string_width, unwrapped_height,
+    ellipsize_text, ellipsize_to_fit, line_advances, line_origin, line_rows, measure_text,
+    measure_wrapped_rows, string_width, unwrapped_height,
 };
 
 /// A rect this narrow is no wrap constraint: an unsized single-point `FontString` resolves to ~0.
@@ -55,6 +58,9 @@ pub(crate) struct FontSpec<'a> {
     /// The glyph outline: it picks the ring-and-fill cell and, for THICK only, the step law's
     /// extra `+1` (`GlyphStepBase` `0x5ca2b0`), so it changes measured width too.
     pub outline: Outline,
+    /// The `monochrome` flag: glyphs draw from the 1-bit raster and its bakes
+    /// ([`super::outline::mono_cell`]); widths do not change.
+    pub monochrome: bool,
     /// The gap between lines in logical px, scaled like [`Self::height`]; the line step adds it
     /// rounded up to a whole device pixel ([`line_gap`]).
     pub spacing: f32,
@@ -64,6 +70,13 @@ pub(crate) struct FontSpec<'a> {
     pub shadow_x: f32,
     /// The `SetAlphaGradient` reveal `(start, length)`; on the spec, shadows fade with their fill.
     pub alpha_gradient: Option<(f32, f32)>,
+    /// `nonspacewrap` (ui flag `0x1000`, the line kernel's flag `0x40`): a force-broken line then
+    /// leaves the next its first break opportunity, and the ellipsis fit walk goes on past it
+    /// (`0x5c76ea`-`0x5c76f5`, `0x5c22e8`-`0x5c22f5`).
+    pub non_space_wrap: bool,
+    /// `maxLines` (`+0x128`): the ellipsis fits the text into this many lines, with or without a
+    /// height (`0x771f0f`, `0x771f48`-`0x771f61`); 0 for none.
+    pub max_lines: u32,
 }
 
 /// The step law's bias over the whole-pixel advance ([`TextEngine::step`]): `+1` (glyph rasterizer
@@ -178,7 +191,7 @@ fn layout_text_quads_inner(
     let gradient = font.alpha_gradient;
     let r = measure::resolve(e, &font);
     // One pass fills the caches, as `AllGlyphsCached` (`0x5c9fa0`); the layout below is lookups.
-    e.ensure_str(r.face, r.ppem, r.radius, text);
+    e.ensure_str(r.face, r.ppem, r.bake, text);
     let e = &*e;
     let dpi = e.dpi();
     let sheet = e.sheet_image();
@@ -195,7 +208,7 @@ fn layout_text_quads_inner(
     // Wrap only within a pinned width; `rect` is in the pen's own space, so no conversion. Each
     // row keeps the source character after it, which prices its last glyph for the justify.
     let mut render_lines: Vec<(Vec<ColorRun>, Option<char>)> = if rect.width() > WRAP_MIN_WIDTH {
-        measure::wrap_rows(e, r, &lines, rect.width())
+        measure::wrap_rows(e, r, &lines, rect.width(), font.non_space_wrap)
     } else {
         lines.into_iter().map(|line| (line, None)).collect()
     };
@@ -281,7 +294,7 @@ fn layout_text_quads_inner(
                     color[3] *= gradient_alpha(char_index, start, length);
                 }
                 for g in &cc.glyphs {
-                    if let Some(info) = e.cell(r.face, r.ppem, r.radius, g.glyph_id) {
+                    if let Some(info) = e.cell(r.face, r.ppem, r.bake, g.glyph_id) {
                         pending.push(PendingGlyph {
                             x_dev: pen_dev + info.bearing_x,
                             y_dev: g.y_off - info.bearing_top,
@@ -432,9 +445,12 @@ mod measure_fits_render {
             path: Some(FACE),
             height: Some(h),
             outline: Outline::None,
+            monochrome: false,
             spacing: 0.0,
             shadow_x: 0.0,
             alpha_gradient: None,
+            non_space_wrap: false,
+            max_lines: 0,
         }
     }
 
@@ -457,8 +473,7 @@ mod measure_fits_render {
                     let r = measure::resolve(&mut e, &s);
                     e.ensure_metrics(r.face, r.ppem, label);
                     let runs = parse_markup(label, [1.0, 1.0, 1.0, 1.0]);
-                    let line = runs.first().expect("one line");
-                    let rows = measure::wrap_line(&e, r, line, measured);
+                    let rows = measure::wrap_lines(&e, r, &runs, measured, false, usize::MAX).rows;
                     assert_eq!(
                         rows.len(),
                         1,
@@ -495,14 +510,16 @@ mod measure_fits_render {
             ] {
                 e.ensure_metrics(r.face, r.ppem, title);
                 e.ensure_metrics(r.face, r.ppem, "...");
-                // The cap bites: uncapped the title is one line, capped it needs more.
+                let own = measure_text(&mut e, title, None, s).0;
+                // The cap bites: in its own measured width, indent included (`0x5c7470` skips no
+                // leading whitespace), the title is one line; capped it needs more.
                 assert_eq!(
-                    measure::wrapped_rows_for_test(&e, r, title, 275.0),
+                    measure::wrapped_rows_for_test(&e, r, title, own, true),
                     1,
                     "{title:?} fits the uncapped row"
                 );
                 assert!(
-                    measure::wrapped_rows_for_test(&e, r, title, cap) > 1,
+                    measure::wrapped_rows_for_test(&e, r, title, cap, true) > 1,
                     "{title:?} must overflow the {cap}px cap for this test to mean anything"
                 );
                 // The line stack: a 10-tall box emits one line whatever the wrap says.
@@ -515,7 +532,7 @@ mod measure_fits_render {
                 let cap_rows = overflow::lines_fitting(BOX_H.max(r.size), r.size, r.gap) + 1;
                 let display =
                     overflow::ellipsize_in_box(title, BOX_H, r.size, r.gap, |candidate| {
-                        measure::wrapped_rows_capped_for_test(&e, r, candidate, cap, cap_rows)
+                        measure::fit_rows_for_test(&e, r, candidate, cap, cap_rows, true)
                     })
                     .unwrap_or_else(|| panic!("{title:?} at cap {cap} must ellipsize"));
                 assert!(
@@ -523,7 +540,7 @@ mod measure_fits_render {
                     "the truncation marker is three dots, got {display:?}"
                 );
                 assert_eq!(
-                    measure::wrapped_rows_for_test(&e, r, &display, cap),
+                    measure::wrapped_rows_for_test(&e, r, &display, cap, true),
                     1,
                     "{display:?} must fit the row's single line at cap {cap}"
                 );
@@ -644,8 +661,8 @@ mod measure_fits_render {
     }
 
     /// One line is one baseline at every DPI, size and seat, where rounding each glyph's own sum
-    /// splits half-pixel ties by bearing at a fractional DPI. FRIZQT's hinted cells all end on the
-    /// baseline (`px_h == bearing_top` at every ppem 8..64), so one baseline is one `rect.max.y`.
+    /// splits half-pixel ties by bearing at a fractional DPI. A glyph's baseline is its quad's top
+    /// plus its cell's `bearing_top`; the unhinted `o`, `C` and `b` overshoot it below.
     #[test]
     fn one_line_is_one_baseline_at_every_dpi() {
         let Some(mut e) = test_engine(1.0) else {
@@ -656,6 +673,18 @@ mod measure_fits_render {
             e.set_dpi_for_test(dpi);
             for base in [10.0f32, 12.0, 13.0, 14.0, 16.0, 18.0, 20.0] {
                 let s = spec(base * ERA);
+                // Each letter's `bearing_top`, in quad order: every letter of "Combat" has ink.
+                let r = measure::resolve(&mut e, &s);
+                e.ensure_str(r.face, r.ppem, r.bake, "Combat");
+                let tops: Vec<f32> = "Combat"
+                    .chars()
+                    .map(|c| {
+                        let g = e.char_cell(r.face, r.ppem, c).expect("shaped").glyphs[0];
+                        e.cell(r.face, r.ppem, r.bake, g.glyph_id)
+                            .expect("inked")
+                            .bearing_top
+                    })
+                    .collect();
                 // A quarter-pixel walk, as a scaled frame's text takes every offset.
                 for step in 0..320 {
                     let top = step as f32 * 0.25;
@@ -673,14 +702,10 @@ mod measure_fits_render {
                         s,
                         TextSeat::UiGrid,
                     );
-                    let lo = quads
-                        .iter()
-                        .map(|q| q.rect.max.y)
-                        .fold(f32::INFINITY, f32::min);
-                    let hi = quads
-                        .iter()
-                        .map(|q| q.rect.max.y)
-                        .fold(f32::NEG_INFINITY, f32::max);
+                    assert_eq!(quads.len(), tops.len());
+                    let baselines = quads.iter().zip(&tops).map(|(q, t)| q.rect.min.y + t / dpi);
+                    let lo = baselines.clone().fold(f32::INFINITY, f32::min);
+                    let hi = baselines.fold(f32::NEG_INFINITY, f32::max);
                     assert!(
                         (hi - lo) * dpi < 1e-3,
                         "dpi {dpi}, height {base}, seat {top}: the letters of \"Combat\" \
@@ -755,6 +780,7 @@ mod measure_fits_render {
             ] {
                 let s = FontSpec {
                     outline,
+                    monochrome: false,
                     shadow_x,
                     ..spec(16.0 * ERA)
                 };
@@ -954,9 +980,12 @@ mod ellipsis_cost {
             path: Some(FACE),
             height: Some(SIZE),
             outline: Outline::None,
+            monochrome: false,
             spacing: 0.0,
             shadow_x: 0.0,
             alpha_gradient: None,
+            non_space_wrap: false,
+            max_lines: 0,
         };
         let r = measure::resolve(&mut e, &s);
         let fits = overflow::lines_fitting(BOX_H, r.size, r.gap);
@@ -965,7 +994,7 @@ mod ellipsis_cost {
             let text = page_body(page);
             e.ensure_metrics(r.face, r.ppem, &text);
             e.ensure_metrics(r.face, r.ppem, "...");
-            let full = measure::wrapped_rows_for_test(&e, r, &text, BOX_W);
+            let full = measure::wrapped_rows_for_test(&e, r, &text, BOX_W, false);
             eprintln!(
                 "[ellipsis-cost] {label:<11} {:>4} chars -> {full:>2} rows in a {fits}-row box",
                 text.chars().count(),
@@ -981,7 +1010,7 @@ mod ellipsis_cost {
                 let got = overflow::ellipsize_in_box(&text, BOX_H, r.size, r.gap, |candidate| {
                     probes.set(probes.get() + 1);
                     chars.set(chars.get() + candidate.chars().count());
-                    measure::wrapped_rows_capped_for_test(&e, r, candidate, BOX_W, cap)
+                    measure::fit_rows_for_test(&e, r, candidate, BOX_W, cap, false)
                 });
                 let us = t.elapsed().as_secs_f64() * 1e6;
                 eprintln!(

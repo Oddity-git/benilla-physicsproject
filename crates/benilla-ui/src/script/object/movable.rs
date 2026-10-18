@@ -89,11 +89,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
                 };
                 let (Some(w), Some(hgt)) = (num(&pair.0), num(&pair.1)) else {
                     let model = lua.app_data_ref::<Model>().expect("model");
-                    let who = model
-                        .arena
-                        .frame(h)
-                        .and_then(|f| f.name.clone())
-                        .unwrap_or_else(|| "<unnamed>".to_string());
+                    let who = crate::script::binding_abi::frame_name(&model, h);
                     let (verb, a, b) = if upper {
                         ("SetMaxResize", "maxWidth", "maxHeight")
                     } else {
@@ -246,14 +242,10 @@ fn get_flag(lua: &Lua, this: &Table, which: Flag) -> mlua::Result<Value> {
     ))
 }
 
-/// The family's refusal, naming the frame as the reference does. The wording is ours: the strings
-/// at `0x879810`, `0x879828` and `0x879844` are unread, known only by their symbol names.
+/// The family's refusal: `Frame %s is not movable` (`0x879810`), `… resizable` (`0x879828`) or
+/// `… movable or resizable` (`0x879844`, `SetUserPlaced`), naming the frame (`0x77679b`).
 fn not_flagged(model: &Model, h: FrameHandle, want: &str) -> mlua::Error {
-    let who = model
-        .arena
-        .frame(h)
-        .and_then(|f| f.name.clone())
-        .unwrap_or_else(|| "<anonymous>".into());
+    let who = crate::script::binding_abi::frame_name(model, h);
     mlua::Error::runtime(format!("Frame {who} is not {want}"))
 }
 
@@ -314,7 +306,7 @@ pub(crate) fn start_layout_drag(
 /// `0x7653ab`). None when the frame has no rect (`0x765379`).
 fn grid_grip(model: &mut Model, h: FrameHandle, (x, y): (f32, f32)) -> Option<Point> {
     UiScript::resolve_layout(model);
-    let r = *model.resolved.get(&h)?;
+    let r = model.frame_rect(h)?;
     let dx = f64::from(x) - f64::from(r.left);
     let quarter_w = (f64::from(r.right) - f64::from(r.left)) * 0.25;
     let dy = f64::from((f64::from(y) - f64::from(r.bottom)) as f32);
@@ -385,7 +377,7 @@ fn pin_top_left(
     travel: (f32, f32),
 ) -> Option<bool> {
     UiScript::resolve_layout(model);
-    let r = *model.resolved.get(&h)?;
+    let r = model.frame_rect(h)?;
     let root = model.screen;
     let scale = f64::from(eff_scale(model, h));
     let inv = 1.0 / scale;

@@ -841,7 +841,7 @@ fn the_inheritable_reference_templates_confer_their_shape() {
     .unwrap();
     s.resolve();
 
-    assert_eq!(
+    benilla_ui::assert_near!(
         s.eval::<(f64, f64)>("return BuffProbe:GetWidth(), BuffProbe:GetHeight()")
             .unwrap(),
         (21.0, 21.0),
@@ -857,7 +857,7 @@ fn the_inheritable_reference_templates_confer_their_shape() {
         "the tooltip script comes with the template"
     );
 
-    assert_eq!(
+    benilla_ui::assert_near!(
         s.eval::<(f64, f64)>("return MicroProbe:GetWidth(), MicroProbe:GetHeight()")
             .unwrap(),
         (29.0, 58.0)
@@ -1932,6 +1932,66 @@ fn the_stock_options_windows_load_and_save_are_reachable_for_addons() {
     assert!(
         (yaw - 180.0).abs() < 0.001 && (pitch - 90.0).abs() < 0.001,
         "_Save should write the slider's 180 and its half; got yaw={yaw} pitch={pitch}"
+    );
+}
+
+/// `GetCVar`, `SetCVar` and `GetCVarDefault` raise on a name no CVar has (`0x488be7`, `0x488c53`,
+/// `0x488d37`), so every name the stock interface's files spell out must be registered, whether
+/// or not a branch that names it runs.
+#[test]
+fn every_cvar_name_the_stock_interface_spells_out_is_registered() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let registered: std::collections::HashSet<String> = crate::cvars::registered_pairs()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
+    let toc = super::reference_ui::core().expect("the stock FrameXML.toc");
+    let mut queue: Vec<String> = toc.toc.files.clone();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unregistered = Vec::new();
+    let mut spelled = 0;
+    while let Some(file) = queue.pop() {
+        if !seen.insert(file.replace('/', "\\").to_ascii_lowercase()) {
+            continue;
+        }
+        let Some(bytes) = super::reference_ui::read(&file) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        for chunk in text.split('<').skip(1) {
+            let tag = chunk.split('>').next().unwrap_or("").trim_start();
+            if tag.starts_with("Include") || tag.starts_with("Script") {
+                if let Some(name) = tag
+                    .split("file=\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                {
+                    queue.push(format!(r"Interface\FrameXML\{name}"));
+                }
+            }
+        }
+        for verb in ["GetCVar(", "SetCVar(", "GetCVarDefault("] {
+            for at in text.match_indices(verb).map(|(i, _)| i) {
+                // Only a call that spells its name out: a word boundary before, a literal after.
+                let before = text[..at].chars().next_back();
+                if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let rest = text[at + verb.len()..].trim_start();
+                let Some(rest) = rest.strip_prefix('"') else {
+                    continue;
+                };
+                let name = rest.split('"').next().unwrap_or("");
+                spelled += 1;
+                if !registered.contains(&name.to_ascii_lowercase()) {
+                    unregistered.push(format!("{name} ({file})"));
+                }
+            }
+        }
+    }
+    assert!(spelled > 40, "the walk found only {spelled} spelled names");
+    assert!(
+        unregistered.is_empty(),
+        "the stock interface names CVars the client does not register: {unregistered:?}"
     );
 }
 

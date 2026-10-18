@@ -1,61 +1,42 @@
-//! The UI session's lifecycle, all edges and nothing per-frame: `Startup` installs a boot VM
-//! (strings and emote tokens), or the stock glue screens' VM under `WOW_GLUE_STOCK=1`; world entry
-//! builds a fresh VM and loads the in-game UI and every addon onto it; leaving the world runs the
-//! reference's shutdown tail and installs the glue-side VM again; `ReloadUI()` is the two edges
+//! The UI session's lifecycle, all edges and nothing per-frame: `Startup` installs the glue
+//! screens' VM; world entry builds a fresh VM and loads the in-game UI and every addon onto it;
+//! leaving the world runs the reference's shutdown tail and installs the glue VM again; `ReloadUI()` is the two edges
 //! back to back without leaving the world.
 
 use bevy::prelude::*;
 
-use benilla_assets::LockRecover;
+use benilla_assets::{LockRecover, LooseOpen};
 use benilla_ui::script::{GlueNotice, UiScript};
+use benilla_world::frame_pace::FrameStep;
 
 use super::manifest::silenced_ui_load;
 use super::{load_ingame_ui, CursorPayloadHeld, PlayerUiHover, UiClock, UiKeyboardCapture};
 use crate::ui_script::addons;
 
 pub(crate) fn setup_script(world: &mut World) {
-    install_glue_side_vm(world, super::glue::GlueScreen::Login);
+    install_glue_side_vm(world, super::glue::GlueScreen::Login.key());
 }
 
-/// Install the VM the world holds outside the world: the stock glue screens' under
-/// [`super::glue::GlueStock`], put up on `screen`, else a boot VM.
-///
-/// The IO thread's roster policy follows the VM that is up: the screen asks for its roster only
-/// when the stock glue VM was built and its character select screen loaded, so a run whose stock VM failed to build (logged as an error
-/// by [`new_vm`]) falls back to the park's own enumeration instead of waiting on a screen that
-/// never asks.
-fn install_glue_side_vm(world: &mut World, screen: super::glue::GlueScreen) {
-    let stock_asked = world
-        .get_resource::<super::glue::GlueStock>()
-        .is_some_and(|s| s.0);
-    let stock_up = if stock_asked {
-        install_glue_vm(world, screen)
-    } else {
-        install_boot_vm(world);
-        false
-    };
-    if stock_asked && !stock_up {
-        error!("ui_script: WOW_GLUE_STOCK=1 but the stock glue VM did not come up with its character select screen; the roster is fetched at the park");
-    }
-    if let Some(policy) = world.get_resource::<crate::net::RosterPolicy>() {
-        policy
-            .0
-            .store(stock_up, std::sync::atomic::Ordering::SeqCst);
+/// Install the VM the world holds outside the world: the glue screens', put up on the screen
+/// named `screen`. A glue whose select screen did not load (logged as an error by [`new_vm`] or
+/// the load) asks for no roster, and nothing else does.
+pub(super) fn install_glue_side_vm(world: &mut World, screen: &str) {
+    if !install_glue_vm(world, screen) {
+        error!("ui_script: the glue VM did not come up with its character select screen");
     }
 }
 
-/// Build and install a boot VM, the one the world holds outside an in-game UI session: the
-/// strings the feeds resolve lines from and the emote tokens `/`-commands are built from
-/// (`ui_chat::commands`), no frames and no font objects. Installed at `Startup` and at every
-/// [`end_ui_session`], unless the stock glue screens stand there instead ([`install_glue_vm`]).
+/// Build and install a boot VM, the one a `ReloadUI()` holds between its teardown and its load:
+/// the strings the feeds resolve lines from and the emote tokens `/`-commands are built from
+/// (`ui_chat::commands`), no frames and no font objects.
 fn install_boot_vm(world: &mut World) {
     if let Some(script) = strings_vm(world) {
         world.insert_non_send_resource(script);
     }
 }
 
-/// A boot VM's contents on a VM of their own: `GlobalStrings.lua` and the emote tokens, for a
-/// reader that needs them where the world holds the glue VM. `None` (the world's VM removed) when
+/// A boot VM: `GlobalStrings.lua` and the emote tokens, for a reader that needs them where the
+/// world holds the glue VM. `None` (the world's VM removed) when
 /// the VM cannot start.
 pub(crate) fn strings_vm(world: &mut World) -> Option<UiScript> {
     let script = new_vm(world, UiScript::new)?;
@@ -66,19 +47,20 @@ pub(crate) fn strings_vm(world: &mut World) -> Option<UiScript> {
 
 /// Build the glue VM, load the stock GlueXML onto it, install it and put `screen` up: the glue
 /// builder `0x46a7b0` then `SET_GLUE_SCREEN` (`0x402b65` at startup, `0x402090` back from the
-/// world). It holds what the glue state holds and nothing of the boot VM's: no `GlobalStrings.lua`,
+/// world). It holds what the glue state holds and nothing of a boot VM's: no `GlobalStrings.lua`,
 /// no emote tokens.
-fn install_glue_vm(world: &mut World, screen: super::glue::GlueScreen) -> bool {
+fn install_glue_vm(world: &mut World, screen: &str) -> bool {
     let Some(mut script) = new_vm(world, UiScript::new_glue) else {
         return false;
     };
+    // The build's size and aspect, and its clear of a pending rebuild (`0x46a7e0`, `0x46a81c`).
+    super::glue::glue_built(world);
     seat_raster_seam_for_load(world, &mut script);
     // The CVar table before the load and the first screen, as the in-game build seeds its own:
     // this VM is born before `cvars::sync_cvars`'s per-VM seed, and the character screen's
     // `OnShow` names the realm `GetServerName` reads off `realmName` (`0x46d289`).
     if let Some(cvars) = world.get_resource::<crate::cvars::Cvars>() {
-        script.set_cvar_saved_base(cvars.orphans());
-        script.seed_cvars(cvars.vm_seed());
+        cvars.seed_vm(&mut script);
     }
     seed_agreements(world, &mut script);
     let start = std::time::Instant::now();
@@ -87,11 +69,14 @@ fn install_glue_vm(world: &mut World, screen: super::glue::GlueScreen) -> bool {
     start_server_alert(world, &script);
     // What the glue carries across its rebuild, in place before the screen's `OnShow` reads it.
     super::glue_mgr::seat_glue_build(world, &mut script);
-    super::glue::set_glue_screen(&mut script, screen);
+    // `SetCurrentScreen`'s buffer is the client's (`[0xb41478]`) and outlives the Lua state: a
+    // rebuild signals what it holds (`0x46b9a2`), and the screen's handler writes the same name.
+    script.set_glue_screen_name(screen);
+    super::glue::signal_glue_screen(&mut script, screen);
     info!(
         "ui_script: stock glue up in {:.0} ms on \"{}\" ({} load failure(s))",
         start.elapsed().as_secs_f32() * 1000.0,
-        screen.key(),
+        screen,
         failures.len()
     );
     // Up means the screen that asks for the roster exists: the stock files loaded far enough to
@@ -137,6 +122,11 @@ fn new_vm<E: std::fmt::Display>(
     world: &mut World,
     make: fn() -> Result<UiScript, E>,
 ) -> Option<UiScript> {
+    // The client globals the VM holds that no rebuild resets: `[0xcf4d24]`, written only by
+    // `SetEuropeanNumbers` (`0x771c40`), outlives a `ReloadUI` and a logout.
+    let european_numbers = world
+        .get_non_send_resource::<UiScript>()
+        .is_some_and(UiScript::european_numbers);
     let mut script = match make() {
         Ok(s) => s,
         Err(e) => {
@@ -145,55 +135,63 @@ fn new_vm<E: std::fmt::Display>(
             return None;
         }
     };
+    script.set_european_numbers(european_numbers);
+    // `[0xc0e080]`, which start-up sets once from `Wow.ini`, so every VM answers `GetLocale` alike.
+    script.set_locale(super::client_locale().index());
+    // `[0x882730]`, `Wow.ini`'s `Region`, read once alike and handed to the name check.
+    script.set_client_region(super::client_region());
     seed_vm_clock(world, &mut script);
+    // The reference seeds `rand` with the clock before `WinMain` (`0x5b800b`). Deviation: a
+    // capture run (`scenario_active`) keeps the CRT's default seed, 1, so its frames reproduce.
+    if crate::run_mode::scenario_active() {
+        script.lua().srand(1);
+    }
     install_addon_asset_resolvers(world, &mut script);
     info!("ui_script: new VM, session {}", script.session());
     Some(script)
 }
 
 /// Start the new VM's `GetTime()` where the process already is and re-anchor [`UiClock`] to it,
-/// both off the `Time<Real>` it anchors on. The reference's `GetTime` is `GetTickCount` × 0.001
+/// both off the [`FrameStep`] the VM ticks on, before this frame's step: every VM is built ahead
+/// of the frame's tick (`Startup`, `PreUpdate`, a state edge), which then adds the step. The reference's `GetTime` is `GetTickCount` × 0.001
 /// (`0x515ea0`, via `0x42c010` → `0x42b790`), an OS clock that never restarts; ours lives in the
 /// VM, rebuilt at every login and `ReloadUI`, and a clock back at zero puts every converted
 /// cooldown start in the past, which stock `CooldownFrame_SetTimer` hides (`Cooldown.lua:3`).
 fn seed_vm_clock(world: &mut World, script: &mut UiScript) {
-    let (anchor, elapsed) = world
-        .get_resource::<Time<bevy::time::Real>>()
-        .map_or_else(Default::default, |t| {
-            (t.last_update(), t.elapsed_secs_f64())
-        });
-    script.set_now(elapsed);
+    let (anchor, now) = world
+        .get_resource::<FrameStep>()
+        .copied()
+        .unwrap_or_default()
+        .before_step();
+    script.set_now(now);
     if let Some(mut clock) = world.get_resource_mut::<UiClock>() {
         *clock = UiClock {
-            anchor: anchor.unwrap_or_else(std::time::Instant::now),
-            ui_now: elapsed,
+            anchor,
+            ui_now: now,
         };
     }
 }
 
-/// Wire `Interface\AddOns\` art and fonts: the decoder's loose-file root and the VM's texture,
-/// size and font probes, so the path forms of `SetTexture` and `SetFont` answer the reference's
-/// 1|nil load verdict, and a region with no authored size on an axis takes it from its art as the
-/// client's virtual size getters do. Each probe resolves [`addons::root`] through the store its
-/// renderer reads, so the answer is what draws; they test existence, not decode.
+/// Wire the loose files into art and fonts: the decoder's AddOns folder, beside the install's
+/// index it already reads, and the VM's texture, size and font probes, so the path forms of
+/// `SetTexture` and `SetFont` answer the reference's 1|nil load verdict, and a region with no
+/// authored size on an axis takes it from its art as the client's virtual size getters do. Each
+/// probe resolves through the store and the open its renderer reads (an interface texture's,
+/// [`LooseOpen::Index`], and a font face's, [`LooseOpen::BareNameFirst`]), so the answer is what
+/// draws; they test existence, not decode.
 fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
-    let root = addons::root();
     let Some(mut assets) = world.get_resource_mut::<benilla_assets::WorldAssets>() else {
         return;
     };
-    assets.set_loose_addon_root(root.clone());
+    assets.set_loose_addon_root(addons::root());
+    let loose = assets.loose().clone();
     let chain = assets.chain.clone();
     let size_chain = chain.clone();
-    let size_root = root.clone();
+    let size_loose = loose.clone();
     let font_chain = chain.clone();
-    let font_root = root.clone();
+    let font_loose = loose.clone();
     script.set_texture_probe(Box::new(move |path| {
-        benilla_assets::sprite_candidates(path).iter().any(|c| {
-            chain.lock_recover().contains(c)
-                || root
-                    .as_deref()
-                    .is_some_and(|r| benilla_assets::loose_addon_file(r, c).is_some())
-        })
+        benilla_assets::sprite_found(&chain, &loose, path)
     }));
     // Keyed by the path exactly as the region carries it, so a hit allocates nothing (this is
     // asked per zero-size textured region per layout pass); misses are cached too.
@@ -203,11 +201,11 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
         if let Some(cached) = sizes.borrow().get(path) {
             return *cached;
         }
-        let measured = benilla_assets::sprite_dimensions(&size_chain, size_root.as_deref(), path);
+        let measured = benilla_assets::sprite_dimensions(&size_chain, &size_loose, path);
         sizes.borrow_mut().insert(path.to_string(), measured);
         measured
     }));
-    // Existence over the same two stores, in the same order, as `ui_text::engine`'s face loader,
+    // Existence over the same stores, in the same order, as `ui_text::engine`'s face loader,
     // memoised because a path's answer cannot change and an addon may call `SetFont` every frame.
     let seen: std::cell::RefCell<std::collections::HashMap<String, bool>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
@@ -215,13 +213,20 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
         if let Some(&cached) = seen.borrow().get(path) {
             return cached;
         }
-        let found = font_chain.lock_recover().contains(path)
-            || font_root.as_deref().is_some_and(|r| {
-                benilla_assets::loose_addon_file(r, &benilla_assets::normalize_path(path)).is_some()
-            });
+        let found = font_found(&font_chain, &font_loose, path);
         seen.borrow_mut().insert(path.to_string(), found);
         found
     }));
+}
+
+/// Whether a font face's open of `path` finds a file: the loose files by bare name first, then the
+/// chain, as `ui_text::engine`'s face loader reads them.
+pub(super) fn font_found(
+    chain: &std::sync::Mutex<benilla_formats::Chain>,
+    loose: &benilla_assets::LooseFiles,
+    path: &str,
+) -> bool {
+    loose.find(path, LooseOpen::BareNameFirst).is_some() || chain.lock_recover().contains(path)
 }
 
 /// Whether this run wants the player UI: always outside a capture, and in one only when opted in
@@ -239,15 +244,15 @@ fn ui_wanted(world: &World) -> bool {
 #[derive(Resource, Default)]
 pub(crate) struct PendingEntryUiLoad;
 
-/// The boot VM, parked between the world-entry edge and the deferred load, out of every feed's
+/// The glue VM, parked between the world-entry edge and the deferred load, out of every feed's
 /// reach: each feed takes the VM as an `Option` and returns on `None`.
-pub(crate) struct ParkedBootVm(UiScript);
+pub(crate) struct ParkedGlueVm(UiScript);
 
-/// `OnEnter(InWorld)`: arm the deferred entry load and park the boot VM.
+/// `OnEnter(InWorld)`: arm the deferred entry load and park the glue VM.
 pub(crate) fn arm_entry_ui_load(world: &mut World) {
     world.insert_resource(PendingEntryUiLoad);
     if let Some(vm) = world.remove_non_send_resource::<UiScript>() {
-        world.insert_non_send_resource(ParkedBootVm(vm));
+        world.insert_non_send_resource(ParkedGlueVm(vm));
     }
 }
 
@@ -260,14 +265,15 @@ pub(crate) fn arm_entry_ui_load(world: &mut World) {
 /// `GlobalStrings.lua` and `Fonts.xml` as its first rows, and `ChatFrame.lua` the emote tokens.
 fn mint_entry_vm(world: &mut World) {
     crate::cvars::fold_dying_vm_cvars(world);
-    if let Some(script) = new_vm(world, UiScript::new) {
+    if let Some(mut script) = new_vm(world, UiScript::new) {
+        crate::ui_macro::install_icon_source(world, &mut script);
         world.insert_non_send_resource(script);
     }
 }
 
-/// Put the parked boot VM back into the world, if one is parked.
-fn unpark_boot_vm(world: &mut World) {
-    if let Some(ParkedBootVm(vm)) = world.remove_non_send_resource::<ParkedBootVm>() {
+/// Put the parked glue VM back into the world, if one is parked.
+fn unpark_glue_vm(world: &mut World) {
+    if let Some(ParkedGlueVm(vm)) = world.remove_non_send_resource::<ParkedGlueVm>() {
         world.insert_non_send_resource(vm);
     }
 }
@@ -284,9 +290,10 @@ fn unpark_boot_vm(world: &mut World) {
 /// parks the VM runs at the next frame's `StateTransition`; the `InWorld` term covers that frame.
 pub(crate) fn ingame_ui_up(
     pending: Option<Res<PendingEntryUiLoad>>,
-    state: Option<Res<State<crate::char_select::ClientState>>>,
+    state: Option<Res<State<crate::client_state::ClientState>>>,
 ) -> bool {
-    pending.is_none() && state.is_some_and(|s| *s.get() == crate::char_select::ClientState::InWorld)
+    pending.is_none()
+        && state.is_some_and(|s| *s.get() == crate::client_state::ClientState::InWorld)
 }
 
 /// `PreUpdate`, after [`run_pending_reload`] so a reload never interleaves an armed entry load:
@@ -299,13 +306,13 @@ pub(crate) fn run_pending_entry_load(world: &mut World) {
         return;
     }
     let in_world = *world
-        .resource::<State<crate::char_select::ClientState>>()
+        .resource::<State<crate::client_state::ClientState>>()
         .get()
-        == crate::char_select::ClientState::InWorld;
+        == crate::client_state::ClientState::InWorld;
     if !in_world {
         // Left the world before the load ran: nothing to build a UI for.
         world.remove_resource::<PendingEntryUiLoad>();
-        unpark_boot_vm(world);
+        unpark_glue_vm(world);
         return;
     }
     let covering = world
@@ -349,9 +356,9 @@ fn seat_raster_seam_for_load(world: &mut World, script: &mut UiScript) {
     };
     let s = super::seam_scale(h);
     if w > 0.0 && h > 0.0 {
-        // The VM lives in a 768-tall root, so logical size over the seam scale is its screen. No
+        // The VM lives in a 768-tall root, `768·a` wide for the window's aspect `a`. No
         // `UIParent_ManageFramePositions` here, unlike `tick_script`: nothing is laid out yet.
-        script.set_screen_size(w / s, h / s);
+        script.set_window_size(w, h);
     }
     let Some(atlas) = world.get_resource::<crate::ui_text::UiFontAtlas>() else {
         return;
@@ -377,6 +384,18 @@ enum LoadSeat {
 /// state edge because the initial transition runs after `PostStartup`: a capture booting straight
 /// into `InWorld` still loads after [`benilla_assets::AssetSet::Open`].
 pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
+    // Before the load, as `0x48f590` runs before `0x48fbf0`: an addon's file scope sets the mask
+    // after it, and a `/reload` never takes this step.
+    crate::minimap::restore_default_mask(world);
+    // `InitializeGame` arms the play-time warning before it jumps to `UI_Init` (`0x48f636`-`0x48f681`).
+    crate::ui_billing::arm_at_world_entry(world);
+    // `InitializeGame` flags the world session's read-only rows whether or not a UI then loads
+    // (`0x48f566`-`0x48f584`); `end_ui_session` is `ShutdownGame`'s clear. A `/reload` keeps them.
+    if let Some(mut cvars) = world.get_resource_mut::<crate::cvars::Cvars>() {
+        for name in benilla_ui::script::IN_WORLD_READ_ONLY_CVARS {
+            cvars.set_read_only(name, true);
+        }
+    }
     load_ingame_ui_seated(world, LoadSeat::Roster);
 }
 
@@ -384,7 +403,7 @@ pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
 fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     // The parked VM goes back into the world, where the CVar fold reads it; a reload has none
     // parked and uses the live one.
-    unpark_boot_vm(world);
+    unpark_glue_vm(world);
     if !ui_wanted(world) {
         return;
     }
@@ -395,12 +414,12 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     };
     // The character whose AddOn enable state gates which addons run.
     let identity = world
-        .get_resource::<crate::char_select::Roster>()
+        .get_resource::<crate::glue_session::roster::Roster>()
         .and_then(crate::ui_macro::identity);
     // The realm's character list is the enable store's node set: the reference keeps one
     // `ADDONSTATELIST` node per character, and an addon this one never set resolves from the rest.
     let roster: Vec<String> = world
-        .get_resource::<crate::char_select::Roster>()
+        .get_resource::<crate::glue_session::roster::Roster>()
         .map(|r| r.chars.iter().map(|c| c.name.clone()).collect())
         .unwrap_or_default();
     // The addon array before any addon file runs: `SMSG_ADDON_INFO` lands during the handshake, so
@@ -415,13 +434,9 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     // The CVar table goes in before the UI loads: stock `UIOptionsFrame.xml`'s camera dropdowns
     // read `cameraSmoothStyle` and `cameraSmoothTrackingStyle` in their `OnLoad`, where a nil is a
     // concat error (`UIOptionsFrame.lua:379-384`, `:501-506`), and this VM was born inside this
-    // call, before `cvars::sync_cvars`'s per-VM seed. Its order: the file's unclaimed entries
-    // first, so an addon's `RegisterCVar` starts at the player's value, then the live table.
+    // call, before `cvars::sync_cvars`'s per-VM seed.
     match world.get_resource::<crate::cvars::Cvars>() {
-        Some(cvars) => {
-            script.set_cvar_saved_base(cvars.orphans());
-            script.seed_cvars(cvars.vm_seed());
-        }
+        Some(cvars) => cvars.seed_vm(&mut script),
         None => script.register_cvars(crate::cvars::registered_pairs()),
     }
     // The item locks before any file or event runs: a `/reload`'s survive, as on the reference's
@@ -430,14 +445,19 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     // The realm before the load, since addons read `GetRealmName()` at file scope; the roster
     // carries the realm-list entry this session connected to.
     let realm = world
-        .get_resource::<crate::char_select::Roster>()
+        .get_resource::<crate::glue_session::roster::Roster>()
         .and_then(|r| r.realm.as_ref().map(|r| r.name.clone()))
         .unwrap_or_default();
     script.set_realm_name(&realm);
+    // `GetBillingTimeRested` reads the connection's word (`0x48ec59`), there for every VM.
+    if let Some(billing) = world.get_resource::<crate::net::SessionBilling>() {
+        script.set_billing_time_rested(billing.0.time_rested);
+    }
     // `CGGameUI::InitializeGame` flags these read-only before `UI_Init` loads anything
-    // (`0x48f566`-`0x48f584`), so an in-game `SetCVar` of one raises, logout handlers included;
-    // `ShutdownGame` clears them (`0x491240`), and here the flags die with this VM. The host's
-    // own realm writes are engine writes, which the flag does not stop.
+    // (`0x48f566`-`0x48f584`), so an in-game `SetCVar` of one raises, logout handlers included,
+    // and no other write stores; `ShutdownGame` clears them (`0x491240`). The VM's flags die with
+    // it (the registry's are [`load_ingame_ui_on_world_entry`]'s). After `set_realm_name`, whose
+    // write is the world entry's own.
     for name in benilla_ui::script::IN_WORLD_READ_ONLY_CVARS {
         script.set_cvar_read_only(name, true);
     }
@@ -447,8 +467,8 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     // the unit: the live player on a `/reload`, else the roster's stand-in until the descriptor
     // streams in.
     if let Some(record) = world
-        .get_resource::<crate::char_select::Roster>()
-        .and_then(record_from_roster)
+        .get_resource::<crate::glue_session::roster::Roster>()
+        .and_then(|roster| record_from_roster(roster, crate::ui_unit::world_unit_names(world)))
     {
         script.set_player_record(record);
     }
@@ -462,8 +482,10 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
         }
         None => {
             if let Some(seat) = world
-                .get_resource::<crate::char_select::Roster>()
-                .and_then(seat_from_roster)
+                .get_resource::<crate::glue_session::roster::Roster>()
+                .and_then(|roster| {
+                    seat_from_roster(roster, crate::ui_unit::world_unit_names(world))
+                })
             {
                 script.set_unit("player", Some(seat));
             }
@@ -517,11 +539,11 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     silenced_ui_load(&mut script, |script| {
         let _ = load_ingame_ui(script, identity.as_ref(), &roster, version_check);
         crate::ui_chat::commands::register_dev_commands(script, crate::run_mode::dev_affordances());
-        // The new Minimap's zoom indices from the persisted CVars, as the reference's minimap reset
-        // copies each CVar into its live index; `Minimap:SetZoom` owns them from here.
+        // The new VM's zoom cells from the persisted CVars, which the reference's statics hold
+        // across the load; the world entry's minimap initializer reseeds them from the CVars again.
         script.set_minimap_zoom(zoom.0, zoom.1);
-        // The saved-variables chunk runs after the files set their defaults and before
-        // `VARIABLES_LOADED`, the reference's order (`AddOn_Load` `0x51f240`); reversed, the
+        // The saved-variables file is read after the files set their defaults and before
+        // `VARIABLES_LOADED`, the reference's order (`0x4900a3`, `0x4900b2`); reversed, the
         // defaults always win. The chat cache restores after `VARIABLES_LOADED` and before any chat
         // is routed: its `UPDATE_CHAT_WINDOWS` registers each chat frame for its `CHAT_MSG_*`
         // events (`ChatFrame.lua:1261-1273`).
@@ -609,11 +631,12 @@ fn roster_sex(gender: u8) -> u8 {
 /// one at `+0x108`, but its accessor (`0x5abe00`) has no caller, so `UnitLevel("player")` reads
 /// the descriptor.
 pub(crate) fn record_from_roster(
-    roster: &crate::char_select::Roster,
+    roster: &crate::glue_session::roster::Roster,
+    names: crate::ui_unit::UnitNames<'_>,
 ) -> Option<benilla_ui::script::PlayerRecord> {
     let row = roster.pending_row()?;
-    let race = crate::ui_unit::race_names(row.race);
-    let class = crate::ui_unit::class_names(row.class);
+    let race = names.race(row.race);
+    let class = names.class(row.class);
     Some(benilla_ui::script::PlayerRecord {
         name: row.name.clone(),
         race: race.map(|(n, f)| (n.to_string(), f.to_string())),
@@ -628,11 +651,12 @@ pub(crate) fn record_from_roster(
 /// scope reads, the faction group chief among it. Health and power stay zero, the descriptor's
 /// to say.
 pub(crate) fn seat_from_roster(
-    roster: &crate::char_select::Roster,
+    roster: &crate::glue_session::roster::Roster,
+    names: crate::ui_unit::UnitNames<'_>,
 ) -> Option<benilla_ui::script::UnitState> {
     let row = roster.pending_row()?;
-    let race = crate::ui_unit::race_names(row.race);
-    let class = crate::ui_unit::class_names(row.class);
+    let race = names.race(row.race);
+    let class = names.class(row.class);
     let sex = roster_sex(row.gender);
     Some(benilla_ui::script::UnitState {
         // Before the player object exists the reference answers `UnitExists("player")`
@@ -807,10 +831,16 @@ pub(crate) fn shutdown_ui_state(script: &mut UiScript, identity: Option<&(String
 /// shutdown tail, then end this session's Lua state, so no frame, global or addon upvalue reaches
 /// the next login. The reference's state outlives `0x490bd0` and is replaced twice through
 /// `0x703b80`, in `ShutdownGame` (at `0x491231`) and then in the glue build (`0x46a7b0`), so the
-/// character screen runs on a state of its own. Ours is a fresh boot VM, or the stock glue's
-/// ([`install_glue_side_vm`]).
+/// character screen runs on a state of its own. Ours is a fresh glue VM ([`install_glue_side_vm`]).
 pub(crate) fn end_ui_session(world: &mut World) {
     close_ui_session(world, ShutdownRoot::WorldTeardown);
+    // `ShutdownGame`'s clear of the world session's read-only flags (`0x491240`-`0x49125d`); a
+    // `/reload` never comes here.
+    if let Some(mut cvars) = world.get_resource_mut::<crate::cvars::Cvars>() {
+        for name in benilla_ui::script::IN_WORLD_READ_ONLY_CVARS {
+            cvars.set_read_only(name, false);
+        }
+    }
     // The session's end drops what the fold just carried, as the disconnect handler, a frame
     // earlier, dropped the rest: only a `/reload` seats it again.
     if let Some(mut log) = world.get_resource_mut::<crate::ui_quest_log::QuestLog>() {
@@ -826,13 +856,13 @@ pub(crate) fn end_ui_session(world: &mut World) {
     // `0x401ee0`'s glue leg: `"charselect"` after a logout, `"login"` after a disconnect
     // (`0x402084`); the state this exit enters says which.
     let screen = match world
-        .get_resource::<State<crate::char_select::ClientState>>()
+        .get_resource::<State<crate::client_state::ClientState>>()
         .map(|s| *s.get())
     {
-        Some(crate::char_select::ClientState::CharSelect) => super::glue::GlueScreen::CharSelect,
+        Some(crate::client_state::ClientState::CharSelect) => super::glue::GlueScreen::CharSelect,
         _ => super::glue::GlueScreen::Login,
     };
-    install_glue_side_vm(world, screen);
+    install_glue_side_vm(world, screen.key());
 }
 
 /// [`end_ui_session`] up to the new VM: the shutdown tail, the folds and the host values reset.
@@ -842,9 +872,9 @@ fn close_ui_session(world: &mut World, root: ShutdownRoot) {
     // to a departure owns it.
     let silenced = run_shutdown_front(world, root);
     // A VM still parked goes back into the world first.
-    unpark_boot_vm(world);
+    unpark_glue_vm(world);
     // An entry load still armed means no in-game UI was built, and the tail would overwrite the
-    // saved files with the boot VM's emptiness.
+    // saved files with the glue VM's emptiness.
     let ui_never_loaded = world.remove_resource::<PendingEntryUiLoad>().is_some();
     let identity = world
         .get_resource::<AddOnIdentity>()
@@ -904,15 +934,15 @@ pub(crate) struct ReloadUiPending(pub(crate) bool);
 /// cascade itself (`0x490168`), firing the `PLAYER_LOGIN` it armed and `PLAYER_ENTERING_WORLD`;
 /// ours fire from [`crate::ui_unit`]'s feed on the new VM's first `Update`, once it has re-seated
 /// the player. In-world only, as the reference's gate (`0x494a50(0xa)`) is; elsewhere the request
-/// is dropped.
+/// is dropped, and the glue's own rebuild is [`super::glue::run_pending_glue_rebuild`]'s.
 pub(crate) fn run_pending_reload(world: &mut World) {
     if !std::mem::take(&mut world.resource_mut::<ReloadUiPending>().0) {
         return;
     }
     let in_world = *world
-        .resource::<State<crate::char_select::ClientState>>()
+        .resource::<State<crate::client_state::ClientState>>()
         .get()
-        == crate::char_select::ClientState::InWorld;
+        == crate::client_state::ClientState::InWorld;
     if !in_world {
         info!("ui_script: ReloadUI outside the world — dropped");
         return;
@@ -948,8 +978,8 @@ pub(crate) fn shutdown_on_exit(
         return;
     }
     let in_world = world
-        .get_resource::<State<crate::char_select::ClientState>>()
-        .is_some_and(|s| *s.get() == crate::char_select::ClientState::InWorld);
+        .get_resource::<State<crate::client_state::ClientState>>()
+        .is_some_and(|s| *s.get() == crate::client_state::ClientState::InWorld);
     // Same guard as [`end_ui_session`]: a quit inside the entry-load window has no UI to save.
     if !in_world || world.contains_resource::<PendingEntryUiLoad>() {
         return;
@@ -985,7 +1015,7 @@ pub(crate) fn finish_ui_load(script: &mut UiScript) {
 }
 
 /// [`finish_ui_load`] with its two host seams. `host_settings` runs between the saved-variables
-/// chunk and `VARIABLES_LOADED`, carrying over a setting `config.toml` held before it moved into
+/// file and `VARIABLES_LOADED`, carrying over a setting `config.toml` held before it moved into
 /// the saved variables. `between` runs after `VARIABLES_LOADED` and before the `PLAYER_LOGIN` arm
 /// (so before the event too): the chat-cache restore's `UPDATE_CHAT_WINDOWS` +
 /// `UPDATE_CHAT_COLOR` burst, where the reference registers its reader (`0x4900d6` → `0x498a20`),
@@ -1102,8 +1132,110 @@ pub(crate) fn is_emote_token_line(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The roster's stand-in `"player"` and the record `UnitRace`/`UnitClass` read carry the
+    /// table's names at the install's locale, and the tokens beside them.
     #[test]
-    fn the_entry_edge_parks_the_boot_vm_and_the_session_end_returns_it() {
+    fn the_roster_seat_and_record_name_race_and_class_from_the_tables() {
+        let mut c = crate::glue_session::roster::test_character(7, "Harness");
+        c.race = 4; // Night Elf
+        c.class = 5; // Priest
+        let roster = crate::glue_session::roster::Roster::with_pending_pick(vec![c], 7);
+        let korean = crate::ui_unit::TestNames::korean();
+        let seat = seat_from_roster(&roster, korean.names()).expect("a pick seats");
+        assert_eq!(seat.race.as_deref(), Some("나이트 엘프"));
+        assert_eq!(seat.race_file.as_deref(), Some("NightElf"));
+        assert_eq!(seat.class.as_deref(), Some("사제"));
+        assert_eq!(seat.class_file.as_deref(), Some("PRIEST"));
+        let record = record_from_roster(&roster, korean.names()).expect("a pick records");
+        assert_eq!(
+            record.race,
+            Some(("나이트 엘프".to_string(), "NightElf".to_string()))
+        );
+        assert_eq!(
+            record.class,
+            Some(("사제".to_string(), "PRIEST".to_string()))
+        );
+    }
+
+    /// A capture's VM draws the CRT's default sequence, `srand(1)`'s 41, 18467, ..., so its
+    /// frames reproduce; a session's is seeded from the clock.
+    #[test]
+    fn a_capture_vm_draws_the_default_random_sequence() {
+        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let draws = |capture: bool| {
+            let _cap = if capture {
+                EnvGuard::set("WOW_CAPTURE", "some-scenario")
+            } else {
+                EnvGuard::unset("WOW_CAPTURE")
+            };
+            let mut world = World::new();
+            let script = new_vm(&mut world, UiScript::new).expect("a VM");
+            script
+                .eval::<Vec<i64>>(
+                    "local r = math.random return {r(32767), r(32767), r(32767), r(32767)}",
+                )
+                .unwrap()
+        };
+        assert_eq!(draws(true), [42, 18468, 6335, 26501]);
+        assert_ne!(draws(false), [42, 18468, 6335, 26501]);
+    }
+
+    /// Every VM, glue and in-game, answers `GetLocale` with the install's locale (`[0xc0e080]`).
+    #[test]
+    fn every_new_vm_is_seated_with_the_installs_locale() {
+        let mut world = World::new();
+        let want = super::super::client_locale();
+        let in_game = new_vm(&mut world, UiScript::new).expect("a VM");
+        let glue = new_vm(&mut world, UiScript::new_glue).expect("a glue VM");
+        for script in [in_game, glue] {
+            assert_eq!(script.locale(), want.index());
+            let answer = script.eval::<String>("return GetLocale()").unwrap();
+            assert_eq!(answer, want.name());
+            assert_eq!(script.client_region(), super::super::client_region());
+        }
+    }
+
+    /// `[0xcf4d24]` has one writer, `SetEuropeanNumbers` (`0x771c40`), and nothing resets it, so
+    /// the VM that replaces a dying one (a `ReloadUI`, a logout, a login) opens with its value.
+    #[test]
+    fn the_european_numbers_switch_outlives_the_vm_that_set_it() {
+        let mut world = World::new();
+        let first = UiScript::new().unwrap();
+        assert!(!first.european_numbers(), "off at boot");
+        world.insert_non_send_resource(first);
+        let text = |world: &World| {
+            let script = world.non_send_resource::<UiScript>();
+            script
+                .run(
+                    "F = CreateFrame('Frame'):CreateFontString() \
+                     F:SetFont('Fonts\\\\FRIZQT__.TTF', 12) F:SetText('1.5')",
+                )
+                .unwrap();
+            script.eval::<String>("return F:GetText()").unwrap()
+        };
+        world
+            .non_send_resource::<UiScript>()
+            .run("SetEuropeanNumbers(1)")
+            .unwrap();
+        for _ in 0..2 {
+            let next = new_vm(&mut world, UiScript::new).expect("a VM");
+            world.insert_non_send_resource(next);
+            assert_eq!(text(&world), "1,5");
+        }
+        world
+            .non_send_resource::<UiScript>()
+            .run("SetEuropeanNumbers(false)")
+            .unwrap();
+        let next = new_vm(&mut world, UiScript::new).expect("a VM");
+        world.insert_non_send_resource(next);
+        assert_eq!(text(&world), "1.5");
+    }
+
+    #[test]
+    fn the_entry_edge_parks_the_glue_vm_and_the_session_end_returns_it() {
         let mut world = World::new();
         let boot = UiScript::new().unwrap();
         let session = boot.session();
@@ -1114,14 +1246,14 @@ mod tests {
             "no VM in the deferral window"
         );
         assert!(world.get_resource::<PendingEntryUiLoad>().is_some());
-        assert!(world.get_non_send_resource::<ParkedBootVm>().is_some());
+        assert!(world.get_non_send_resource::<ParkedGlueVm>().is_some());
         // Left the world before the load ran: the VM comes back, untouched.
-        unpark_boot_vm(&mut world);
+        unpark_glue_vm(&mut world);
         let vm = world
             .get_non_send_resource::<UiScript>()
             .expect("the parked VM is back");
         assert_eq!(vm.session(), session, "the same VM, no session moved");
-        assert!(world.get_non_send_resource::<ParkedBootVm>().is_none());
+        assert!(world.get_non_send_resource::<ParkedGlueVm>().is_none());
     }
 
     /// The plate bits clear at the world entry (`0x401639`, in the entry setup `0x401570`) and
@@ -1135,7 +1267,7 @@ mod tests {
         };
         let world_with = |on: VPlateMode| {
             let mut world = World::new();
-            world.insert_resource(State::new(crate::char_select::ClientState::InWorld));
+            world.insert_resource(State::new(crate::client_state::ClientState::InWorld));
             world.insert_resource(crate::run_mode::CaptureMode);
             world.insert_resource(on);
             world
@@ -1153,6 +1285,33 @@ mod tests {
         assert_eq!(*world.resource::<VPlateMode>(), on, "a reload keeps them");
     }
 
+    /// `InitializeGame` flags the world session's read-only rows on the registry before the UI gate
+    /// (`0x48f566`-`0x48f584`), so a capture world that builds no UI has them too; a `/reload`
+    /// keeps them, and the world's end clears them (`0x491240`).
+    #[test]
+    fn the_world_entry_flags_the_registry_read_only_with_or_without_a_ui() {
+        let mut world = World::new();
+        world.insert_resource(State::new(crate::client_state::ClientState::InWorld));
+        world.insert_resource(crate::run_mode::CaptureMode);
+        world.init_resource::<crate::cvars::Cvars>();
+        world.insert_resource(PendingEntryUiLoad);
+        run_pending_entry_load(&mut world);
+        let set = |world: &mut World, name: &str| {
+            world
+                .resource_mut::<crate::cvars::Cvars>()
+                .set(name, "x.example.org")
+        };
+        use crate::cvars::SetOutcome;
+        for name in benilla_ui::script::IN_WORLD_READ_ONLY_CVARS {
+            assert_eq!(set(&mut world, name), SetOutcome::ReadOnly, "{name}");
+        }
+        world.insert_resource(ReloadUiPending(true));
+        run_pending_reload(&mut world);
+        assert_eq!(set(&mut world, "realmName"), SetOutcome::ReadOnly);
+        end_ui_session(&mut world);
+        assert_eq!(set(&mut world, "realmName"), SetOutcome::Changed);
+    }
+
     /// A `ReloadUI()` runs the leave-world sweep (`0x490c20`, past the armed latch) and then
     /// re-enters the world-enter cascade (`0x490168`), whose readers re-send the time, mail,
     /// battlefield and meeting-stone queries, only with the active player set (`0x490166 je`).
@@ -1161,7 +1320,7 @@ mod tests {
         use crate::net::WorldEnterCascadeMessage;
         let reload = |seated: bool| {
             let mut world = World::new();
-            world.insert_resource(State::new(crate::char_select::ClientState::InWorld));
+            world.insert_resource(State::new(crate::client_state::ClientState::InWorld));
             world.insert_resource(crate::run_mode::CaptureMode);
             world.init_resource::<Messages<WorldEnterCascadeMessage>>();
             world.init_resource::<super::super::SweptWorlds>();
@@ -1190,35 +1349,15 @@ mod tests {
         );
     }
 
-    /// The IO thread's roster policy follows the VM that came up: the screen asks only when the
-    /// stock glue VM stands, so a boot VM leaves the park to fetch the roster.
-    #[test]
-    fn the_roster_policy_follows_the_vm_that_stands() {
-        use std::sync::atomic::Ordering;
-        for stock in [true, false] {
-            let mut world = World::new();
-            let policy = crate::net::RosterPolicy(Default::default());
-            policy.0.store(!stock, Ordering::SeqCst);
-            world.insert_resource(policy.clone());
-            world.insert_resource(super::super::glue::GlueStock(stock));
-            world.insert_resource(State::new(crate::char_select::ClientState::Login));
-            setup_script(&mut world);
-            // The stock policy needs the stock files to have loaded: no install, no screen.
-            let up = stock && benilla_formats::wow_data().is_some();
-            assert_eq!(policy.0.load(Ordering::SeqCst), up, "stock {stock}");
-        }
-    }
-
     /// The agreements are read from their CVars before the first screen is set (`0x46a400` at
     /// `0x402b36`, `SET_GLUE_SCREEN` at `0x402b65`): a returning player's login shows the boxes,
     /// not the EULA, and a first launch still shows the EULA.
     #[test]
     fn the_login_screen_comes_up_on_the_accepted_agreements() {
-        use crate::char_select::ClientState;
+        use crate::client_state::ClientState;
         let _ = benilla_formats::wow_data_or_skip!();
         let screens = |cvars: crate::cvars::Cvars| {
             let mut world = World::new();
-            world.insert_resource(super::super::glue::GlueStock(true));
             world.insert_resource(State::new(ClientState::Login));
             world.insert_resource(cvars);
             world.init_non_send_resource::<super::super::glue_mgr::SharedGlueMgr>();
@@ -1245,12 +1384,12 @@ mod tests {
         );
     }
 
-    /// Under `WOW_GLUE_STOCK=1` the world holds the glue VM where it holds a boot VM, at startup
-    /// on the login screen (`0x402b65`) and back from the world on the screen the exit enters
-    /// (`0x402090`); a `ReloadUI()` never builds the glue.
+    /// The world holds the glue VM outside the world, at startup on the login screen
+    /// (`0x402b65`) and back from the world on the screen the exit enters (`0x402090`); a
+    /// `ReloadUI()` never builds the glue.
     #[test]
-    fn the_stock_glue_stands_where_the_boot_vm_does() {
-        use crate::char_select::ClientState;
+    fn the_glue_stands_outside_the_world() {
+        use crate::client_state::ClientState;
         use benilla_ui::script::VmKind;
         let shown = |world: &World, frame: &str| {
             benilla_formats::wow_data().is_none()
@@ -1260,7 +1399,6 @@ mod tests {
                     .unwrap()
         };
         let mut world = World::new();
-        world.insert_resource(super::super::glue::GlueStock(true));
         world.insert_resource(State::new(ClientState::Login));
         setup_script(&mut world);
         assert_eq!(
@@ -1290,6 +1428,27 @@ mod tests {
             VmKind::InGame,
             "the reload's VM is a boot VM, never the glue's"
         );
+    }
+
+    /// Only the in-game state registers the macro verbs (`RegisterMacroFunctions` `0x4f1b90`, from
+    /// `0x490297`), so the world-entry VM gets the icon chooser's source and the glue VM and a
+    /// reload's boot VM get none.
+    #[test]
+    fn only_the_entry_vm_gets_the_macro_icon_source() {
+        use crate::client_state::ClientState;
+        let has = |world: &World| {
+            world
+                .non_send_resource::<UiScript>()
+                .has_macro_icon_source()
+        };
+        let mut world = World::new();
+        world.insert_resource(State::new(ClientState::Login));
+        setup_script(&mut world);
+        assert!(!has(&world), "the glue VM");
+        install_boot_vm(&mut world);
+        assert!(!has(&world), "a boot VM");
+        mint_entry_vm(&mut world);
+        assert!(has(&world), "the world-entry VM");
     }
 
     /// The reference re-makes its Lua state inside `UI_Init` (`0x48fe97`).
@@ -1347,13 +1506,14 @@ mod tests {
 
         let mut world = World::new();
         world.init_resource::<UiClock>();
-        // The process has been up 90 s, on `Time<Real>` and on the dying VM alike.
+        // The process has been up 90 s on the dying VM, and this frame's step, which the new VM's
+        // first tick adds, takes the frame step's clock 16 ms past that.
         let startup = Instant::now() - Duration::from_secs(90);
-        let mut time = Time::<bevy::time::Real>::new(startup);
-        // `Time<Real>` measures `elapsed` from its first update, not from `startup`.
-        time.update_with_instant(startup);
-        time.update_with_instant(startup + Duration::from_secs(90));
-        world.insert_resource(time);
+        world.insert_resource(FrameStep {
+            delta: Duration::from_millis(16),
+            at: startup + Duration::from_millis(90_016),
+            elapsed: Duration::from_millis(90_016),
+        });
         let mut dying = UiScript::new().unwrap();
         dying.set_now(90.0);
         world.insert_non_send_resource(dying);
@@ -1364,7 +1524,7 @@ mod tests {
 
         let vm = world
             .get_non_send_resource::<UiScript>()
-            .expect("the session end installs a fresh boot VM");
+            .expect("the session end installs a fresh glue VM");
         assert_eq!(
             vm.now(),
             90.0,
@@ -1547,7 +1707,7 @@ mod tests {
     fn a_quit_at_the_character_screen_runs_nothing() {
         use bevy::ecs::system::RunSystemOnce;
         let (mut world, rx) = front_world(false, false);
-        world.insert_resource(State::new(crate::char_select::ClientState::CharSelect));
+        world.insert_resource(State::new(crate::client_state::ClientState::CharSelect));
         world.init_resource::<AddOnIdentity>();
         world.init_resource::<Messages<AppExit>>();
         world

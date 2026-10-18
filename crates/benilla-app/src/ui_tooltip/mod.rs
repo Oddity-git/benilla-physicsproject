@@ -15,6 +15,7 @@ use benilla_ui::strings::Arg;
 
 use crate::names::NameCache;
 use crate::net::{NetCommands, ObjectStore, SelfPlayer};
+use crate::query_cache::Ask;
 use crate::target::{go_is_nearest, Hovered, HoveredObject, GO_FLAG_LOCKED, GO_TYPE_GENERIC};
 use crate::ui_script::UiFeed;
 use crate::ui_trainer::TrainerFeed;
@@ -70,7 +71,14 @@ pub(crate) struct HoverMemo<'s> {
     trace: Local<'s, String>,
     /// Whether the VM holds a `"mouseover"` unit, so the clear is pushed once.
     published: Local<'s, crate::ui_script::VmMemo<bool>>,
+    /// What the last frame hovered, unit, corpse and object: a hover onto anything else is the
+    /// build, whose lookups pass a callback (`GetUnitName` `0x609210` from `0x529fe0`, the corpse's
+    /// owner `0x52af77`, a lock's key `0x52aca6`); the frames under the same hover read.
+    hovering: Local<'s, Option<HoverKey>>,
 }
+
+/// What the pointer is over: the picked unit, corpse and object guids.
+type HoverKey = (Option<u64>, Option<u64>, Option<u64>);
 
 fn lines_view(s: &UnitState) -> UnitState {
     UnitState {
@@ -126,7 +134,7 @@ fn drive_mouseover_tooltip(
     let last = script.world_mouseover();
     let published = memo.published.get(&script);
     let self_store = self_q.iter().next();
-    let chr = tables.classes();
+    let chr = tables.unit_names();
     let types = tables.types(&names);
 
     // A plate's pick stands for its enter's publish (`0x7cb850`), so it holds only while that plate
@@ -139,10 +147,16 @@ fn drive_mouseover_tooltip(
         script.publish_world_mouseover(None);
         return;
     }
+    let hover: HoverKey = (
+        hovered.mouseover(&hovered_go).map(|(_, guid)| guid),
+        hovered.corpse_guid,
+        hovered_go.guid,
+    );
+    let ask = Ask::at(memo.hovering.replace(hover) != Some(hover), &commands);
     let unit = hovered.mouseover(&hovered_go).and_then(|(entity, guid)| {
         let store = stores.get(entity).ok()?;
         let name = names
-            .resolve_unit(guid, Some(store), &commands)
+            .resolve_unit(guid, Some(store), ask)
             .map(str::to_string);
         let reaction = unit_reaction(rx.factions.as_deref(), &rx.reputations, store, self_store);
         // The hovered guid, the pair `0x492890` writes to `0xb4e2c8`/`0xb4e2cc` and the token
@@ -209,7 +223,7 @@ fn drive_mouseover_tooltip(
         let Some(owner) = store.0.corpse_owner() else {
             return;
         };
-        let Some(name) = names.resolve(owner, &commands).map(str::to_string) else {
+        let Some(name) = names.resolve_player(owner, ask).map(str::to_string) else {
             return;
         };
         // `CORPSE_TOOLTIP`, the builder's key; no string, no plate.
@@ -228,11 +242,10 @@ fn drive_mouseover_tooltip(
         // The plate follows the cursor iff `[vtbl+0x5c]` (`0x5f8630`) finds
         // `data[0x621b00(type, 0x13)]` set, and semantic `0x13` exists only for GENERIC(5), at
         // `data[0]`. `data[1]` (`0x5f4830`) is whether it can be hovered, not where it sits.
-        let cursor_seated = stores.get(entity).map(|s| s.0.gameobject_type_id())
-            == Ok(GO_TYPE_GENERIC)
-            && go_inputs
-                .templates
-                .get(guid)
+        let go_fields = stores.get(entity).ok().map(|s| &s.0);
+        let cursor_seated = go_fields.map(|f| f.gameobject_type_id()) == Some(GO_TYPE_GENERIC)
+            && go_fields
+                .and_then(|f| go_inputs.templates.of(f))
                 .is_some_and(|t| t.floating_tooltip);
         // Window px to the VM's y-up root units, as the input seam converts.
         let cursor_ui = cursor_seated
@@ -267,12 +280,17 @@ fn drive_mouseover_tooltip(
             info!(
                 "hover probe/tooltip: guid {guid:#x} cursor_seated {cursor_seated} cursor_ui \
                  {cursor_ui:?} template {:?}",
-                go_inputs.templates.get(guid).map(|t| t.name.clone()),
+                go_fields
+                    .and_then(|f| go_inputs.templates.of(f))
+                    .map(|t| t.name.clone()),
             );
         }
-        let Some(template) = go_inputs.templates.get(guid).cloned() else {
-            // Template in flight: ask once, and show it when it lands.
-            go_inputs.templates.request(guid, &commands);
+        let Some(fields) = go_fields else {
+            return; // not streamed: no descriptor, no entry
+        };
+        // The builder reads the record its create asked for (`0x5f7d81`, `0x5f8100`): an object
+        // whose template has not landed shows when it does.
+        let Some(template) = go_inputs.templates.of(fields).cloned() else {
             return;
         };
         // The builder's lock lines (`0x52aa20`): "Locked" iff `GO_FLAG_LOCKED` (`0x52aae5`), then
@@ -320,7 +338,7 @@ fn drive_mouseover_tooltip(
         {
             match slot0.key_type {
                 benilla_formats::LOCK_KEY_ITEM => {
-                    if let Some(t) = go_inputs.items.template(slot0.index, 0, &commands) {
+                    if let Some(t) = go_inputs.items.template(slot0.index, 0, ask) {
                         // `LOCKED_WITH_ITEM`, at `0x52acb8`.
                         if let Some(text) = keyed(&go_get, "LOCKED_WITH_ITEM", &[Arg::S(&t.name)]) {
                             lines.push((text, TooltipTint::White));

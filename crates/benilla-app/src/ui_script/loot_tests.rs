@@ -219,7 +219,7 @@ fn shipped_loot_frame_drives_end_to_end() {
         vec![1, 2],
         "coin row is pick 1, the first item row is pick 2"
     );
-    assert!(!s.take_loot_close());
+    assert_eq!(s.take_loot_close(), None);
 
     // The looted coin row hides in place, off `LOOT_SLOT_CLEARED` alone, and the items keep their
     // rows.
@@ -243,8 +243,9 @@ fn shipped_loot_frame_drives_end_to_end() {
     );
 
     s.run("LootCloseButton:Click()").unwrap();
-    assert!(
+    assert_eq!(
         s.take_loot_close(),
+        Some(false),
         "closing the window releases the loot (OnHide → CloseLoot)"
     );
     assert!(!s.eval::<bool>("return LootFrame:IsVisible()").unwrap());
@@ -1088,9 +1089,9 @@ fn loot_row_awaiting_its_template_opens_clean() {
     assert_eq!(miss, (1.0, 1.0, 1.0), "the cache-miss row is Common/white");
     // f32 region storage against the binding's f64: compare within a tolerance.
     assert!(
-        (painted.0 - miss.0).abs() < 1e-6
-            && (painted.1 - miss.1).abs() < 1e-6
-            && (painted.2 - miss.2).abs() < 1e-6,
+        (painted.0 - miss.0).abs() < 1.0 / 255.0
+            && (painted.1 - miss.1).abs() < 1.0 / 255.0
+            && (painted.2 - miss.2).abs() < 1.0 / 255.0,
         "LootFrame_Update:85 must paint the -1 colour, got {painted:?} want {miss:?}"
     );
 

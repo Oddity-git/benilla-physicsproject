@@ -18,6 +18,7 @@ use crate::names::NameCache;
 use crate::net::{
     ClientCommand, NetCommands, ObjectStore, SelfGuid, SelfPlayer, WorldEnterCascadeMessage,
 };
+use crate::query_cache::Ask;
 use crate::ui_party::GroupState;
 use crate::ui_script::{SweepApp, SweepLeg, UiFeed, UiInput};
 use crate::ui_session::{close_npc_session_out_of_range, NpcSession};
@@ -54,11 +55,18 @@ impl NpcSession for PetUnlearnState {
     }
 }
 
+/// The event a boot packet owes the UI.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum BootEdge {
+    Start,
+    Stop,
+}
+
 /// The instance-boot clock (`[0xb4e34c]`), and what the last packet owes the UI.
 #[derive(Resource, Default)]
 pub(crate) struct InstanceBoot {
     deadline: Option<Instant>,
-    events: Vec<&'static str>,
+    events: Vec<BootEdge>,
     errors: Vec<&'static str>,
 }
 
@@ -67,10 +75,10 @@ impl InstanceBoot {
     pub(crate) fn apply(&mut self, delay_ms: u32, reason: u32, now: Instant) {
         if delay_ms > 0 {
             self.deadline = Some(now + std::time::Duration::from_millis(u64::from(delay_ms)));
-            self.events.push("INSTANCE_BOOT_START");
+            self.events.push(BootEdge::Start);
         } else {
             self.deadline = None;
-            self.events.push("INSTANCE_BOOT_STOP");
+            self.events.push(BootEdge::Stop);
             match reason {
                 1 => self.errors.push("ERR_RAID_GROUP_ONLY"),
                 2 => self.errors.push("ERR_RAID_GROUP_FULL"),
@@ -307,6 +315,10 @@ pub(crate) struct MeetingStone {
     notices: Vec<MeetingStoneNotice>,
     /// `0x299` guids whose name has not resolved yet.
     pending_members: Vec<u64>,
+    /// How many of `pending_members`, from the front, a feed has looked up: the rest arrived
+    /// since, each in a packet whose handler looks the name up with the callback `0x4ca510`
+    /// (`0x4ca4b2`).
+    members_asked: usize,
     /// The VM's copy of the two globals is stale.
     dirty: bool,
 }
@@ -480,10 +492,11 @@ fn feed_meeting_stone(
     }
     // `0x299`'s name-cache callback: the line when the name lands, nothing until then.
     let pending = std::mem::take(&mut stone.pending_members);
-    for guid in pending {
+    let asked = std::mem::take(&mut stone.members_asked);
+    for (i, guid) in pending.into_iter().enumerate() {
         match inputs
             .names
-            .resolve(guid, &inputs.commands)
+            .resolve_player(guid, Ask::at(i >= asked, &inputs.commands))
             .map(str::to_string)
         {
             Some(name) => lines.extend(crate::ui_action::keyed_line_s(
@@ -494,6 +507,7 @@ fn feed_meeting_stone(
             None => stone.pending_members.push(guid),
         }
     }
+    stone.members_asked = stone.pending_members.len();
     if !lines.is_empty() {
         crate::ui_action::show_messages(&mut script, &mut sink, "ui_dialog_verbs", lines);
     }
@@ -592,6 +606,7 @@ fn drain_meeting_stone_joins(
     group: Option<Res<GroupState>>,
     self_guid: Res<SelfGuid>,
     templates: Res<crate::go_templates::GameObjectTemplates>,
+    objects: crate::net::Objects,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     commands: Res<NetCommands>,
     mut sink: crate::ui_action::MessageSink,
@@ -603,7 +618,9 @@ fn drain_meeting_stone_joins(
     let level = self_q.single().ok().and_then(|s| s.0.unit_level());
     let mut lines = Vec::new();
     for &MeetingStoneUse { go_guid } in uses.read() {
-        let stone = templates.get(go_guid).and_then(|t| t.meeting_stone);
+        let stone = templates
+            .of_guid(&objects, go_guid)
+            .and_then(|t| t.meeting_stone);
         let verdict = meeting_stone_join_refusal(group.as_deref(), self_guid.0, level, stone);
         // Traced on the click's own `use` tag: a refusal, the no-player silence, or the send.
         if benilla_assets::trace::enabled_for("use") {
@@ -670,8 +687,11 @@ pub(crate) fn feed_dialog_verbs(
     }
 
     script.set_instance_boot_secs(boot.secs(now));
-    for event in std::mem::take(&mut boot.events) {
-        script.fire_event(event, vec![]);
+    for edge in std::mem::take(&mut boot.events) {
+        match edge {
+            BootEdge::Start => script.fire_event("INSTANCE_BOOT_START", vec![]),
+            BootEdge::Stop => script.fire_event("INSTANCE_BOOT_STOP", vec![]),
+        }
     }
     let lines: Vec<_> = std::mem::take(&mut boot.errors)
         .into_iter()
@@ -876,6 +896,7 @@ fn poll_area_spirit_healer(
             &reputations,
             Some(self_store),
             store_of,
+            crate::target::Assist::UnitToPlayer,
         ) {
             continue;
         }
@@ -976,7 +997,7 @@ impl Plugin for UiDialogVerbsPlugin {
                     close_npc_session_out_of_range::<PetUnlearnState>.before(feed_dialog_verbs),
                     // Gated on the in-game interface: vmangos can send `SMSG_RAID_GROUP_ONLY` in
                     // the login burst (`Player.cpp:18686`), and an `INSTANCE_BOOT_START` fired at
-                    // the boot VM would be lost; the queue waits instead.
+                    // the glue VM would be lost; the queue waits instead.
                     feed_dialog_verbs
                         .in_set(UiFeed)
                         .run_if(crate::ui_script::ingame_ui_up),
@@ -986,7 +1007,7 @@ impl Plugin for UiDialogVerbsPlugin {
                     poll_area_spirit_healer
                         .after(crate::target::TargetUpdate)
                         .run_if(crate::ui_script::ingame_ui_up)
-                        .in_set(crate::char_select::InWorldGated),
+                        .in_set(crate::client_state::InWorldGated),
                     // The cascade's order: the battlefield status, then this (`0x4909fb`,
                     // `0x490a14`), so `CMSG 0x296` follows `CMSG 0x2D3` on the wire.
                     meeting_stone_enter_world
@@ -1009,7 +1030,7 @@ impl Plugin for UiDialogVerbsPlugin {
                 ),
             )
             .add_systems(
-                OnExit(crate::char_select::ClientState::InWorld),
+                OnExit(crate::client_state::ClientState::InWorld),
                 area_spirit_healer_leave_world,
             );
     }
@@ -1029,6 +1050,47 @@ fn cancel_gate_could_apply(attributes_ex: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member-added packet looks its name up with the callback `0x4ca510` (`0x4ca4b2`); the
+    /// frames its line waits through read. A refused name is asked by no frame after it, only by
+    /// the next packet naming its member.
+    #[test]
+    fn a_refused_stone_member_is_asked_by_the_next_packet_never_by_a_frame() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<MeetingStone>()
+            .init_resource::<NameCache>()
+            .init_resource::<crate::ui_chat::ChatLog>()
+            .init_resource::<crate::sound::MessageSounds>()
+            .add_message::<SpellKitFx>()
+            .add_systems(Update, feed_meeting_stone);
+        app.insert_non_send_resource(UiScript::new().unwrap());
+        let added = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<MeetingStone>()
+                .apply_notice(MeetingStoneNotice::MemberAdded { guid: 0x9 });
+            app.update();
+        };
+        added(&mut app);
+        assert_eq!(crate::query_cache::queries(&rx).len(), 1);
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(0x9, String::new(), None);
+        for _ in 0..600 {
+            app.update();
+        }
+        assert!(
+            crate::query_cache::queries(&rx).is_empty(),
+            "no frame asks a refusal"
+        );
+        added(&mut app);
+        assert_eq!(
+            crate::query_cache::queries(&rx).len(),
+            1,
+            "the next packet asks again"
+        );
+    }
 
     /// `UNIT_FIELD_LEVEL`, absolute field 34.
     const LEVEL_FIELD: u16 = 34;
@@ -1408,10 +1470,9 @@ mod tests {
     #[test]
     fn the_join_drain_sends_the_clicked_stone_and_refuses_silently_on_the_wire() {
         use crate::go_templates::GameObjectTemplates;
-        // A real GameObject guid, `counter | entry << 24 | HIGH_GAMEOBJECT << 48`: the template
-        // cache is keyed by the entry it carries.
+        // The template cache is keyed by the entry in the stone's descriptor, not its guid bits.
         const STONE_ENTRY: u32 = 0x5701;
-        const STONE: u64 = 0xF110 << 48 | (STONE_ENTRY as u64) << 24 | 0x22;
+        const STONE: u64 = 0xF110 << 48 | 0x22;
         const ME: u64 = 0x5e1f;
         const MATE: u64 = 0xa11e;
 
@@ -1420,17 +1481,22 @@ mod tests {
         let mut templates = GameObjectTemplates::default();
         let mut data = [0i32; 24];
         (data[0], data[1], data[2]) = (15, 60, 1519);
-        assert_eq!(benilla_protocol::guid::entry(STONE), Some(STONE_ENTRY));
         templates.insert(STONE_ENTRY, 23, "Stonard Meeting Stone".into(), &data);
         app.insert_resource(templates)
             .insert_resource(NetCommands(tx))
             .insert_resource(SelfGuid(Some(ME)))
             .init_resource::<GroupState>()
+            .init_resource::<crate::net::GuidIndex>()
             .init_resource::<crate::ui_action::UiErrorKeys>()
             .init_resource::<crate::ui_chat::ChatLog>()
             .init_resource::<crate::sound::MessageSounds>()
             .add_message::<MeetingStoneUse>()
             .add_systems(Update, drain_meeting_stone_joins);
+        crate::items::test_spawn_object(
+            app.world_mut(),
+            STONE,
+            crate::go_templates::test_fields(STONE_ENTRY),
+        );
         app.insert_non_send_resource(UiScript::new().expect("VM"));
         app.world_mut().spawn((
             SelfPlayer,
@@ -1627,13 +1693,10 @@ mod tests {
         let mut boot = InstanceBoot::default();
         let now = Instant::now();
         boot.apply(60_500, 0, now);
-        assert_eq!(boot.events, vec!["INSTANCE_BOOT_START"]);
+        assert_eq!(boot.events, vec![BootEdge::Start]);
         assert_eq!(boot.secs(now), 60, "whole seconds, truncated");
         boot.apply(0, 1, now);
-        assert_eq!(
-            boot.events,
-            vec!["INSTANCE_BOOT_START", "INSTANCE_BOOT_STOP"]
-        );
+        assert_eq!(boot.events, vec![BootEdge::Start, BootEdge::Stop]);
         assert_eq!(boot.errors, vec!["ERR_RAID_GROUP_ONLY"]);
         assert_eq!(boot.secs(now), 0);
         boot.apply(0, 7, now);

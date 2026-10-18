@@ -1,9 +1,11 @@
 //! The action bar's identity feed: each of the 120 slots' icon and count, pushed to the VM with
-//! `ACTIONBAR_SLOT_CHANGED` per changed slot. [`feed_actions`] also drains the UI error queues
+//! `ACTIONBAR_SLOT_CHANGED` per changed slot; between resolves an item slot's count moves by the
+//! item watchers' recount ([`super::recount`]). [`feed_actions`] also drains the UI error queues
 //! and feeds the stance page (`GetBonusBarOffset`: the form's `SpellShapeshiftForm.dbc`
 //! BonusActionBar column, `0x4e4fc0`).
 
-use crate::ui_items::{count_of, InventoryScope};
+use crate::query_cache::Ask;
+use crate::ui_items::action_count;
 use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
@@ -71,8 +73,13 @@ pub(super) fn feed_actions(
     mut cast_errors: ResMut<CastErrors>,
     mut mount_errors: ResMut<MountErrors>,
     mut pet_tame_failures: ResMut<PetTameFailures>,
-    // The by-key and resolved-text queues as one parameter, at Bevy's 16-parameter limit.
-    ui_errors: (ResMut<UiErrorKeys>, ResMut<UiErrorTexts>),
+    // The by-key and resolved-text queues and the cover that holds the latter, as one parameter,
+    // at Bevy's 16-parameter limit.
+    ui_errors: (
+        ResMut<UiErrorKeys>,
+        ResMut<UiErrorTexts>,
+        Option<Res<crate::loading_screen::LoadingScreen>>,
+    ),
     spells: Option<Res<Spells>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     objects: crate::net::Objects,
@@ -87,7 +94,7 @@ pub(super) fn feed_actions(
     let Some(mut script) = script else {
         return;
     };
-    let (mut ui_error_keys, mut ui_error_texts) = ui_errors;
+    let (mut ui_error_keys, mut ui_error_texts, cover) = ui_errors;
     let memory = memory.get(&script);
 
     // Cast failures become error lines through [`cast_fail`], all resolved before any event
@@ -111,7 +118,7 @@ pub(super) fn feed_actions(
     for spell_id in refused {
         script.trade_skill_cast_failed(spell_id);
     }
-    let texts: Vec<cast_fail::CastFailLine> = cast_errors
+    let texts: Vec<(cast_fail::CastFailLine, benilla_ui::script::InputEvents)> = cast_errors
         .0
         .drain(..)
         .filter_map(|fail| {
@@ -178,9 +185,14 @@ pub(super) fn feed_actions(
                             .and_then(|s| first_short_reagent(d, s, &objects))
                             .or_else(|| d.reagents.iter().map(|&(id, _)| id).find(|&id| id != 0))
                     }?;
-                    let cached = items
-                        .template(failing, 0, &commands)
-                        .map(|i| i.name.clone());
+                    // The failure handler's lookup with the callback `0x6e29b0` (`0x6e1ea4`) on a
+                    // first pass; its redisplay only reads.
+                    let ask = if fail.redisplay {
+                        Ask::Read
+                    } else {
+                        Ask::Event(&commands)
+                    };
+                    let cached = items.template(failing, 0, ask).map(|i| i.name.clone());
                     let name = match cached {
                         Some(name) => name,
                         // Answered unknown: the reference's callback literal (`0x838044`).
@@ -251,7 +263,7 @@ pub(super) fn feed_actions(
                     });
                 }
             }
-            line
+            line.map(|l| (l, fail.input))
         })
         .collect();
     cast_errors.0.extend(await_template);
@@ -262,7 +274,9 @@ pub(super) fn feed_actions(
         &mut script,
         &mut sink,
         "ui_action",
-        texts.into_iter().map(|l| Shown::keyed(l.key, l.text)),
+        texts
+            .into_iter()
+            .map(|(l, input)| Shown::keyed(l.key, l.text).under(input)),
     );
 
     // (Dis)mount refusals by key ([`mount_result_key`]); none of these strings takes arguments.
@@ -302,28 +316,34 @@ pub(super) fn feed_actions(
         .drain(..)
         .filter_map(|e| {
             ui_error_text(&e, &|key| script.lua().globals().get::<String>(key).ok())
-                .map(|t| Shown::keyed(e.key, t))
+                .map(|t| Shown::keyed(e.key, t).under(e.input))
         })
         .collect();
     show_messages(&mut script, &mut sink, "ui_action", key_lines);
 
-    // Already-resolved lines ([`UiErrorTexts`]); the queued kind is the `0x4945b0` flag.
-    let resolved: Vec<Shown> = ui_error_texts
-        .0
-        .drain(..)
-        .map(|(text, kind)| Shown::unkeyed(kind, text))
-        .collect();
-    show_messages(&mut script, &mut sink, "ui_action", resolved);
+    // Already-resolved lines ([`UiErrorTexts`]); the queued kind is the `0x4945b0` flag. Held
+    // while the loading cover is up, so a login notice's hold starts at the reveal: the reference
+    // sends `CMSG_PLAYER_LOGIN` only after its world load (`0x46c272`), and its cover drops at the
+    // player's create (`0x5debbd`), which vmangos sends ahead of the notices (`Maps/Map.cpp:432`,
+    // `Handlers/CharacterHandler.cpp:675`).
+    if !cover.is_some_and(|c| c.covering()) {
+        let resolved: Vec<Shown> = ui_error_texts
+            .0
+            .drain(..)
+            .map(|(text, kind)| Shown::unkeyed(kind, text))
+            .collect();
+        show_messages(&mut script, &mut sink, "ui_action", resolved);
+    }
 
     // The engine's own by-key refusals (`ERR_PASSIVE_ABILITY`): `benilla_ui` cannot reach
     // [`UiErrorKeys`], so it queues keys that show here, one frame late.
-    let engine_keys = script.take_ui_errors();
+    let engine_keys = script.take_ui_errors_with_input();
     let engine_lines: Vec<Shown> = engine_keys
         .into_iter()
-        .filter_map(|key| {
+        .filter_map(|(key, input)| {
             let e = UiError::key(key);
             ui_error_text(&e, &|k| script.lua().globals().get::<String>(k).ok())
-                .map(|t| Shown::keyed(e.key, t))
+                .map(|t| Shown::keyed(e.key, t).under(input))
         })
         .collect();
     show_messages(&mut script, &mut sink, "ui_action", engine_lines);
@@ -374,21 +394,24 @@ pub(super) fn feed_actions(
                             &objects,
                             &items,
                             icons.as_deref(),
-                            &commands,
                         )
                     });
                     (icon, 0, false, None)
                 }
                 ACTION_KIND_ITEM => {
                     // Never nil: the reference's resolver `0x5d88b0` returns the question mark,
-                    // and the stock `ActionButton.lua:158` hides the icon on a nil texture.
-                    let template = items.template(button.action, 0, &commands).cloned();
+                    // and the stock `ActionButton.lua:158` hides the icon on a nil texture. The
+                    // texture getter looks it up with a callback (`0x4e6b24`) on the bar's events,
+                    // which no event here marks: an entry is asked when it first shows.
+                    let template = items
+                        .template(button.action, 0, Ask::New(&commands))
+                        .cloned();
                     let texture = template
                         .as_ref()
                         .and_then(|t| icons.as_ref()?.catalog.get(t.display_info_id)?.icon.clone())
                         .unwrap_or_else(|| MISSING_ITEM_ICON.to_string());
                     let count = store
-                        .map(|s| count_of(&s.0, &objects, button.action, InventoryScope::CARRIED))
+                        .map(|s| action_count(&s.0, &objects, button.action, template.as_ref()))
                         .unwrap_or(0);
                     // The Count gate (`0x4e5250`, [`ItemInfo::is_consumable`]) reads the icon's
                     // template, so it rides the same push.
@@ -473,19 +496,11 @@ pub(super) fn feed_actions(
         }
     }
 
-    // An item slot's count and a live icon change without an action-table edit (eating a stack
-    // sends no `SMSG_ACTION_BUTTONS`), so the pushed slots refresh every frame.
+    // A live icon changes without an action-table edit, so the pushed spell slots refresh every
+    // frame. An item slot's count is the item watchers' (`super::recount`), never polled.
     if let Some(store) = store {
         for (&action, slot) in memory.pushed.iter_mut() {
             let changed = match slot.kind {
-                ACTION_KIND_ITEM => {
-                    let fresh = count_of(&store.0, &objects, slot.action, InventoryScope::CARRIED);
-                    let changed = fresh != slot.count;
-                    if changed {
-                        slot.count = fresh;
-                    }
-                    changed
-                }
                 // Live icons: a weapon face follows the equipped weapon and form (Attack's
                 // `0x4e6870`), and a toggle's `ActiveIconID` follows its own aura (`0x4e6bbd`).
                 ACTION_KIND_SPELL => {
@@ -503,7 +518,6 @@ pub(super) fn feed_actions(
                                 &objects,
                                 &items,
                                 icons.as_deref(),
-                                &commands,
                             );
                             let changed = fresh != slot.texture;
                             if changed {
@@ -529,7 +543,6 @@ pub(super) fn feed_actions(
                     .is_some_and(|h| (h.kind, h.action) == (slot.kind, slot.action))
                 {
                     let mut next = held.unwrap_or_default();
-                    next.count = slot.count;
                     next.texture = slot.texture.clone();
                     script.set_action(action, Some(next));
                     script.fire_event(
@@ -555,9 +568,8 @@ pub(crate) fn spell_action_icon(
     objects: &crate::net::Objects,
     items: &Items,
     icons: Option<&ItemDisplays>,
-    commands: &NetCommands,
 ) -> Option<String> {
-    auto_attack_icon(d, store, &spells.forms, objects, items, icons, commands)
+    auto_attack_icon(d, store, &spells.forms, objects, items, icons)
         .or_else(|| {
             store
                 .filter(|s| super::toggle::active_action_toggle(spell_id, d, s))

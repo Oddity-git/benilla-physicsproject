@@ -29,10 +29,11 @@
 //! benilla-buildstamp = { git = "https://github.com/samwhosung/benilla" }
 //!
 //! # Cargo reads `[patch]` and `[profile]` from the root manifest only, so benilla's are repeated:
-//! # without the patches the addon Lua and the mixer are not benilla's.
+//! # without the kira patch the mixer is not benilla's, and without the alsa one the lock holds two
+//! # `alsa-sys` and does not resolve.
 //! [patch.crates-io]
-//! lua-src = { git = "https://github.com/samwhosung/benilla" }
 //! kira = { git = "https://github.com/samwhosung/benilla" }
+//! alsa = { git = "https://github.com/samwhosung/benilla" }
 //!
 //! [profile.dev]
 //! opt-level = 1
