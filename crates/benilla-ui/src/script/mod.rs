@@ -273,7 +273,7 @@ pub use guild::{
 pub use input_verbs::{BindingInput, FiredInput, HeldInput};
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
-pub use modelframe::{CharacterPaneFrame, ModelPaneFrame};
+pub use modelframe::{CharacterPaneFrame, ModelPaneFrame, ModelWanted};
 pub use petition::{
     validate_guild_name, PetitionRecordView, PetitionRequest, PetitionState, PETITION_TYPE_CHARTER,
     PETITION_TYPE_PETITION,
@@ -327,7 +327,7 @@ pub use reputation::{FactionEntry, ReputationSend, ReputationState};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
 pub(crate) use simplehtml::{
-    apply_element_font_parts as apply_simplehtml_font_parts,
+    element_fonts_lua as simplehtml_element_fonts_lua,
     element_of_xml_tag as simplehtml_element_of_xml_tag,
 };
 pub use skills::{SkillEntry, SkillsState};
@@ -502,7 +502,7 @@ pub const SCREEN: crate::layout::Handle = 0;
 /// ScrollFrame's three scroll kinds are `+0x32c`/`+0x334`/`+0x33c` (script-name map `0x786c40`).
 /// The EditBox's vtable (`0x81c910`) replaces the key and char slots: an EditBox never fires
 /// `OnKeyDown`, and fires `OnChar` only from `Insert`, with the inserted text (`0x77c13c`).
-const SCRIPT_KINDS: [&str; 45] = [
+const SCRIPT_KINDS: [&str; 46] = [
     "OnLoad",
     "OnEvent",
     "OnUpdate",
@@ -532,6 +532,10 @@ const SCRIPT_KINDS: [&str; 45] = [
     "OnCursorChanged",
     "OnEditFocusGained",
     "OnEditFocusLost",
+    // The EditBox's input-method slot (script map `0x77a310`, `0x77a40d`, `+0x430`), fired only
+    // when an input-method event changes the box's language (`0x77abb0`, stored at `0x77abf2`).
+    // benilla has no input method, so it is stored and never runs, as on a western layout.
+    "OnInputLanguageChanged",
     "OnHorizontalScroll",
     "OnVerticalScroll",
     "OnScrollRangeChanged",
@@ -1455,7 +1459,8 @@ impl UiScript {
     }
 
     /// Whether `name` is a registered font object, the other namespace an `inherits=` may name
-    /// (`loader::expand_region` forks on it), so a census counts no font as a missing template.
+    /// (a FontString's `inherits=` links it, `0x770f69`), so a census counts no font as a missing
+    /// template.
     pub fn has_font_object(&self, name: &str) -> bool {
         self.model_ref().font_object(name).is_some()
     }

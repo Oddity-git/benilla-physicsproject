@@ -90,9 +90,10 @@ pub enum QuadContent {
         own_alpha: f32,
         /// `ReplaceIconTexture`'s path, the type-14 texture override.
         icon: Option<String>,
-        /// The camera, a raw index into the file's camera table: `None` renders orthographic, the
-        /// model laid flat over the rect, and `Some(n)` in perspective through camera `n`.
-        camera: Option<u32>,
+        /// The installed camera, a raw index into the camera table of the file it was resolved
+        /// from, which a later `SetModel` keeps: `None` renders orthographic, the model laid flat
+        /// over the rect, and `Some` in perspective through that camera.
+        camera: Option<crate::widget::InstalledCamera>,
         /// The embedded `CGLight`, off on every shipped pane; a lit batch under it draws black, as
         /// in the reference.
         light: crate::widget::ModelLight,
@@ -446,9 +447,9 @@ pub(crate) struct RegionData {
     /// The `<TexCoords>`/`SetTexCoord` mapping; `None` is the full texture.
     pub(crate) tex_coords: Option<TexCoords>,
     /// The reference's `+0x124`: `SetTexCoordModifiesRect` writes it (`0x79c113`, in `0x79c080`)
-    /// and installing the texture as a StatusBar's bar sets it (`0x783220`, in `0x7831f0`). Stored,
-    /// not applied: there a set flag makes `SetTexCoord` re-derive the rect from the UV quad
-    /// (`0x770462`); no stock or corpus code sets it.
+    /// and installing the texture as a StatusBar's bar sets it (`0x783220`, in `0x7831f0`). A set
+    /// flag scales the drawn rect by the coordinates' spans (`0x770570`, the extract's
+    /// `modified_rect`).
     pub(crate) tex_coord_modifies_rect: bool,
     /// Rotation about the centre, radians counterclockwise; always 0: 1.12 has no Texture setter.
     pub(crate) rotation: f32,

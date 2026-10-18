@@ -1079,7 +1079,8 @@ mod loader_tests {
             .unwrap();
         assert!(ok, "XML attributes + children landed in the widget state");
 
-        s.resolve();
+        // The fill's coordinates are the bar's update (`0x7833c0`), in the tick's walk.
+        s.tick(0.0);
         let bar = s
             .extract()
             .into_iter()
@@ -2278,6 +2279,41 @@ mod loader_tests {
             (1, "Hello".to_string())
         );
         assert_eq!(s.eval::<i64>("return Gone:GetNumRegions()").unwrap(), 0);
+    }
+
+    /// `0x78a130` sets the `file=` document (`0x78a2b2`) before it reads `hyperlinkFormat`
+    /// (`0x78a2d4`), so the document's links splice with the ctor's format and the XML's applies
+    /// from the next `SetText`.
+    #[test]
+    fn simplehtml_parses_its_file_before_taking_its_hyperlink_format() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <Font name="LinkDocFont" font="Fonts\FRIZQT__.TTF"><FontHeight val="12"/></Font>
+                <SimpleHTML name="LinkDoc" file="doc.html" hyperlinkFormat="|H%s|h[%s]|h">
+                    <Size><AbsDimension x="270" y="304"/></Size>
+                    <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                    <FontString inherits="LinkDocFont"/>
+                </SimpleHTML>
+            </Ui>"#,
+        );
+        let files = |req: &str| -> Option<Vec<u8>> {
+            (req == "doc.html")
+                .then(|| b"<html><body><p><a href=\"x\">go</a></p></body></html>".to_vec())
+        };
+        let report = load_in(&s, &doc, "Interface/GlueXML/LinkDoc.xml", &files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        let text = "local r = LinkDoc:GetRegions(); return r:GetText()";
+        assert_eq!(s.eval::<String>(text).unwrap(), "|Hx|hgo|h");
+        assert_eq!(
+            s.eval::<String>("return LinkDoc:GetHyperlinkFormat()")
+                .unwrap(),
+            "|H%s|h[%s]|h"
+        );
+        s.run(r#"LinkDoc:SetText('<html><body><p><a href="x">go</a></p></body></html>')"#)
+            .unwrap();
+        assert_eq!(s.eval::<String>(text).unwrap(), "|Hx|h[go]|h");
     }
 
     /// A `<SimpleHTML>` element font is loaded by `CSimpleFont::LoadXML` (`0x78a26e` → `0x783c30`),
