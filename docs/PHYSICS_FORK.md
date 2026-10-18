@@ -543,14 +543,15 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
     `gore::gush_corpses` spurts droplets up from the hub body for `GUSH 1.2` s in `GUSH_PULSE 0.3`
     pulses (`GUSH_SPEED 2.5–4.5`, leaning `GUSH_LEAN 0.35`), weakening as it goes. Blood gated.
   - **Any cut** (`gore::bleed_cuts`, whatever the school): a geyser of `GEYSER_DROPS 70` (× Gore
-    Amount, at least half) thrown up at `GEYSER_SPEED 5–10` yd/s, then an `Artery` entity per face:
+    Amount, at least half) thrown up at `GEYSER_SPEED 8–16` yd/s, then an `Artery` entity per face:
     the stump jets for `ARTERY 4` s, the piece for `ARTERY_PIECE 1.2` s. `spray_arteries` throws
     one droplet (× Gore Amount) every `ARTERY_EVERY 0.01` s during the first `ARTERY_SPURT 0.6` of
     each `ARTERY_BEAT 0.5` s, along the face's live direction from `Dismembered::wounds` lifted
-    `ARTERY_LIFT 0.45`, cone `ARTERY_CONE 0.12`, at `ARTERY_SPEED 5–8.5` yd/s scaled by a pressure
+    `ARTERY_LIFT 0.45`, cone `ARTERY_CONE 0.12`, at `ARTERY_SPEED 9–14` yd/s scaled by 0.4–1 of a pressure
     that surges each beat and fades as √ of the time left. Jet droplets are `ARTERY_SIZE 1–2.4`×
     the usual dot, and only `ARTERY_MARKS 0.3` of them splat on landing (`Droplet::marks`), so a
-    jet does not retire every older splat.
+    jet does not retire every older splat. Each droplet also carries `ARTERY_CARRY 0.9` of its
+    face's own velocity (capped at `ARTERY_CARRY_MAX 20` yd/s), so a flung piece trails blood.
   - **Fire** (`Some(2)`): Immolate's (348) state kit as a persistent `SpellKitFx::Begin` under
     our own key `BURN_KEY` (class `AuraState`), reaped after `BURN 4` s; embers rise meanwhile,
     smoke starts halfway and goes on `SMOKE 5` s after, thinning.

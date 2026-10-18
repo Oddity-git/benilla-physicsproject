@@ -698,7 +698,7 @@ fn gush_corpses(
 /// A cut's geyser: this many droplets thrown at once, at this speed range (yd/s), leaning off
 /// straight up by up to this much.
 const GEYSER_DROPS: usize = 70;
-const GEYSER_SPEED: (f32, f32) = (5.0, 10.0);
+const GEYSER_SPEED: (f32, f32) = (8.0, 16.0);
 const GEYSER_LEAN: f32 = 0.3;
 /// How long a stump jets (s), and the severed piece.
 const ARTERY: f32 = 4.0;
@@ -708,7 +708,7 @@ const ARTERY_PIECE: f32 = 1.2;
 const ARTERY_BEAT: f32 = 0.5;
 const ARTERY_SPURT: f32 = 0.6;
 const ARTERY_EVERY: f32 = 0.01;
-const ARTERY_SPEED: (f32, f32) = (5.0, 8.5);
+const ARTERY_SPEED: (f32, f32) = (9.0, 14.0);
 /// How tight the jet is, and how much it lifts above the cut's own direction.
 const ARTERY_CONE: f32 = 0.12;
 const ARTERY_LIFT: f32 = 0.45;
@@ -716,6 +716,10 @@ const ARTERY_LIFT: f32 = 0.45;
 /// fly, so a jet does not retire every older splat).
 const ARTERY_SIZE: (f32, f32) = (1.0, 2.4);
 const ARTERY_MARKS: f32 = 0.3;
+/// A jet's droplets carry this share of their face's own velocity, which counts up to this
+/// (yd/s): a piece flung away trails blood along its flight.
+const ARTERY_CARRY: f32 = 0.9;
+const ARTERY_CARRY_MAX: f32 = 20.0;
 
 /// One face of a cut jetting blood: the stump's, or the severed piece's.
 #[derive(Component)]
@@ -726,6 +730,9 @@ struct Artery {
     start: f32,
     len: f32,
     next: f32,
+    /// Where its face was last frame, and how fast the face is moving (yd/s).
+    last: Option<Vec3>,
+    moving: Vec3,
 }
 
 /// Each artery jets from its face of the cut, wherever the body has gone, in heartbeat pulses
@@ -743,6 +750,7 @@ fn spray_arteries(
     mut gore: ResMut<Gore>,
 ) {
     let now = time.elapsed_secs();
+    let dt = time.delta_secs().max(1e-3);
     let violence = violence_level(cvars.as_deref());
     let amount = gore_amount(cvars.as_deref());
     for (e, mut artery) in &mut arteries {
@@ -760,6 +768,17 @@ fn spray_arteries(
             commands.entity(e).despawn();
             continue;
         }
+        let (at, out) = if artery.piece {
+            faces.piece
+        } else {
+            faces.stump
+        };
+        // The face's own motion, smoothed a little, which every droplet it throws carries.
+        if let Some(last) = artery.last {
+            let v = ((at - last) / dt).clamp_length_max(ARTERY_CARRY_MAX);
+            artery.moving = artery.moving.lerp(v, 0.5);
+        }
+        artery.last = Some(at);
         let Some(blood) = blood.as_deref().filter(|_| violence > 0) else {
             continue;
         };
@@ -772,11 +791,7 @@ fn spray_arteries(
             continue;
         };
         let splats = blood.0.splats(id, violence);
-        let (at, out) = if artery.piece {
-            faces.piece
-        } else {
-            faces.stump
-        };
+        let carried = artery.moving * ARTERY_CARRY;
         // Each beat surges then sags; the whole jet weakens as the heart gives out.
         let surge = 1.0 - beat / ARTERY_SPURT * 0.5;
         let pressure = (1.0 - t / artery.len).sqrt() * surge;
@@ -791,7 +806,7 @@ fn spray_arteries(
             );
             let dir =
                 (out.normalize_or(Vec3::Y) + Vec3::Y * ARTERY_LIFT + jitter).normalize_or(Vec3::Y);
-            let v = dir * gore.range(ARTERY_SPEED) * (0.25 + 0.75 * pressure);
+            let v = dir * gore.range(ARTERY_SPEED) * (0.4 + 0.6 * pressure) + carried;
             let size = gore.range(ARTERY_SIZE);
             let marks = gore.rand() < ARTERY_MARKS;
             gore.drops.push(Droplet {
@@ -912,6 +927,8 @@ fn bleed_cuts(
                         start: now,
                         len,
                         next: now,
+                        last: None,
+                        moving: Vec3::ZERO,
                     },
                 ));
             }
