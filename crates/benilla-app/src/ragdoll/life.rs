@@ -297,6 +297,7 @@ fn start_ragdolls(
     cvars: Option<Res<crate::cvars::Cvars>>,
     mut severs: MessageWriter<super::dismember::Severed>,
     spells: Option<Res<crate::ui_action::Spells>>,
+    mut dumped: Local<std::collections::HashSet<Option<u32>>>,
 ) {
     if ragdolls_off() {
         return;
@@ -349,6 +350,21 @@ fn start_ragdolls(
                 net.display_id,
                 rig.binds.len()
             );
+            // The skeleton once per model, as `bone:parent:x,y,z` bind locals, to tune against.
+            if dumped.insert(net.display_id) {
+                let bones: Vec<String> = rig
+                    .binds
+                    .iter()
+                    .zip(&rig.parents)
+                    .enumerate()
+                    .map(|(i, (b, p))| format!("{i}:{p}:{:.2},{:.2},{:.2}", b.x, b.y, b.z))
+                    .collect();
+                info!(
+                    "ragdoll: skeleton of display {:?}: {}",
+                    net.display_id,
+                    bones.join(" ")
+                );
+            }
             continue;
         };
         // The head's key bone gets a body of its own, so the head can come off.

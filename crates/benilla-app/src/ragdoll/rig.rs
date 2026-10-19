@@ -7,6 +7,8 @@ use bevy::math::Vec3;
 /// A bone's segment must be at least this fraction of the skeleton's height to get a body; the
 /// fingers, face and toes fall below it and ride their parent body rigidly.
 const MIN_SEGMENT: f32 = 0.08;
+/// When no profile comes out, the threshold is tried again at these shares of [`MIN_SEGMENT`].
+const SHORT_SEGMENT_RETRIES: [f32; 3] = [1.0, 0.5, 0.25];
 /// Most bodies a rig gets, keeping the hub and the longest segments: room for a spider's legs.
 const MAX_BODIES: usize = 32;
 /// Walking down from the root, the hub is the first bone no single child of which holds this share
@@ -52,6 +54,15 @@ pub(super) struct Profile {
 /// Build the profile from bind-pose locals (`RigPose::binds`) and parents. `None` when fewer than
 /// three bones qualify: a rock or a floating eye has nothing to flop.
 pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> {
+    // A skeleton of many short bones (a thunderhawk's neck, tail and wing fingers) has no segment
+    // long enough at the usual threshold, so it tries again with shorter ones.
+    SHORT_SEGMENT_RETRIES
+        .iter()
+        .find_map(|&share| build_profile_at(binds, parents, MIN_SEGMENT * share))
+}
+
+/// [`build_profile`] with segments of at least `min_segment` of the height earning a body.
+fn build_profile_at(binds: &[Vec3], parents: &[i16], min_segment: f32) -> Option<Profile> {
     let n = binds.len().min(parents.len());
     if n == 0 {
         return None;
@@ -123,7 +134,7 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
         .map(|i| {
             main_child[i]
                 .map(|c| (pivots[c] - pivots[i]).length())
-                .filter(|&l| l >= MIN_SEGMENT * height)
+                .filter(|&l| l >= min_segment * height)
                 .unwrap_or(0.0)
         })
         .collect();
@@ -154,7 +165,7 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
                     return None;
                 }
                 // A root bone at the model origin spans origin to pelvis: no limb.
-                (seg.length() >= MIN_SEGMENT * height && !root_like(i)).then_some((i, seg))
+                (seg.length() >= min_segment * height && !root_like(i)).then_some((i, seg))
             })
             .collect();
         if candidates.len() + 1 > MAX_BODIES {
@@ -169,8 +180,8 @@ pub(super) fn build_profile(binds: &[Vec3], parents: &[i16]) -> Option<Profile> 
         // with no child to run to gets a short stub up.
         let hub_seg = main_child[hub]
             .map(|c| pivots[c] - pivots[hub])
-            .filter(|s| s.length() >= 0.5 * MIN_SEGMENT * height)
-            .unwrap_or(Vec3::Y * MIN_SEGMENT * height);
+            .filter(|s| s.length() >= 0.5 * min_segment * height)
+            .unwrap_or(Vec3::Y * min_segment * height);
         candidates.insert(0, (hub, hub_seg));
 
         let mut body_of = vec![None; n];

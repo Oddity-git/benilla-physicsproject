@@ -346,6 +346,10 @@ added here.
 
 - A bone earns a body if the limb segment it starts is at least `MIN_SEGMENT` (0.08) long. There
   are at most `MAX_BODIES` (32).
+- When no profile comes out, `build_profile` retries at `SHORT_SEGMENT_RETRIES` (0.5, then 0.25 of
+  `MIN_SEGMENT`): a skeleton of many short bones, such as a thunderhawk's (display 1974/1975, 63
+  bones), had no segment long enough. A model that still fails logs its skeleton once
+  (`ragdoll: skeleton of display …`, `bone:parent:x,y,z`).
 - The **hub** is the pelvis-like bone where the limbs split (`find_hub`, `HUB_SHARE 0.75`).
   Nearby or short bones merge into it.
 - A chain (a snake, a lasher's vine) has no branch, so that walk runs to its tip. When the walked
