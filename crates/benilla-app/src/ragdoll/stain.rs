@@ -227,6 +227,16 @@ fn positions(mesh: &Mesh) -> Option<&[[f32; 3]]> {
     }
 }
 
+/// Fork: a creature of `CreatureType` 4 (Elemental) takes no blood stains.
+fn elemental(names: &crate::names::NameCache, store: &ObjectStore) -> bool {
+    store
+        .0
+        .object_entry()
+        .filter(|&e| e != 0)
+        .and_then(|e| names.creature_type(e))
+        == Some(4)
+}
+
 /// Leaves a stain on each bleeding hit's victim, facing the attacker.
 #[allow(clippy::too_many_arguments)] // one Bevy system's resources
 fn stain_hits(
@@ -235,7 +245,7 @@ fn stain_hits(
     places: Query<&GlobalTransform>,
     parts: Query<StockPart, Without<StainCopy>>,
     index: Res<GuidIndex>,
-    creatures: Option<Res<Creatures>>,
+    (creatures, names): (Option<Res<Creatures>>, Res<crate::names::NameCache>),
     blood: Option<Res<BloodTables>>,
     cvars: Option<Res<crate::cvars::Cvars>>,
     materials: Res<Assets<WowModelMaterial>>,
@@ -268,6 +278,9 @@ fn stain_hits(
         let killing = health == 0 || hit.damage >= health;
         if !hit.physical && !killing {
             continue;
+        }
+        if elemental(&names, store) {
+            continue; // stone and flame do not stain
         }
         let Some(id) = unit_blood_id(creatures.as_deref(), &blood, net.display_id) else {
             continue;
@@ -446,6 +459,7 @@ fn stain_cuts(
     mut cuts: MessageReader<super::dismember::Severed>,
     victims: Query<(&RigPose, &NetEntity, &ObjectStore)>,
     creatures: Option<Res<Creatures>>,
+    names: Res<crate::names::NameCache>,
     blood: Option<Res<BloodTables>>,
     cvars: Option<Res<crate::cvars::Cvars>>,
     time: Res<Time>,
@@ -465,6 +479,9 @@ fn stain_cuts(
         let Ok((rig, net, store)) = victims.get(cut.unit) else {
             continue;
         };
+        if elemental(&names, store) {
+            continue; // stone and flame do not stain
+        }
         let Some(id) = unit_blood_id(creatures.as_deref(), &blood, net.display_id) else {
             continue;
         };

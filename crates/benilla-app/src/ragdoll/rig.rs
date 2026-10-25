@@ -11,6 +11,8 @@ const MIN_SEGMENT: f32 = 0.08;
 const SHORT_SEGMENT_RETRIES: [f32; 3] = [1.0, 0.5, 0.25];
 /// Most bodies a rig gets, keeping the hub and the longest segments: room for a spider's legs.
 const MAX_BODIES: usize = 32;
+/// A debris rock's body runs this share of the height up from its bone.
+const DEBRIS_SEGMENT: f32 = 0.1;
 /// Walking down from the root, the hub is the first bone no single child of which holds this share
 /// of the limb length below it: the pelvis, where the spine and the legs part.
 const HUB_SHARE: f32 = 0.75;
@@ -231,6 +233,78 @@ fn build_profile_at(binds: &[Vec3], parents: &[i16], min_segment: f32) -> Option
     match (walked, chained) {
         (Some(w), Some(c)) if covered(&c) <= covered(&w) => Some(w),
         (w, c) => c.or(w),
+    }
+}
+
+/// Fork: an earth elemental's rocks are leaf bones that float around its middle, which no limb
+/// segment reaches, so the whole pile rode one body. Each leaf bone without a body gets a stubby
+/// body of its own, jointed to its nearest bodied ancestor, so the rocks fall apart. An empty
+/// profile first gets a hub: the bone with the biggest subtree below the root.
+pub(super) fn add_debris(profile: &mut Profile, binds: &[Vec3], parents: &[i16]) {
+    let n = binds.len().min(parents.len());
+    if n == 0 {
+        return;
+    }
+    let parent_of = |i: usize| usize::try_from(parents[i]).ok().filter(|&p| p < i);
+    let mut pivots = vec![Vec3::ZERO; n];
+    for i in 0..n {
+        pivots[i] = parent_of(i).map_or(Vec3::ZERO, |p| pivots[p]) + binds[i];
+    }
+    let (lo, hi) = pivots.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+        (lo.min(p.y), hi.max(p.y))
+    });
+    let height = (hi - lo).max(f32::EPSILON);
+    let mut subtree = vec![1usize; n];
+    let mut has_child = vec![false; n];
+    for i in (0..n).rev() {
+        if let Some(p) = parent_of(i) {
+            subtree[p] += subtree[i];
+            has_child[p] = true;
+        }
+    }
+    if profile.body_of.len() != n {
+        profile.body_of = vec![None; n];
+    }
+    let segment = Vec3::Y * DEBRIS_SEGMENT * height;
+    let radius = (segment.length() * HEAD_RADIUS).clamp(RADIUS_MIN * height, RADIUS_MAX * height);
+    if profile.bodies.is_empty() {
+        let hub = (0..n)
+            .filter(|&i| parent_of(i).is_some())
+            .max_by_key(|&i| (subtree[i], std::cmp::Reverse(i)))
+            .unwrap_or(0);
+        profile.body_of[hub] = Some(0);
+        profile.bodies.push(BodySpec {
+            bone: hub as u16,
+            pivot: pivots[hub],
+            segment,
+            radius,
+            parent: None,
+        });
+    }
+    for i in 0..n {
+        if profile.bodies.len() >= MAX_BODIES {
+            break;
+        }
+        if has_child[i] || profile.body_of[i].is_some() {
+            continue;
+        }
+        let mut up = parent_of(i);
+        let mut parent = 0;
+        while let Some(p) = up {
+            if let Some(b) = profile.body_of[p] {
+                parent = b;
+                break;
+            }
+            up = parent_of(p);
+        }
+        profile.body_of[i] = Some(profile.bodies.len());
+        profile.bodies.push(BodySpec {
+            bone: i as u16,
+            pivot: pivots[i],
+            segment,
+            radius,
+            parent: Some(parent),
+        });
     }
 }
 

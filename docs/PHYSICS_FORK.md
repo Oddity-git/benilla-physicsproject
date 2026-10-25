@@ -746,6 +746,9 @@ of rigs.
 
 ## 12. Known issues and open questions
 
+- **Elementals** (`CreatureType` 4): `stain` skips them, and `rig::add_debris` gives every leaf
+  bone without a body its own stubby body so earth elementals fall apart into their rocks.
+  Untested; no skeleton dump yet, so the rock bones are assumed to be leaf bones.
 - **Removed features.** Hitstop and cloth cloaks were removed entirely (code, settings and
   options) on 2026-10-25 at Mathieu's request. Capes draw as stock. Do not bring them back
   unless he asks.

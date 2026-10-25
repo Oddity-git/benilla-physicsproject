@@ -296,7 +296,10 @@ fn start_ragdolls(
     mut bodies: ResMut<RagdollBodies>,
     cvars: Option<Res<crate::cvars::Cvars>>,
     mut severs: MessageWriter<super::dismember::Severed>,
-    spells: Option<Res<crate::ui_action::Spells>>,
+    (spells, names): (
+        Option<Res<crate::ui_action::Spells>>,
+        Res<crate::names::NameCache>,
+    ),
     mut dumped: Local<std::collections::HashSet<Option<u32>>>,
 ) {
     if ragdolls_off() {
@@ -344,7 +347,22 @@ fn start_ragdolls(
         if dead {
             commands.entity(unit).try_remove::<SeenAlive>();
         }
-        let Some(mut profile) = build_profile(&rig.binds, &rig.parents) else {
+        // Fork: an Elemental (`CreatureType` 4) breaks into its rocks.
+        let debris = store
+            .0
+            .object_entry()
+            .filter(|&e| e != 0)
+            .and_then(|e| names.creature_type(e))
+            == Some(4);
+        let mut built = build_profile(&rig.binds, &rig.parents);
+        if debris {
+            super::rig::add_debris(
+                built.get_or_insert_with(Profile::default),
+                &rig.binds,
+                &rig.parents,
+            );
+        }
+        let Some(mut profile) = built else {
             info!(
                 "ragdoll: unit {unit} (display {:?}) has too few limbs to ragdoll ({} bones)",
                 net.display_id,
