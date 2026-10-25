@@ -420,7 +420,13 @@ pub(super) fn pose_limbs(
                 let n = rig.locals.len().min(rig.parents.len());
                 let mut model = vec![Affine3A::IDENTITY; n];
                 for i in 0..n {
-                    let local = rig.locals[i].compute_affine();
+                    let mut local = rig.locals[i];
+                    // The fold below leaves a limb root at `TINY`, and the pose keeps scale from
+                    // frame to frame, so the piece itself is drawn at full size.
+                    if cut.limbs.iter().any(|l| l.root == i) {
+                        local.scale = Vec3::ONE;
+                    }
+                    let local = local.compute_affine();
                     model[i] = match usize::try_from(rig.parents[i]).ok().filter(|&p| p < i) {
                         Some(p) => model[p] * local,
                         None => local,
