@@ -44,7 +44,7 @@ All of it lives behind the `ragdoll` Cargo feature, which is on by default.
 
 ## 2. Working rules for this repo
 
-These come from the maintainer (Mathieu). They override generic habits.
+These come from the maintainer (Oddity-git). They override generic habits.
 
 - **Environment.** CachyOS with the fish shell. The local clone is
   `~/Games/benilla-physicsproject`. He tests against a local cMaNGOS server with
@@ -91,7 +91,7 @@ deliberate exceptions. Do not "fix" them.
 | Features beyond 1.12.1 go in their own crate via `run_with` and keep their own settings, never CVar rows. | The fork lives inside `benilla-app` and registers its settings as CVar rows with `ours(...)` in `cvars/table.rs`. This keeps the options-window plumbing simple. |
 | Settings boot at the reference default. | The fork's rows are `ours` rows, which have no reference value. Their defaults are the fork's choice. |
 | The UI layer does not grow, and a test names its files. | The fork adds one file, `assets/ui/PhysicsOptions.xml`. It is listed in `layer.toc` and in `shipped_xml_tests.rs`. |
-| Gates include `cargo test --workspace` and smoke runs. | Mathieu's rule is compile and clippy only (section 2). |
+| Gates include `cargo test --workspace` and smoke runs. | Oddity-git's rule is compile and clippy only (section 2). |
 | land by squash-merged PR to `main` | The fork pushes straight to `ragdoll`. |
 
 The upstream hard rules still apply: never commit anything from the WoW install, never write into
@@ -169,7 +169,7 @@ upstream can find it. `grep -rn "Fork:" crates` lists them. These are the hooks:
   pipelines. This fixed a crash near water that ragdolls exposed. It is a real bug fix, not a
   feature.
 
-**Merging upstream.** Mathieu's standing preference is benilla's tagged releases (`git fetch up
+**Merging upstream.** Oddity-git's standing preference is benilla's tagged releases (`git fetch up
 --tags`, then `git merge <tag>`), but he asked for upstream `main` on 2026-10-13 and it was merged
 (`git merge up/main`; conflicts were only the Cargo feature lists, both kept, and `README.md`,
 kept ours). Merge whatever he names; ask if he names neither.
@@ -300,7 +300,7 @@ The page's rows, in order:
 | Foot Planting | `footPlanting` | 0–1, 0 off | 1 |
 | Turn Around on Back | `omniMovement` | box | 0 |
 
-Wide slider ranges (up to 10×) are intentional. Mathieu asked for "wacky high settings".
+Wide slider ranges (up to 10×) are intentional. Oddity-git asked for "wacky high settings".
 
 ---
 
@@ -358,7 +358,7 @@ added here.
 - `start_ragdolls` (Update) creates bodies at the current pose, joints, and the death push and
   lift. **Stiffness** (`ragdollStiffness`, s in 0–1, default 0.5) sets each joint: its rest is
   the bind direction slerped by s toward the pose the unit died in, and the swing limit, twist
-  limit and angular damping lerp from `(55°, 20°, 4)` at 0 to `(8°, 3°, 30)` at 1. Mathieu found
+  limit and angular damping lerp from `(55°, 20°, 4)` at 0 to `(8°, 3°, 30)` at 1. Oddity-git found
   the old fixed 55°/20° about the bind pose floppy, limbs bending wrong ways, and asked for
   stiffer, short of frost. Death push and lift:
   - push = `DEATH_PUSH` plus `BLOW_PUSH` × the killing blow's share of health, capped by
@@ -368,7 +368,7 @@ added here.
   It also decides frozen, shocked and severed limbs.
 - **Melee delay.** A melee kill (`school None`) gets `AwaitingBlow` and is skipped until
   `now − hit.at ≥ ragdollMeleeDelay` (default 0.3 s, max 1 s). `track_unit_motion` keeps
-  `LastSpot` updated meanwhile. Spells are never delayed. Mathieu was explicit about that.
+  `LastSpot` updated meanwhile. Spells are never delayed. Oddity-git was explicit about that.
 - **Frost** (school 4): joints are locked near the death pose (`FROZEN_LIMIT 2°`,
   `FROZEN_DAMPING 60`), and the body inserts `frost::Frozen`.
 - **Shock**: `shocked = !frozen && no knockdown && (killing spell name is_shock ||
@@ -403,11 +403,11 @@ corpse. The stock loot sparkle is moved to the sack.
 The sack fades in `DROP_HEIGHT 1.2` yd (× its size) above the spot over `FADE_IN 0.25` s, falls
 for `FALL 0.35` s, squashes `SQUASH 0.2` and bounces twice (`BOUNCES`: 0.15 yd for 0.22 s, 0.04 yd
 for 0.12 s) in `drop_bags`, drawn, not simulated; the fade is the meshes' `MeshTag` alpha
-(the plain fallback bag has none and just drops). Mathieu asked for it instead of popping in.
+(the plain fallback bag has none and just drops). Oddity-git asked for it instead of popping in.
 **Skinning.** Once the corpse is looted and `UNIT_FLAG_SKINNABLE` (0x0400_0000) is set, the sack
 is swapped for a hide on the same spot (`wants`: sack while lootable, hide while skinnable), with
 the same drop and the same corpse pick, so skinning works where the server keeps the corpse.
-Mathieu found that a corpse whose sack he had looted could not then be skinned with WowPad's
+Oddity-git found that a corpse whose sack he had looted could not then be skinned with WowPad's
 interact. The hide model is the shortest `World\…\*.m2` whose name holds `pelt`, `\hide`,
 `_hide`, `bearskin` or `rug` (logged `ragdoll skinning hide: using …`), scaled to
 `HIDE_RADIUS 0.45` yd across from its bound; a flat leather disc stands in without one.
@@ -425,7 +425,7 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   × goreAmount` long thin lines from under the victim, away from the attacker (half-sizes
   `LINE_LENGTH 0.3–0.8` × (0.6 + share) by `LINE_WIDTH 0.03–0.06`). Both are the stock splat
   textures through `lay_stretched`: `yaw = atan2(−dir.z, dir.x)`, because the decal frame's x
-  axis lies along (cos, −sin). Mathieu asked for more variety than round splats.
+  axis lies along (cos, −sin). Oddity-git asked for more variety than round splats.
 - **Splats** are decals on the shared ground projector and fade out. The cap is
   `MAX_SPLATS 400 × goreAmount`, up to `MAX_SPLATS_EVER 4000`.
 - **Pools** start under a ragdoll, centred on its bodies' middle at the lowest body's height. A
@@ -440,7 +440,7 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   stump at the root's bind point on its parent, facing along the bone; the piece at its root
   joint, facing back up it), and `push_wounds` draws each as a quad turned to the eye, half-size
   `CUT_FACE 0.07` × the unit's height, pushed `CUT_FACE_OUT 0.25` of that out of the flesh and
-  `CUT_FACE_TO_EYE 0.5` toward the eye so the body does not hide it. Mathieu found the cut's
+  `CUT_FACE_TO_EYE 0.5` toward the eye so the body does not hide it. Oddity-git found the cut's
   vertex stain too faint and asked for the ground splat on the stump. `drop_wounds` removes them
   when the unit is healed or gone, or Blood is off.
 - Droplets are drawn as effect quads through `WorldEffectDraw` (`push_decals` after
@@ -484,7 +484,7 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   `VisibilityPropagate`, and `release` restores `Inherited` unless the sway holds the part.
 - **Cuts.** `stain_cuts` reads `dismember::Severed` (which carries the limb's root `bone`) and adds
   a cut stain at that bone's bind pivot: `CUT_RADIUS 0.07` of the height across, the unit's stain
-  colour × `CUT_DARKEN 0.5`, covering fully. Mathieu asked for a deep red where the limb comes off.
+  colour × `CUT_DARKEN 0.5`, covering fully. Oddity-git asked for a deep red where the limb comes off.
   The stained parts draw the stump. The severed piece's parts carry `dismember::LimbPart` (their
   stock part and mesh), and `draw_limb_stains` (PostUpdate) swaps their `Mesh3d` to the unit's
   stained copy of that part while there is one, so the piece shows the cut and any earlier stains,
@@ -575,7 +575,7 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   `jolt_shocked` removes `Sleeping` and kicks every body in spasms `JOLT_EVERY 0.12–0.32` s
   apart for `SEIZURE 4.5` s, strength `1 − t³` (fading late): up to `JOLT_SPEED 5.5` yd/s and
   `JOLT_SPIN 16` rad/s, `SHARED 0.6` of each kick the same for every body so the whole body
-  convulses, and the hub lifted `ARCH 1.5` yd/s. Mathieu found the old 0.06 s, 2.2 yd/s buzz
+  convulses, and the hub lifted `ARCH 1.5` yd/s. Oddity-git found the old 0.06 s, 2.2 yd/s buzz
   too rapid and small. `tint_shocked` flickers a pale blue. The body never stiffens; it shakes and then
   lies as normal.
 
@@ -610,7 +610,7 @@ Do not describe this one in the README (section 2).
   lightest joint slot and fading out toward `REACH × radius`. Rear lobes take at most
   `REAR_WEIGHT 0.75` of a vertex, so the hips and thighs still bend it. The distance is
   stretched per axis: the chest's reaches `CHEST_REACH_UP 2` further upward so it slopes from
-  the collar (Mathieu found the orc chest a harsh ball), and the rear's reaches only
+  the collar (Oddity-git found the orc chest a harsh ball), and the rear's reaches only
   `REAR_REACH_VERTICAL 0.9` up and down and takes nothing deeper than its centre, to stay off the
   waist and thighs. The rear's centre sits `REAR_CENTRE_DEPTH 0.8 × radius` behind its tip
   (the chest's 0.4), so it swells round.
@@ -619,7 +619,7 @@ Do not describe this one in the README (section 2).
 - The copy slot has `bones + lobes` rows (2 or 4) with identity ibp. Its rows are the unit's own
   `rig_rows` plus the spring bones.
 - **Spring.** `FREQUENCY 5`, `DAMPING 0.15`, fixed `STEP 1/120`, horizontal response × 0.2, offset
-  capped at `MAX_OFFSET 0.35 × radius × bodyPhysics`. The rear's is calmer on purpose (Mathieu
+  capped at `MAX_OFFSET 0.35 × radius × bodyPhysics`. The rear's is calmer on purpose (Oddity-git
   asked for less bounce than the chest): `REAR_FREQUENCY 7`, `REAR_DAMPING 0.3`, `REAR_LAG 0.5`
   of the motion, `REAR_STRAY 0.5` of the cap. A jump over `TELEPORT 2` resets it. **The
   component pointing into the body (against the lobe's outward direction, −Z for the chest and +Z
@@ -643,7 +643,7 @@ Do not describe this one in the README (section 2).
   `TELEPORT 2` resets it.
 - **Vertical only, no tilt.** The lag shifts the item straight up or down in the world. An
   earlier version tipped it about the attach point from the horizontal lag too; running forward
-  at Weapon Motion 3 swung a back weapon nearly flat, and Mathieu asked for footstep bounce only.
+  at Weapon Motion 3 swung a back weapon nearly flat, and Oddity-git asked for footstep bounce only.
 - The shift goes on two places: the root's `Transform` (the attach offset plus the shift in the
   anchor's frame), which collision, picking and the glow read, and `RiderTilt` (a translation),
   which the rendered rider frame takes. Runs in PostUpdate before `TransformSystems::Propagate`.
@@ -659,7 +659,7 @@ Do not describe this one in the README (section 2).
   still ends it.
 
 ### `feet.rs` (foot planting, two-bone IK)
-- Players only (`object_type() == Player`; Mathieu asked for players only after creatures sank
+- Players only (`object_type() == Player`; Oddity-git asked for players only after creatures sank
   through the floor), alive, on foot, within `RANGE 60` yd of the camera, not a ragdoll, not
   parked, not mounted (`unit_mount_display_id`). Two or more legs needed.
 - **Legs** come from `rig::build_profile`: a body whose segment runs down straight off the hub
@@ -693,7 +693,7 @@ Do not describe this one in the README (section 2).
   camera are stock. `stock` (right mouse held, `may_turn` or `may_translate` down) leaves the
   stock backpedal.
 - It used to be full omni-directional movement (every key a direction from the camera, facing
-  the camera on release in combat). Mathieu found it confused when rolling a gamepad stick from
+  the camera on release in combat). Oddity-git found it confused when rolling a gamepad stick from
   right or left to down, and asked for only the turn around. The CVar kept its name
   `omniMovement` so existing configs still read.
 - State is statics (`ON`, `BACKING`, `TURNING`, `TARGET`); `read_box` (PreUpdate) reads the
@@ -738,7 +738,7 @@ of rigs.
 6. Run `cargo build --release -p benilla` and clippy with `-D warnings`. Clippy fixes used before:
    `as_chunks::<3>()` instead of `chunks_exact(3)`, type aliases for big query tuples
    (`type_complexity`), `then_some`, and `iter_mut().enumerate()` for `needless_range_loop`.
-7. Commit as "Ragdoll: …", push to `ragdoll`, and give Mathieu a fish block to pull and build.
+7. Commit as "Ragdoll: …", push to `ragdoll`, and give Oddity-git a fish block to pull and build.
 8. Add a log line (`info!` once per model, `warn!` on failure) for anything that can silently
    fail on some races. He sends the terminal output back.
 
@@ -750,7 +750,7 @@ of rigs.
   bone without a body its own stubby body so earth elementals fall apart into their rocks.
   On death every rock is severed too, whatever the Dismemberment option says. Untested; no skeleton dump yet, so the rock bones are assumed to be leaf bones.
 - **Removed features.** Hitstop and cloth cloaks were removed entirely (code, settings and
-  options) on 2026-10-25 at Mathieu's request. Capes draw as stock. Do not bring them back
+  options) on 2026-10-25 at Oddity-git's request. Capes draw as stock. Do not bring them back
   unless he asks.
 - **Gnome female sway** does not activate. A `body physics:` log line was requested. The likely
   cause is `find_chest` validation failing on the gnome's proportions.
