@@ -32,8 +32,6 @@ fidelity to the 1.12.1 reference client. This fork deliberately adds features 1.
 | Frost kills freeze stiff and icy | `frost`, `life` | always |
 | Lightning kills shake in a seizure | `shock`, `life` | always |
 | Knockdowns ragdoll and stand back up; a debug kick | `knock` | always |
-| Hitstop on landed melee hits | `hitstop` | `hitstop`, `hitstopStrength` |
-| Cloth cloaks | `cloak` | `cloakPhysics`, `cloakMotion`, `cloakLooseDrawn` |
 | Soft-body sway on female units | `sway` | `bodyPhysics`, `bodySize`, `bodyRearSize` |
 | Stowed weapons jostle while moving | `jostle` | `weaponMotion` |
 | Feet plant on slopes and steps (foot IK) | `feet` | `footPlanting` |
@@ -77,7 +75,7 @@ These come from the maintainer (Mathieu). They override generic habits.
   ```fish
   cd ~/Games/benilla-physicsproject
   env WOW_HOST=localhost:3726 cargo run --release -p benilla 2>&1 | tee /tmp/benilla.log
-  grep -E "cloth cloak|body physics" /tmp/benilla.log
+  grep -E "ragdoll:|body physics" /tmp/benilla.log
   ```
 
 ---
@@ -183,7 +181,7 @@ re-apply the hook in the new place and keep the `Fork:` comment.
 
 ## 6. Rendering concepts every feature depends on
 
-The cloak, sway and dismemberment code all depend on how benilla draws skinned models.
+The sway, stain and dismemberment code all depend on how benilla draws skinned models.
 Misunderstanding this causes most bugs.
 
 ### 6.1 Palette rig slots
@@ -208,8 +206,8 @@ palette (a storage buffer of `Mat4` rows), and its meshes' shader reads rows fro
 
 ### 6.2 The mesh-copy technique
 
-1.12 models have no cloth bones, no breast bones and one skinned mesh per unit. So `cloak`,
-`sway` and `dismember` all use the same trick:
+1.12 models have no cloth bones, no breast bones and one skinned mesh per unit. So `sway`,
+`stain` and `dismember` all use the same trick:
 
 1. Hide the stock part by setting `Visibility::Hidden` in a system that runs
    `.before(VisibilitySystems::VisibilityPropagate)`.
@@ -248,7 +246,7 @@ Gotchas, each learned the hard way:
 
 - Bevy: +Y up, model front is −Z.
 - WoW to Bevy: `wow_to_bevy(x, y, z) = (−y, z, −x)`.
-- 1.12 bones have **no names**. Everything (ragdoll bodies, cloak capsules, chest bones) is
+- 1.12 bones have **no names**. Everything (ragdoll bodies, chest bones) is
   found from the bind skeleton's geometry, never by bone index tables.
 
 ### 6.4 Tints
@@ -265,8 +263,8 @@ Every slider or checkbox needs changes in three places:
 
 1. **`crates/benilla-app/src/cvars/table.rs`**: add a row near the others,
    ```rust
-   // benilla's own: the Physics page's Cloak Motion slider, how much the cloth cloaks swing.
-   ours("cloakMotion", "1", "benilla's own — 1.12 draws a cloak stiff on the body's bones"),
+   // benilla's own: how hard a dying ragdoll is thrown, times the fork's own push.
+   ours("ragdollPush", "1", "benilla's own — 1.12 ragdolls nothing, so it throws nothing"),
    ```
 2. **`crates/benilla-app/assets/ui/PhysicsOptions.xml`**:
    - a `BENILLA_TOOLTIP_*` string in the `<Script>`;
@@ -289,17 +287,12 @@ The page's rows, in order:
 | Blood Stains | `bloodStains` | 0–3, 0 off | 1 |
 | Dismemberment | `dismemberment` | box | 0 |
 | Dismember Amount | `dismemberAmount` | 0.25–10 | 1 |
-| Hitstop | `hitstop` | box | 1 |
-| Hitstop Strength | `hitstopStrength` | 0.25–3 | 1 |
 | Death Push | `ragdollPush` | 0–10 | 1 |
 | Death Lift | `ragdollLift` | 0–10 | 1 |
 | Spell Push | `ragdollSpellPush` | 0.5–10 | 2 |
 | Melee Death Delay | `ragdollMeleeDelay` | 0–1 s, step 0.05 | 0.3 |
 | Ragdoll Stiffness | `ragdollStiffness` | 0–1, step 0.1 | 0.5 |
 | Death Effects | `deathEffects` | box | 1 |
-| Cloak Physics | `cloakPhysics` | box | 1 |
-| Cloak Motion | `cloakMotion` | 0–3 | 1 |
-| Loose Cloak When Armed | `cloakLooseDrawn` | box | 1 |
 | Body Physics | `bodyPhysics` | 0–3, 0 off | 1 |
 | Chest Size | `bodySize` | 0.5–2.5 | 1 |
 | Rear Size | `bodyRearSize` | 0.5–2.5 | 1 |
@@ -324,7 +317,6 @@ damage and death **before** the attacker's swing animation reaches its impact fr
   `benilla_protocol::messages::PeriodicTick`; it is not re-exported at the crate root) calls
   `gore::bleed` on a physical damage tick with `amount > 0`. A periodic physical
   `SpellDamageLog` bleeds too.
-- **Swings.** `SwingMessage` and `SwingImpact` (the impact key of the swing clip) drive hitstop.
 - **Spell names.** `crate::ui_action::Spells` holds a `catalog`. Use
   `spells.catalog.get(id).map(|s| &s.name)`. `shock` classifies spells by name.
 - **Unit fields.** `ObjectStore` gives `unit_is_dead()`, `unit_gender()` (1 is female),
@@ -466,7 +458,7 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   shader does not clamp the vertex colour.
 - **Why copies.** A body's composited texture (`skin_composite.rs`, cached by `SkinKey`) and its
   materials are shared by every unit of the same look, so a stain painted there would stain them
-  all. Instead each stained unit's skinned parts (capes excluded, the cloaks draw those) are
+  all. Instead each stained unit's skinned parts (capes excluded) are
   drawn as copies of their meshes with a `Mesh::ATTRIBUTE_COLOR`. `WowModelMaterial` binds that
   attribute on skinned layouts and Bevy multiplies it into the base colour, so no shader change
   is needed. The copies use the unit's **own** palette slot and the stock part's tag unchanged,
@@ -533,7 +525,7 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   scaled to zero, which folds the limb into the stump **at its joint**.
 - **Parked parts.** A part a blood stain or the sway hides is parked after 30 frames (6.2), its
   `Mesh3d` moved to `ParkedMesh`. `build_limb_copies` takes the mesh from either, or a bloodied
-  unit's limb copied nothing and vanished. A parked cape (the cloth cloak draws it) is skipped.
+  unit's limb copied nothing and vanished. A parked cape is skipped.
 - `heal` undoes this when a unit revives.
 - `refit_rebuilt` (first in the PosePost chain): a ragdoll whose `RigPose` bone count changed (a
   model rebuilt with another skeleton, such as a Druid of the Fang leaving snake form as it dies)
@@ -568,13 +560,6 @@ All blood colours and textures come from the stock `UnitBlood` tables. Violence 
   once the bodies are dropped). At most `MAX_PUFFS 1200`.
 - A missing kit logs `death effects: no burning model …` and the puffs still run.
 
-### `hitstop.rs`
-On a landed melee hit (`SwingMessage`), at the clip's impact key, it holds the **drawn pose** of
-the attacker and victim for `STOP 0.06` s (`CRIT_STOP 0.12` on a crit, more for a big share, at
-most 0.3, × `hitstopStrength`). It holds only the drawn pose, not the animation clips: pausing
-the clips desynced the animation driver, so units walked in place and swing sounds drifted. Clips
-with no impact key (some blunt weapons) stop after `FALLBACK 0.3` s instead.
-
 ### `knock.rs`
 - The game's own knockdown animation (121), as from Charge or Lash, ragdolls the unit and stands
   it up when the animation would have ended.
@@ -593,29 +578,6 @@ with no impact key (some blunt weapons) stop after `FALLBACK 0.3` s instead.
   convulses, and the hub lifted `ARCH 1.5` yd/s. Mathieu found the old 0.06 s, 2.2 yd/s buzz
   too rapid and small. `tint_shocked` flickers a pale blue. The body never stiffens; it shakes and then
   lies as normal.
-
-### `cloak.rs` (cloth cloaks)
-A 1.12 cloak is body geosets (15xx) skinned to the spine, hips and thighs, with no bone of its
-own.
-
-- Cape parts are found by material texture path containing `objectcomponents/cape`. **All cape
-  parts of one rig merge into one `Cloth`** (`pieces`). Separate cloths per part tore apart at
-  the seams.
-- The cloak as the animation skins it is the **target**. The top rows (pinned) ride the
-  shoulders exactly. The rest is verlet cloth with gravity (`GRAVITY 4`), edge constraints,
-  bending (`BEND 0.5`), damping (`KEEP 0.96`), and a pull toward the target that weakens down the
-  cloak (`FOLLOW_HEM 0.04` at the hem).
-- Capsules fitted to the bones the cloak rides keep it out of the legs and back.
-- **Vibration fix.** Each frame takes an equal number of fixed substeps (at most `MAX_STEPS`), and
-  inertia is `INERTIA 0.35 × cloakMotion`. When the drift clamp (`MAX_DRIFT`) moves a vertex it
-  moves `prev` by the same amount, or the clamp injects velocity.
-- **Seams.** Normals are averaged over smooth groups across pieces.
-- **Weapon drawn** (`cloakLooseDrawn`). Read from the unit's `CommittedSheath::state()`, falling back to
-  `ObjectStore::unit_sheath_state() != 0`. The lower cloak eases (`LOOSE_RAMP`, `LOOSE_EASE`) to a
-  rigid carry by the pinned rows' main bone, so it hangs from the shoulders and not the hips.
-- Only the nearest `MAX_CLOTHS` (10) within `MAX_RANGE` (60) simulate.
-- Copies use a one-bone palette slot (identity rows) because the CPU writes final positions.
-- Logs `cloth cloak: …` once per model.
 
 ### `sway.rs` (soft-body sway)
 Do not describe this one in the README (section 2).
@@ -748,12 +710,12 @@ of rigs.
 
 | Schedule | Systems |
 |---|---|
-| Update | `life`: `track_unit_motion → start_ragdolls`; `gore` chain; `dismember`: `build_limb_copies`, `heal_limbs`; `cloak::manage_cloths`; `sway::manage_sways`; `knock`; `hitstop::start_stops`; `shock`: `note_shock_debuffs`, `jolt_shocked`; `frost`/`shock` tints after `apply_aura_tint`; `lootbag` chain; `bounds::fit_bounds` |
+| Update | `life`: `track_unit_motion → start_ragdolls`; `gore` chain; `dismember`: `build_limb_copies`, `heal_limbs`; `sway::manage_sways`; `knock`; `shock`: `note_shock_debuffs`, `jolt_shocked`; `frost`/`shock` tints after `apply_aura_tint`; `lootbag` chain; `bounds::fit_bounds` |
 | FixedUpdate | `pusher::follow_players`, `life::release_parted_pairs` |
 | PostUpdate, before animation | `life::reset_getting_up` |
-| PostUpdate, `PosePost` | `life` chain (section 9), `hitstop::hold_stops`, `feet::plant_feet` |
-| PostUpdate, after `finalize_rig_worlds`, in `BillboardPlace` | `cloak::simulate_cloths`, `sway::pose_sways` |
-| PostUpdate, before `VisibilityPropagate` | `cloak::hide_stock_cloaks`, `sway::hide_stock_parts` |
+| PostUpdate, `PosePost` | `life` chain (section 9), `feet::plant_feet` |
+| PostUpdate, after `finalize_rig_worlds`, in `BillboardPlace` | `sway::pose_sways` |
+| PostUpdate, before `VisibilityPropagate` | `sway::hide_stock_parts` |
 | PostUpdate, after `begin_effect_frame` | `gore::push_decals` |
 | PostUpdate, before `TransformSystems::Propagate` | `jostle::jostle_stowed` |
 | Update, after `sway::manage_sways` | `stain`: `stain_hits → manage_stains → manage_weapon_stains` |
@@ -784,9 +746,9 @@ of rigs.
 
 ## 12. Known issues and open questions
 
-- **Troll male cloak pinch.** The cloak narrows at the waist into an hourglass shape. Not yet
-  diagnosed. The likely cause is the capsule fit or the target-follow on the hip bones. A
-  comparison with Cloak Physics off was requested to rule out the stock mesh.
+- **Removed features.** Hitstop and cloth cloaks were removed entirely (code, settings and
+  options) on 2026-10-25 at Mathieu's request. Capes draw as stock. Do not bring them back
+  unless he asks.
 - **Gnome female sway** does not activate. A `body physics:` log line was requested. The likely
   cause is `find_chest` validation failing on the gnome's proportions.
 - Not yet confirmed in game: pool follow, lightning seizure, bleed squirts, the hair exclusion
@@ -808,9 +770,9 @@ of rigs.
 | `a3815a31` | Water twin crash fix |
 | `eecd06ed` | Draw box follows the body |
 | `4de5c228` | Spell kills throw harder, frost freezes |
-| `2f1520b7`, `20b95aa8` | Hitstop (holding the pose, not the clips) and gore sliders |
+| `2f1520b7`, `20b95aa8` | Hitstop (since removed) and gore sliders |
 | `e54af430`, `7c397fed` | The Physics options page in its own file, push and lift sliders |
-| `f79b2261`…`b4bdd2df` | Cloth cloaks, one cloth per cloak, Cloak Motion, loose cloak when armed |
+| `f79b2261`…`b4bdd2df` | Cloth cloaks (since removed) |
 | `57b6ac60`, `0a963fad` | Melee death timing, first by impact key, then as a delay slider; 10× sliders; Body Physics |
 | `0e004276` | Sway bounces vertically and never presses inward |
 | `12399c9c` | Gore Amount raises the splat cap and spray speed |

@@ -101,7 +101,7 @@ struct Stains {
     /// Bloodied weapon mesh parts, by entity: an item's model is the unit's own entity, so its
     /// `Mesh3d` is swapped for a stained clone and put back when the stains fade.
     weapons: EntityHashMap<Weapon>,
-    /// Which materials are capes, by id: the cloth cloaks draw those.
+    /// Which materials are capes, by id: a cape is not stained.
     capes: HashMap<AssetId<WowModelMaterial>, bool>,
     rng: u32,
 }

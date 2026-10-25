@@ -130,7 +130,7 @@ pub(super) struct Sways {
     /// Rigs whose chest could not be found, with the parts it was looked for on; retried once
     /// those change (a re-dress).
     failed: EntityHashMap<Vec<(Entity, AssetId<Mesh>)>>,
-    /// Which materials are capes or hair, by id: the cloth cloaks draw the capes, and hair hanging
+    /// Which materials are capes or hair, by id: a cape does not sway, and hair hanging
     /// over the chest would otherwise be taken for it.
     capes: HashMap<AssetId<WowModelMaterial>, bool>,
     /// Identity bindposes, by bone count.

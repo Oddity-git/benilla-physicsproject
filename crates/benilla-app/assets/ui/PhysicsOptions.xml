@@ -26,13 +26,6 @@
         BENILLA_TOOLTIP_DISMEMBER_AMOUNT =
             "How easily limbs come off. Higher lets lighter killing blows sever limbs."
 
-        BENILLA_TOOLTIP_HITSTOP =
-            "Holds the attacker's and the target's animations for a moment when a melee hit "
-            .. "lands, longer on a crit or a heavy hit, so blows feel weightier."
-
-        BENILLA_TOOLTIP_HITSTOP_STRENGTH =
-            "How long the hitstop holds."
-
         BENILLA_TOOLTIP_DEATH_PUSH =
             "How hard a killing blow throws the body away from the killer. A heavier blow "
             .. "throws it further. High settings get silly."
@@ -44,17 +37,6 @@
         BENILLA_TOOLTIP_SPELL_PUSH =
             "How much harder a spell's killing blow throws the body than a melee one, on top "
             .. "of Death Push."
-
-        BENILLA_TOOLTIP_CLOAK_PHYSICS =
-            "Lets cloaks hang and swing as cloth, trailing behind as you move. Applies to the "
-            .. "ten nearest cloaks."
-
-        BENILLA_TOOLTIP_CLOAK_MOTION =
-            "How much the cloth cloaks swing and trail behind. Lowest holds them to the body."
-
-        BENILLA_TOOLTIP_CLOAK_LOOSE_DRAWN =
-            "With a weapon drawn, cloth cloaks hang from the shoulders only, not the hips and "
-            .. "legs, so the weapon swings clear of them."
 
         BENILLA_TOOLTIP_BODY_PHYSICS =
             "How much female characters' bodies sway as they move. Lowest turns it off."
@@ -97,9 +79,8 @@
             table.insert(BENILLA_OPTIONS_CATEGORY_KEYS, "Physics")
             BENILLA_OPTIONS_PAGE_ROWS.Physics = {
                 "RowBlood", "RowGoreAmount", "RowBloodStains", "RowDismemberment", "RowDismemberAmount",
-                "RowHitstop", "RowHitstopStrength", "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay", "RowStiffness", "RowDeathEffects",
-                "RowCloakPhysics", "RowCloakMotion",
-                "RowCloakLooseDrawn", "RowBodyPhysics", "RowBodySize", "RowBodyRearSize",
+                "RowDeathPush", "RowDeathLift", "RowSpellPush", "RowMeleeDelay", "RowStiffness", "RowDeathEffects",
+                "RowBodyPhysics", "RowBodySize", "RowBodyRearSize",
                 "RowWeaponMotion", "RowFootPlanting", "RowOmniMovement",
             }
         end
@@ -183,30 +164,10 @@
                     BenillaOptionsSliderRow_Setup(this, 0.25, 10, 0.25)
                 </OnLoad></Scripts>
             </Frame>
-            <Frame name="$parentRowHitstop" inherits="BenillaOptionsCheckboxRowTemplate">
+            <Frame name="$parentRowDeathPush" inherits="BenillaOptionsSliderRowTemplate">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="$parentRowDismemberAmount" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                     <Anchor point="TOPRIGHT" relativeTo="$parentRowDismemberAmount" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                </Anchors>
-                <Scripts><OnLoad>
-                    BenillaOptionsRow_OnLoad(this, "hitstop", "Hitstop", "BENILLA_TOOLTIP_HITSTOP")
-                </OnLoad></Scripts>
-            </Frame>
-            <Frame name="$parentRowHitstopStrength" inherits="BenillaOptionsSliderRowTemplate">
-                <Anchors>
-                    <Anchor point="TOPLEFT" relativeTo="$parentRowHitstop" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                    <Anchor point="TOPRIGHT" relativeTo="$parentRowHitstop" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                </Anchors>
-                <Scripts><OnLoad>
-                    BenillaOptionsRow_OnLoad(this, "hitstopStrength", "Hitstop Strength",
-                        "BENILLA_TOOLTIP_HITSTOP_STRENGTH")
-                    BenillaOptionsSliderRow_Setup(this, 0.25, 3, 0.25)
-                </OnLoad></Scripts>
-            </Frame>
-            <Frame name="$parentRowDeathPush" inherits="BenillaOptionsSliderRowTemplate">
-                <Anchors>
-                    <Anchor point="TOPLEFT" relativeTo="$parentRowHitstopStrength" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                    <Anchor point="TOPRIGHT" relativeTo="$parentRowHitstopStrength" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                 </Anchors>
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "ragdollPush", "Death Push",
@@ -268,41 +229,10 @@
                         "BENILLA_TOOLTIP_DEATH_EFFECTS")
                 </OnLoad></Scripts>
             </Frame>
-            <Frame name="$parentRowCloakPhysics" inherits="BenillaOptionsCheckboxRowTemplate">
+            <Frame name="$parentRowBodyPhysics" inherits="BenillaOptionsSliderRowTemplate">
                 <Anchors>
                     <Anchor point="TOPLEFT" relativeTo="$parentRowDeathEffects" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                     <Anchor point="TOPRIGHT" relativeTo="$parentRowDeathEffects" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                </Anchors>
-                <Scripts><OnLoad>
-                    BenillaOptionsRow_OnLoad(this, "cloakPhysics", "Cloak Physics",
-                        "BENILLA_TOOLTIP_CLOAK_PHYSICS")
-                </OnLoad></Scripts>
-            </Frame>
-            <Frame name="$parentRowCloakMotion" inherits="BenillaOptionsSliderRowTemplate">
-                <Anchors>
-                    <Anchor point="TOPLEFT" relativeTo="$parentRowCloakPhysics" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                    <Anchor point="TOPRIGHT" relativeTo="$parentRowCloakPhysics" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                </Anchors>
-                <Scripts><OnLoad>
-                    BenillaOptionsRow_OnLoad(this, "cloakMotion", "Cloak Motion",
-                        "BENILLA_TOOLTIP_CLOAK_MOTION")
-                    BenillaOptionsSliderRow_Setup(this, 0, 3, 0.25)
-                </OnLoad></Scripts>
-            </Frame>
-            <Frame name="$parentRowCloakLooseDrawn" inherits="BenillaOptionsCheckboxRowTemplate">
-                <Anchors>
-                    <Anchor point="TOPLEFT" relativeTo="$parentRowCloakMotion" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                    <Anchor point="TOPRIGHT" relativeTo="$parentRowCloakMotion" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                </Anchors>
-                <Scripts><OnLoad>
-                    BenillaOptionsRow_OnLoad(this, "cloakLooseDrawn", "Loose Cloak When Armed",
-                        "BENILLA_TOOLTIP_CLOAK_LOOSE_DRAWN")
-                </OnLoad></Scripts>
-            </Frame>
-            <Frame name="$parentRowBodyPhysics" inherits="BenillaOptionsSliderRowTemplate">
-                <Anchors>
-                    <Anchor point="TOPLEFT" relativeTo="$parentRowCloakLooseDrawn" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
-                    <Anchor point="TOPRIGHT" relativeTo="$parentRowCloakLooseDrawn" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                 </Anchors>
                 <Scripts><OnLoad>
                     BenillaOptionsRow_OnLoad(this, "bodyPhysics", "Body Physics",

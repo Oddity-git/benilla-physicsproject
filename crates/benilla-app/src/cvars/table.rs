@@ -861,7 +861,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0",
         "benilla's own — 1.12 ragdolls nothing, so it has nothing to dismember",
     ),
-    // benilla's own: the Graphics page's gore sliders and the hitstop box (`ragdoll`).
+    // benilla's own: the Graphics page's gore sliders (`ragdoll`).
     ours(
         "goreAmount",
         "1",
@@ -877,16 +877,6 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "dismemberAmount",
         "1",
         "benilla's own — 1.12 ragdolls nothing, so it has nothing to dismember",
-    ),
-    ours(
-        "hitstop",
-        "1",
-        "benilla's own — 1.12 never holds an animation on a hit",
-    ),
-    ours(
-        "hitstopStrength",
-        "1",
-        "benilla's own — 1.12 never holds an animation on a hit",
     ),
     // benilla's own: a spell's killing blow throws its ragdoll this many times harder.
     ours(
@@ -905,12 +895,6 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "ragdollLift",
         "1",
         "benilla's own — 1.12 ragdolls nothing, so it lifts nothing",
-    ),
-    // benilla's own: the Physics page's Cloak Physics box, cloth cloaks.
-    ours(
-        "cloakPhysics",
-        "1",
-        "benilla's own — 1.12 draws a cloak stiff on the body's bones",
     ),
     // benilla's own: how long a melee kill's ragdoll waits for the swing to land (s).
     ours(
@@ -948,12 +932,6 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own — 1.12 has no soft body motion",
     ),
-    // benilla's own: the Physics page's Loose Cloak When Armed box.
-    ours(
-        "cloakLooseDrawn",
-        "1",
-        "benilla's own — 1.12 draws a cloak stiff on the body's bones",
-    ),
     // benilla's own: the Physics page's Weapon Motion slider, how much stowed weapons jostle.
     ours(
         "weaponMotion",
@@ -971,12 +949,6 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "footPlanting",
         "1",
         "benilla's own — 1.12 stands a unit on the one height under its middle",
-    ),
-    // benilla's own: the Physics page's Cloak Motion slider, how much the cloth cloaks swing.
-    ours(
-        "cloakMotion",
-        "1",
-        "benilla's own — 1.12 draws a cloak stiff on the body's bones",
     ),
     // `lastCharacterIndex` (`0x402d93`, "0" `0x82e570`, category 4, handle `[0x882674]`), help
     // "Last character selected": a 0-based row (the selection cell `[0x83856c]` under `"%d"`), so

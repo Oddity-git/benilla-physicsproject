@@ -18,14 +18,12 @@ use bevy::prelude::*;
 
 mod blow;
 mod bounds;
-mod cloak;
 mod deathfx;
 mod dismember;
 mod feet;
 mod float;
 mod frost;
 mod gore;
-mod hitstop;
 mod jostle;
 mod knock;
 mod life;
@@ -45,12 +43,10 @@ impl Plugin for RagdollPlugin {
         testbox::plugin(app);
         blow::plugin(app);
         bounds::plugin(app);
-        cloak::plugin(app);
         deathfx::plugin(app);
         dismember::plugin(app);
         frost::plugin(app);
         gore::plugin(app);
-        hitstop::plugin(app);
         feet::plugin(app);
         float::plugin(app);
         jostle::plugin(app);

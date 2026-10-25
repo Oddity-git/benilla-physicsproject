@@ -286,7 +286,7 @@ fn build_limb_copies(
     materials: Res<Assets<WowModelMaterial>>,
     server: Res<AssetServer>,
 ) {
-    // A cape part: the cloth cloak draws it, and it would hang stiff off a severed limb.
+    // A cape part: it would hang stiff off a severed limb.
     let cape = |material: &MeshMaterial3d<WowModelMaterial>| {
         materials
             .get(material.id())
