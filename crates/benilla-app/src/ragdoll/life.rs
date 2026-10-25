@@ -31,6 +31,10 @@ const STIFFNESS: f32 = 0.5;
 /// Each body's own damping: a little air drag on its spin and fall.
 const BODY_ANGULAR_DAMPING: f32 = 0.8;
 const BODY_LINEAR_DAMPING: f32 = 0.1;
+/// An elemental's rocks: more grip and more damping, so they stop where they land.
+const DEBRIS_FRICTION: f32 = 3.0;
+const DEBRIS_ANGULAR_DAMPING: f32 = 4.0;
+const DEBRIS_LINEAR_DAMPING: f32 = 0.6;
 /// The fastest a body may move (yd/s) and spin (rad/s): a solver kick on a tangled rig (a spider's
 /// eight legs) can otherwise fling it off into the sky. The speed cap grows with the push and lift
 /// sliders past 1, so a wild setting really throws.
@@ -560,6 +564,14 @@ fn start_ragdolls(
                     TransformInterpolation,
                 ))
                 .id();
+            if debris {
+                // Fork: rocks grip the ground and stop turning, not roll away.
+                commands.entity(id).try_insert((
+                    Friction::new(DEBRIS_FRICTION).with_combine_rule(CoefficientCombine::Max),
+                    AngularDamping(DEBRIS_ANGULAR_DAMPING),
+                    LinearDamping(DEBRIS_LINEAR_DAMPING),
+                ));
+            }
             spawned.push(id);
             isos.push((at, rot));
         }
