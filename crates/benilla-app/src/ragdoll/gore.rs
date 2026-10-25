@@ -32,6 +32,7 @@ use benilla_world::view::WorldCamera;
 use super::blow::Hit;
 use super::life::{Ragdoll, RagdollBodies};
 use crate::creature_anim::{unit_blood_id, violence_level, BloodTables};
+use std::sync::Mutex;
 use crate::entities::{Creatures, ModelBound};
 use crate::net::{GuidIndex, NetEntity, ObjectStore};
 
@@ -134,8 +135,40 @@ pub(super) fn plugin(app: &mut App) {
             )
                 .chain(),
         )
-        .add_systems(Update, drop_wounds)
+        .add_systems(Update, (drop_wounds, note_elementals))
         .add_systems(PostUpdate, push_decals.after(begin_effect_frame));
+}
+
+/// Fork: the display ids seen on Elementals (`CreatureType` 4), which bleed nothing. A set of
+/// displays, not units, so the many blood systems need no extra parameter to ask.
+static ELEMENTALS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn note_elementals(
+    units: Query<(&NetEntity, &ObjectStore)>,
+    names: Res<crate::names::NameCache>,
+) {
+    for (net, store) in &units {
+        let (Some(display), Some(entry)) = (net.display_id, store.0.object_entry()) else {
+            continue;
+        };
+        if entry != 0 && names.creature_type(entry) == Some(4) {
+            if let Ok(mut set) = ELEMENTALS.lock() {
+                if !set.contains(&display) {
+                    set.push(display);
+                }
+            }
+        }
+    }
+}
+
+/// [`unit_blood_id`], except that an Elemental's display has no blood.
+fn blood_id(
+    creatures: Option<&Creatures>,
+    blood: &BloodTables,
+    display_id: Option<u32>,
+) -> Option<i32> {
+    let elemental = display_id.is_some_and(|d| ELEMENTALS.lock().is_ok_and(|s| s.contains(&d)));
+    unit_blood_id(creatures, blood, display_id).filter(|_| !elemental)
 }
 
 /// A bleed lasts this long past its tick (s), a little over the 3 s between ticks, so a running
@@ -499,7 +532,7 @@ fn spray_hits(
         if !hit.physical && !killing {
             continue;
         }
-        let Some(id) = unit_blood_id(creatures.as_deref(), &blood, net.display_id) else {
+        let Some(id) = blood_id(creatures.as_deref(), &blood, net.display_id) else {
             continue;
         };
         let splats = blood.0.splats(id, violence).to_vec();
@@ -673,7 +706,7 @@ fn gush_corpses(
         else {
             continue;
         };
-        let Some(id) = unit_blood_id(creatures.as_deref(), blood, net.display_id) else {
+        let Some(id) = blood_id(creatures.as_deref(), blood, net.display_id) else {
             continue;
         };
         let splats = blood.0.splats(id, violence);
@@ -787,7 +820,7 @@ fn spray_arteries(
             continue;
         }
         artery.next = now + ARTERY_EVERY;
-        let Some(id) = unit_blood_id(creatures.as_deref(), blood, net.display_id) else {
+        let Some(id) = blood_id(creatures.as_deref(), blood, net.display_id) else {
             continue;
         };
         let splats = blood.0.splats(id, violence);
@@ -860,7 +893,7 @@ fn squirt_bleeds(
             continue;
         }
         bleeding.next = now + SQUIRT_EVERY;
-        let Some(id) = unit_blood_id(creatures.as_deref(), blood, net.display_id) else {
+        let Some(id) = blood_id(creatures.as_deref(), blood, net.display_id) else {
             continue;
         };
         let splats = blood.0.splats(id, violence);
@@ -933,7 +966,7 @@ fn bleed_cuts(
                 ));
             }
         }
-        let Some(id) = unit_blood_id(creatures.as_deref(), &blood, net.display_id) else {
+        let Some(id) = blood_id(creatures.as_deref(), &blood, net.display_id) else {
             continue;
         };
         let splats = blood.0.splats(id, violence);
@@ -1221,7 +1254,7 @@ fn grow_pools(
         let Some(blood) = blood.as_deref().filter(|_| violence > 0) else {
             continue;
         };
-        let Some(id) = unit_blood_id(creatures.as_deref(), blood, net.display_id) else {
+        let Some(id) = blood_id(creatures.as_deref(), blood, net.display_id) else {
             continue;
         };
         let Some(texture) = gore.pick_texture(&server, blood.0.splats(id, violence)) else {
