@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 use benilla_formats::{CinematicCatalog, CinematicPath};
-use benilla_ui::script::UiScript;
 use benilla_world::schedule::WorldStage;
 use benilla_world::view::WorldCamera;
 use bevy::prelude::*;
@@ -81,6 +80,11 @@ impl Playing {
 }
 
 impl Cinematic {
+    /// Is a trigger latched for the world to show (`0xc4d75c`)?
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Is a cinematic on screen right now? The engine half of `InCinematic()`.
     pub(crate) fn is_playing(&self) -> bool {
         self.playing.is_some()
@@ -96,6 +100,14 @@ impl Cinematic {
 
 #[cfg(test)]
 impl Cinematic {
+    /// A latched trigger, as one the world was not yet ready to show.
+    pub(crate) fn pending_for_test(id: u32) -> Self {
+        Self {
+            pending: Some(id),
+            ..Self::default()
+        }
+    }
+
     /// A shot-less cinematic for tests that only ask [`Cinematic::is_playing`]; a [`CinematicPath`]
     /// needs a real `Cameras\*.m2`, so anything that reads a shot panics here.
     pub(crate) fn playing_for_test() -> Self {
@@ -139,7 +151,7 @@ impl Plugin for CinematicPlugin {
                 Update,
                 // One chain in one frame, after the net drain and after `control` seats the
                 // camera: no follow-camera frame shows, and this pose is the last word on it.
-                (take_trigger, start_pending, drive)
+                (take_stop, take_trigger, start_pending, drive)
                     .chain()
                     .in_set(WorldStage::Input)
                     .after(PlayerControlSet),
@@ -158,7 +170,6 @@ impl Plugin for CinematicPlugin {
                 Update,
                 drive_letterbox.in_set(WorldStage::Input).after(drive),
             )
-            .add_systems(Update, send_opening_cinematic.in_set(WorldStage::Input))
             // Leaving the world drops a cinematic with no ack, as the reference's teardown does
             // (`0x490a80` clears the flag and sends no `CMSG_COMPLETE_CINEMATIC`); the exit
             // edge drops a latch too, where a departure with the sweep spent leaves one.
@@ -166,7 +177,12 @@ impl Plugin for CinematicPlugin {
                 crate::ui_script::SweepLeg::Cinematic,
                 abandon_cinematic_on_leave_world,
             )
-            .add_systems(OnExit(ClientState::InWorld), abandon_on_leaving_world);
+            // After the shutdown, whose sweep tells the VM `CINEMATIC_STOP` for a cinematic in
+            // flight (`0x490b77`), and before the glue VM goes in.
+            .add_systems(
+                OnExit(ClientState::InWorld),
+                abandon_on_leaving_world.in_set(crate::ui_script::SessionEnd::Clears),
+            );
     }
 }
 
@@ -269,6 +285,17 @@ fn load_catalog(mut commands: Commands, assets: Option<Res<WorldAssets>>) {
         }
         // With no catalog every trigger falls through to the immediate ack.
         Err(e) => warn!("cinematic: tables failed to load: {e:#}"),
+    }
+}
+
+/// A posted `StopCinematic()` ([`crate::ui_logout::SessionPosts`]), at the chain's head.
+fn take_stop(
+    posts: Option<Res<crate::ui_logout::SessionPosts>>,
+    mut cine: ResMut<Cinematic>,
+    net: Option<Res<NetCommands>>,
+) {
+    if posts.is_some_and(|p| p.take_stop_cinematic()) {
+        stop(&mut cine, net.as_deref());
     }
 }
 
@@ -518,7 +545,7 @@ fn drive(
 
 /// ESC, or anything else asking for the skip: end the cinematic and ack it. On the wire a skip is
 /// a completion.
-pub(crate) fn stop(cine: &mut Cinematic, net: Option<&NetCommands>) {
+fn stop(cine: &mut Cinematic, net: Option<&NetCommands>) {
     if cine.playing.is_some() {
         // Something is on screen: [`drive`] pays at full black, as `StopCinematic` (`0x48f050`)
         // arms a 0.25 s fade-out with EndCinematic (`0x48f080`) as its completion.
@@ -533,21 +560,23 @@ pub(crate) fn stop(cine: &mut Cinematic, net: Option<&NetCommands>) {
 /// outside the sweep's sound scope: a cinematic in flight (`[0xb4e310]`) is dropped, the VM the
 /// sweep runs in told `CINEMATIC_STOP` (`0x490b77`), with no `CMSG_COMPLETE_CINEMATIC`.
 fn abandon_cinematic_on_leave_world(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut cine: ResMut<Cinematic>,
     mut fade: ResMut<crate::screen_fade::ScreenFade>,
 ) {
-    if !cine.is_playing() {
-        return;
-    }
-    // The world-ready latch (`0xc4d75c`) is another cell, which the sweep leaves.
-    let pending = cine.pending;
-    abandon(&mut cine, &mut fade);
-    cine.pending = pending;
-    if let Some(mut script) = script {
-        script.set_in_cinematic(false);
-        script.fire_event("CINEMATIC_STOP", vec![]);
-    }
+    hosted_vm.run(|script| {
+        if !cine.is_playing() {
+            return;
+        }
+        // The world-ready latch (`0xc4d75c`) is another cell, which the sweep leaves.
+        let pending = cine.pending;
+        abandon(&mut cine, &mut fade);
+        cine.pending = pending;
+        if let Some(script) = script {
+            script.set_in_cinematic(false);
+            script.fire_event("CINEMATIC_STOP", vec![]);
+        }
+    })
 }
 
 /// Leaving the world drops a cinematic without acking; the socket goes with it.
@@ -574,47 +603,35 @@ fn abandon(cine: &mut Cinematic, fade: &mut crate::screen_fade::ScreenFade) {
 /// is per VM and per world: the leave-world sweep drops a cinematic and tells the VM itself.
 fn feed_ui(
     cine: Res<Cinematic>,
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut published: crate::ui_script::WindowMemo<Option<bool>>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let playing = cine.is_playing();
-    let published = published.get(&script);
-    if *published == Some(playing) {
-        return;
-    }
-    // A fresh VM is already out of a cinematic: seed the memo rather than fire a `CINEMATIC_STOP`
-    // the reference never sends unedged.
-    if published.is_none() && !playing {
-        *published = Some(false);
-        return;
-    }
-    *published = Some(playing);
-    script.set_in_cinematic(playing);
-    script.fire_event(
-        if playing {
-            "CINEMATIC_START"
-        } else {
-            "CINEMATIC_STOP"
-        },
-        vec![],
-    );
-}
-
-/// Each Lua `OpeningCinematic()` is one empty `CMSG_OPENING_CINEMATIC` (`0x48c8c0`); the server
-/// answers, if at all, with the `SMSG_TRIGGER_CINEMATIC` [`take_trigger`] plays.
-fn send_opening_cinematic(script: Option<NonSendMut<UiScript>>, net: Option<Res<NetCommands>>) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let asks = script.take_opening_cinematic_asks();
-    if let Some(net) = net {
-        for _ in 0..asks {
-            let _ = net.0.send(ClientCommand::OpeningCinematic);
+    hosted_vm.run(|script| {
+        let Some(script) = script else {
+            return;
+        };
+        let playing = cine.is_playing();
+        let published = published.get(script);
+        if *published == Some(playing) {
+            return;
         }
-    }
+        // A fresh VM is already out of a cinematic: seed the memo rather than fire a
+        // `CINEMATIC_STOP` the reference never sends unedged.
+        if published.is_none() && !playing {
+            *published = Some(false);
+            return;
+        }
+        *published = Some(playing);
+        script.set_in_cinematic(playing);
+        script.fire_event(
+            if playing {
+                "CINEMATIC_START"
+            } else {
+                "CINEMATIC_STOP"
+            },
+            vec![],
+        );
+    })
 }
 
 fn ack(net: Option<&NetCommands>) {
@@ -903,42 +920,6 @@ mod settling_under_black {
                 .resource::<crate::screen_fade::ScreenFade>()
                 .is_black(),
             "the screen comes back even though the world did not"
-        );
-    }
-}
-
-/// Lua's `OpeningCinematic()` reaches the wire as one empty `CMSG_OPENING_CINEMATIC` per call.
-#[cfg(test)]
-mod opening_cinematic {
-    use super::*;
-
-    #[test]
-    fn each_call_sends_one_opening_cinematic() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let mut app = App::new();
-        app.insert_resource(NetCommands(tx));
-        app.insert_non_send_resource(UiScript::new().unwrap());
-        app.add_systems(Update, send_opening_cinematic);
-        app.world()
-            .non_send_resource::<UiScript>()
-            .run("OpeningCinematic() OpeningCinematic()")
-            .unwrap();
-        app.update();
-        let sent = rx
-            .try_iter()
-            .filter(|c| matches!(c, ClientCommand::OpeningCinematic))
-            .count();
-        assert_eq!(sent, 2);
-        app.update();
-        assert_eq!(rx.try_iter().count(), 0, "drained once");
-        // The opcode the reference puts at `0x48c8c9`.
-        assert_eq!(
-            benilla_protocol::messages::opcode::CMSG_OPENING_CINEMATIC,
-            0xf9
-        );
-        assert_eq!(
-            benilla_protocol::messages::opcode_name(0xf9),
-            Some("CMSG_OPENING_CINEMATIC")
         );
     }
 }

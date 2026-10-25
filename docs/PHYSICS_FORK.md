@@ -103,7 +103,7 @@ the install, and keep local state in `benilla-config/`.
 
 ## 4. Repository layout
 
-- **Upstream base:** upstream `main` at `5338675f` (merged 2026-10-13); before that `2e82d34c`
+- **Upstream base:** upstream `main` at `19af9500` (merged 2026-10-25); before that `5338675f` (2026-10-13) and `2e82d34c`
   (`v0.2.0-116`). The first fork commit is `6ead3cdf` ("Ragdoll step 1").
   `git diff up/main HEAD` (with `up` fetched to the merged commit) shows everything the fork changed.
 - **Fork code:** `crates/benilla-app/src/ragdoll/`, about 5,500 lines in 16 files.
@@ -608,7 +608,7 @@ own.
   inertia is `INERTIA 0.35 × cloakMotion`. When the drift clamp (`MAX_DRIFT`) moves a vertex it
   moves `prev` by the same amount, or the clamp injects velocity.
 - **Seams.** Normals are averaged over smooth groups across pieces.
-- **Weapon drawn** (`cloakLooseDrawn`). Read from the AnimDriver sheath state, falling back to
+- **Weapon drawn** (`cloakLooseDrawn`). Read from the unit's `CommittedSheath::state()`, falling back to
   `ObjectStore::unit_sheath_state() != 0`. The lower cloak eases (`LOOSE_RAMP`, `LOOSE_EASE`) to a
   rigid carry by the pinned rows' main bone, so it hangs from the shoulders and not the hips.
 - Only the nearest `MAX_CLOTHS` (10) within `MAX_RANGE` (60) simulate.

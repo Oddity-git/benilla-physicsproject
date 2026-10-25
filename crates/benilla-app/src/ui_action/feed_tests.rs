@@ -9,7 +9,7 @@ use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
 use super::feed::{feed_actions, MISSING_ITEM_ICON};
-use super::{CastErrors, MountErrors, PetTameFailures, PlayerActions, UiErrorKeys, UiErrorTexts};
+use super::{MountErrors, PetTameFailures, PlayerActions, UiErrorKeys, UiErrorTexts};
 use crate::entities::ItemDisplays;
 use crate::items::{test_template, Items};
 use crate::net::{ClientCommand, NetCommands};
@@ -27,8 +27,8 @@ const JERKY_ICON: &str = "Interface\\Icons\\INV_Misc_Food_16";
 fn app_with_food_on_the_bar() -> (App, crossbeam_channel::Receiver<ClientCommand>) {
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
-    actions.buttons.insert(
+    let mut slots = crate::ui_action::ActionSlots::default();
+    slots.buttons.insert(
         JERKY_SLOT,
         ActionButton {
             slot: JERKY_SLOT,
@@ -37,7 +37,7 @@ fn app_with_food_on_the_bar() -> (App, crossbeam_channel::Receiver<ClientCommand
         },
     );
     // As `SMSG_ACTION_BUTTONS` sets it; the feed's first pass clears it.
-    actions.dirty = true;
+    slots.dirty = true;
 
     let displays = HashMap::from([(
         JERKY_DISPLAY,
@@ -47,10 +47,10 @@ fn app_with_food_on_the_bar() -> (App, crossbeam_channel::Receiver<ClientCommand
         },
     )]);
 
-    app.insert_resource(actions)
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .init_resource::<Items>()
         .init_resource::<crate::net::GuidIndex>()
-        .init_resource::<CastErrors>()
         .init_resource::<MountErrors>()
         .init_resource::<PetTameFailures>()
         .init_resource::<UiErrorKeys>()
@@ -161,11 +161,13 @@ fn a_landed_item_template_also_lands_the_consumable_gate() {
 
 /// `PickupAction` and `PlaceAction` fire their slots' `ACTIONBAR_SLOT_CHANGED` in place
 /// (`0x4e5db0` and `0x4e684f` into `0x4e58e0`), each reading the slot as written, count and
-/// consumable gate included; the store catching up a frame later fires nothing more.
+/// consumable gate included; the feed resolving the stored slots after fires nothing more.
 #[test]
 fn a_bar_drag_fires_its_slots_in_place_and_the_feed_adds_nothing() {
     let (mut app, _rx) = app_with_food_on_the_bar();
-    app.add_systems(Update, super::drain::drain_action_sets.after(feed_actions));
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .keep_calls();
     let mut info = test_template("Tough Jerky");
     info.display_info_id = JERKY_DISPLAY;
     info.spells = vec![ItemSpellEntry {
@@ -212,12 +214,18 @@ fn a_bar_drag_fires_its_slots_in_place_and_the_feed_adds_nothing() {
         ],
         "both slots signal before the verbs return, the placed one with its gate"
     );
+    // The slot writes as the host applies them inside the calls.
+    let sets = script(&mut app).take_action_sets();
+    let mut bar = bevy::ecs::system::SystemState::<super::ActionBarSteps>::new(app.world_mut());
+    for (id, packed) in sets {
+        bar.get_mut(app.world_mut()).set(id, packed);
+    }
 
     app.update();
     app.update();
     let late: Vec<String> = script(&mut app).eval("return SLOT_EVENTS").unwrap();
     assert!(late.is_empty(), "the feed re-fired {late:?}");
-    let bar = app.world().resource::<PlayerActions>();
+    let bar = app.world().resource::<crate::ui_action::ActionSlots>();
     assert!(bar.buttons.contains_key(&0) && !bar.buttons.contains_key(&JERKY_SLOT));
 }
 
@@ -369,20 +377,20 @@ fn a_macro_slot_shows_the_macros_own_icon_and_follows_an_edit() {
     const ACTION: u32 = 1;
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
-    actions.buttons.insert(
+    let mut slots = crate::ui_action::ActionSlots::default();
+    slots.buttons.insert(
         SLOT,
         ActionButton {
             slot: SLOT,
-            action: 1, // macro index 1
+            action: 1, // macro id 1
             kind: ACTION_KIND_MACRO,
         },
     );
-    actions.dirty = true;
-    app.insert_resource(actions)
+    slots.dirty = true;
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .init_resource::<Items>()
         .init_resource::<crate::net::GuidIndex>()
-        .init_resource::<CastErrors>()
         .init_resource::<MountErrors>()
         .init_resource::<PetTameFailures>()
         .init_resource::<UiErrorKeys>()
@@ -393,16 +401,16 @@ fn a_macro_slot_shows_the_macros_own_icon_and_follows_an_edit() {
         .insert_resource(NetCommands(tx));
     let mut script = UiScript::new().unwrap();
     script.set_macro_icons(vec!["Interface\\Icons\\Spell_Fire_FlameBolt".into()]);
-    script.set_macros(MacroState {
-        account: vec![MacroView {
+    script.set_macros(MacroState::from_scopes(
+        vec![MacroView {
             name: "Ambush".into(),
             texture: Some("Interface\\Icons\\Ability_Ambush".into()),
             // The bound spell is not what the icon shows.
             body: "/cast Ambush".into(),
-            local_only: false,
+            ..Default::default()
         }],
-        character: Vec::new(),
-    });
+        Vec::new(),
+    ));
     app.insert_non_send_resource(script);
     app.add_systems(Update, feed_actions);
 
@@ -435,8 +443,8 @@ fn a_macro_slot_shows_the_macros_own_icon_and_follows_an_edit() {
         "the generation gate re-resolved the slot"
     );
 
-    // A rename leaves the slot's texture, kind and id unchanged, so a value diff alone would
-    // fire nothing; the feed must re-fire the slot anyway.
+    // A rename leaves the slot's texture, kind and id unchanged: the edit signals the slot inside
+    // its call (`0x4f1329`), and the feed adds nothing.
     let events = |app: &mut App| {
         app.world_mut()
             .non_send_resource::<UiScript>()
@@ -460,7 +468,7 @@ fn a_macro_slot_shows_the_macros_own_icon_and_follows_an_edit() {
     assert_eq!(
         events(&mut app),
         1,
-        "a rename re-fires ACTIONBAR_SLOT_CHANGED for the slot"
+        "a rename fires ACTIONBAR_SLOT_CHANGED for the slot once"
     );
     assert_eq!(
         app.world_mut()
@@ -589,33 +597,91 @@ fn a_notice_under_the_loading_cover_fires_at_the_reveal() {
     assert!(app.world().resource::<UiErrorTexts>().0.is_empty());
 }
 
+/// The cast reports' feed ([`crate::ui_cast::feed_cast_reports`]) over a VM, with `reports`
+/// queued and `spells` as the catalog.
+fn report_feed(spells: crate::ui_action::Spells, reports: crate::ui_cast::CastReports) -> App {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut app = App::new();
+    app.add_message::<crate::net::FieldChanged>();
+    app.insert_resource(reports)
+        .insert_resource(spells)
+        .init_resource::<Items>()
+        .init_resource::<crate::net::GuidIndex>()
+        .init_resource::<super::CastFailRedisplays>()
+        .init_resource::<crate::ui_chat::ChatLog>()
+        .init_resource::<crate::sound::MessageSounds>()
+        .init_resource::<crate::spell::PendingCast>()
+        .init_resource::<crate::spell::QueuedMeleeSpell>()
+        .init_resource::<crate::spell::targeting::SpellTargeting>()
+        .init_resource::<crate::spell::ActiveChannel>()
+        .init_resource::<crate::spell::AutoRepeatActive>()
+        .init_resource::<crate::creature_anim::UnitEdits>()
+        .add_message::<crate::player::StandStateRequest>()
+        .insert_resource(NetCommands(tx));
+    app.insert_non_send_resource(UiScript::new().unwrap());
+    app.add_systems(Update, crate::ui_cast::signal_reports);
+    app
+}
+
+/// A validator rung's own line (`0x496720` from `0x6098a2`, `0x609930`, `0x6e6ab4`) shows as its
+/// catalog record does, its `%s` filled: `ERR_SPELL_ALREADY_KNOWN_S` with the taught spell's name,
+/// and `ERR_TAME_FAILED` with the `PETTAME_TOOMANY` string, each a `UI_ERROR_MESSAGE`.
+#[test]
+fn a_validator_line_shows_as_its_message_does() {
+    use crate::ui_action::{FillArg, Spells, UiError};
+    let mut reports = crate::ui_cast::CastReports::default();
+    reports.line(UiError {
+        key: "ERR_SPELL_ALREADY_KNOWN_S",
+        args: vec![FillArg::S("Fireball".into())],
+    });
+    reports.line(UiError {
+        key: "ERR_TAME_FAILED",
+        args: vec![FillArg::Global("PETTAME_TOOMANY".into())],
+    });
+    let mut app = report_feed(Spells::empty_for_tests(), reports);
+    app.world_mut()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"ERR_SPELL_ALREADY_KNOWN_S = "You already know %s.";
+               ERR_TAME_FAILED = "%s.";
+               PETTAME_TOOMANY = "You have too many pets already";
+               SEEN = {}
+               local f = CreateFrame("Frame")
+               f:RegisterEvent("UI_ERROR_MESSAGE")
+               f:SetScript("OnEvent", function() table.insert(SEEN, arg1) end)"#,
+        )
+        .unwrap();
+    app.update();
+    let seen = app
+        .world_mut()
+        .non_send_resource::<UiScript>()
+        .eval::<Vec<String>>("return SEEN")
+        .unwrap();
+    assert_eq!(
+        seen,
+        [
+            "You already know Fireball.",
+            "You have too many pets already."
+        ]
+    );
+}
+
 /// `HandleCastFailed 0x6e1a00` logs through `0x62c360`; `HandlePetCastFailed 0x6e8eb0` calls only
 /// the packet readers and `0x496720`, with no log line and no error sound. Both entries name the
 /// same spell, so only the caster differs.
 #[test]
 fn a_pets_refused_cast_writes_no_combat_log_line() {
-    use crate::ui_action::{CastFail, Caster, Spells};
+    use crate::ui_action::{CastFail, Spells};
     use benilla_formats::{SpellCatalog, SpellDisplay};
 
     const GROWL: u32 = 2649;
 
-    let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut app = App::new();
-    let mut errors = CastErrors::default();
+    let mut reports = crate::ui_cast::CastReports::default();
     // 0x5f ROOTED has a string on both tables, so neither entry drops for want of one.
-    errors.0.push(CastFail {
-        spell_id: GROWL,
-        reason: 0x5F,
-        arg: None,
-        caster: Caster::Player,
-        redisplay: false,
-        input: benilla_ui::script::InputEvents::NONE,
-    });
-    errors.push_pet(GROWL, 0x5F);
-
-    app.insert_resource(PlayerActions::default())
-        .insert_resource(errors)
-        .insert_resource(Spells {
+    reports.refused(CastFail::server(GROWL, 0x5F, None));
+    reports.pet_refused(GROWL, 0x5F);
+    let mut app = report_feed(
+        Spells {
             catalog: SpellCatalog::from_displays(HashMap::from([(
                 GROWL,
                 SpellDisplay {
@@ -624,23 +690,18 @@ fn a_pets_refused_cast_writes_no_combat_log_line() {
                 },
             )])),
             ..Spells::empty_for_tests()
-        })
-        .init_resource::<Items>()
-        .init_resource::<crate::net::GuidIndex>()
-        .init_resource::<MountErrors>()
-        .init_resource::<PetTameFailures>()
-        .init_resource::<UiErrorKeys>()
-        .init_resource::<UiErrorTexts>()
-        .init_resource::<crate::ui_chat::ChatLog>()
-        .init_resource::<crate::sound::MessageSounds>()
-        .insert_resource(NetCommands(tx));
-    let script = UiScript::new().unwrap();
-    // Only what the log line needs; the red line's text has its own tests.
-    script
-        .run(r#"SPELL_FAILED_ROOTED = "You are unable to move";"#)
+        },
+        reports,
+    );
+    // Only what the log line needs, its template and its reason; the red line's text has its own
+    // tests.
+    app.world_mut()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"SPELLFAILCASTSELF = "You fail to cast %s: %s."
+               SPELL_FAILED_ROOTED = "You are unable to move";"#,
+        )
         .unwrap();
-    app.insert_non_send_resource(script);
-    app.add_systems(Update, feed_actions);
     app.update();
 
     assert_eq!(
@@ -650,6 +711,103 @@ fn a_pets_refused_cast_writes_no_combat_log_line() {
         1,
         "the player's failure logs and the pet's does not"
     );
+}
+
+/// `0x62c360` logs no refusal of a spell flagged `Attributes & 0x180` (`0x62c4bd`), though the
+/// red line still shows.
+#[test]
+fn a_refused_spell_flagged_not_to_log_writes_no_combat_log_line() {
+    use crate::ui_action::{CastFail, Spells};
+    use benilla_formats::{SpellCatalog, SpellDisplay};
+
+    let logged = |attributes| {
+        let mut reports = crate::ui_cast::CastReports::default();
+        reports.refused(CastFail::server(1, 0x5F, None));
+        let mut app = report_feed(
+            Spells {
+                catalog: SpellCatalog::from_displays(HashMap::from([(
+                    1,
+                    SpellDisplay {
+                        name: "Growl".into(),
+                        attributes,
+                        ..Default::default()
+                    },
+                )])),
+                ..Spells::empty_for_tests()
+            },
+            reports,
+        );
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .run(
+                r#"SPELLFAILCASTSELF = "You fail to cast %s: %s."
+                   SPELL_FAILED_ROOTED = "You are unable to move";"#,
+            )
+            .unwrap();
+        app.update();
+        app.world()
+            .resource::<crate::ui_chat::ChatLog>()
+            .pending_len()
+    };
+    assert_eq!(logged(0), 1);
+    assert_eq!(logged(0x100), 0, "SPELL_ATTR_DO_NOT_LOG");
+    assert_eq!(logged(0x80), 0, "SPELL_ATTR_DO_NOT_DISPLAY");
+}
+
+/// `DisplayError` formats the default errorId through `ERR_SPELL_FAILED_S` (`0x4967d7`); an empty
+/// one shows nothing (`0x4945b0` drops an empty text), and the log still writes the reason
+/// (`0x6e21e2`-`0x6e21fc` run whatever was shown).
+#[test]
+fn an_empty_default_format_shows_nothing_and_still_logs() {
+    use crate::ui_action::{CastFail, Spells};
+    use benilla_formats::{SpellCatalog, SpellDisplay};
+
+    let lines = |format: &str| {
+        let mut reports = crate::ui_cast::CastReports::default();
+        reports.refused(CastFail::server(1, 0x5F, None));
+        let mut app = report_feed(
+            Spells {
+                catalog: SpellCatalog::from_displays(HashMap::from([(
+                    1,
+                    SpellDisplay {
+                        name: "Growl".into(),
+                        ..Default::default()
+                    },
+                )])),
+                ..Spells::empty_for_tests()
+            },
+            reports,
+        );
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .run(&format!(
+                r#"SPELLFAILCASTSELF = "You fail to cast %s: %s."
+                SPELL_FAILED_ROOTED = "You are unable to move"
+                ERR_SPELL_FAILED_S = "{format}"
+                SEEN = {{}}
+                local f = CreateFrame("Frame")
+                f:RegisterEvent("UI_ERROR_MESSAGE")
+                f:SetScript("OnEvent", function() table.insert(SEEN, arg1) end)"#
+            ))
+            .unwrap();
+        app.update();
+        let seen = app
+            .world_mut()
+            .non_send_resource::<UiScript>()
+            .eval::<Vec<String>>("return SEEN")
+            .unwrap();
+        let logged = app
+            .world()
+            .resource::<crate::ui_chat::ChatLog>()
+            .pending_len();
+        (seen, logged)
+    };
+    assert_eq!(lines("%s"), (vec!["You are unable to move".to_string()], 1));
+    assert_eq!(
+        lines("Failed: %s"),
+        (vec!["Failed: You are unable to move".to_string()], 1)
+    );
+    assert_eq!(lines(""), (vec![], 1));
 }
 
 /// `0x6e6a20` resolves `PETTAME_<reason>` first and passes the string to `DisplayError(0xee)`,
@@ -719,7 +877,11 @@ fn a_tame_failure_composes_the_reason_string_into_err_tame_failed() {
 /// not.
 #[test]
 fn a_refusal_of_the_armed_craft_disarms_the_batch() {
-    let (mut app, _rx) = app_with_food_on_the_bar();
+    use crate::ui_action::CastFail;
+    let mut app = report_feed(
+        crate::ui_action::Spells::empty_for_tests(),
+        crate::ui_cast::CastReports::default(),
+    );
     {
         let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
         script.set_trade_skill(Some(benilla_ui::script::TradeSkillState {
@@ -742,8 +904,11 @@ fn a_refusal_of_the_armed_craft_disarms_the_batch() {
                 product_item_level: 0,
                 reagents: vec![],
                 tools: vec![],
+                icon_pending: None,
+                tools_pending: Vec::new(),
             }],
         }));
+        script.keep_calls();
         script.run("DoTradeSkill(2, 3)").unwrap();
     }
     let repeat = |app: &App| {
@@ -752,13 +917,13 @@ fn a_refusal_of_the_armed_craft_disarms_the_batch() {
             .trade_skill_repeat()
     };
     app.world_mut()
-        .resource_mut::<CastErrors>()
-        .push_local(133, 0x0c);
+        .resource_mut::<crate::ui_cast::CastReports>()
+        .refused(CastFail::local(133, 0x0c));
     app.update();
     assert_eq!(repeat(&app), (2963, 3), "another spell's refusal");
     app.world_mut()
-        .resource_mut::<CastErrors>()
-        .push_local(2963, 0x0c);
+        .resource_mut::<crate::ui_cast::CastReports>()
+        .refused(CastFail::local(2963, 0x0c));
     app.update();
     assert_eq!(repeat(&app), (0, 3), "the armed craft's refusal disarms");
 }
@@ -905,4 +1070,116 @@ fn a_charged_item_slot_shows_the_uses_left() {
         .insert_template(JERKY, Some(info));
     app.update();
     assert_eq!(jerky_count(&mut app), 2, "|-2| charges, one item");
+}
+
+/// Only `EditMacro` signals a macro's slots (`0x4f1329` into `0x4e5cc0`), inside its call: the feed
+/// pushes a macro slot's new icon and name silently, so a load (`0x4f0600`, which ends in the order
+/// rebuild alone) and a create (`0x4f1010`) signal no slot, and an edit's slots are not signalled
+/// a second time.
+#[test]
+fn the_feed_signals_no_macro_slot_of_its_own() {
+    use benilla_protocol::messages::ACTION_KIND_MACRO;
+    use benilla_ui::script::{MacroState, MacroView};
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut app = App::new();
+    let mut slots = crate::ui_action::ActionSlots::default();
+    // Macro 1 on slots 1 and 3, macro 2 on slot 2.
+    for (slot, id) in [(0u8, 1u32), (1, 2), (2, 1)] {
+        slots.buttons.insert(
+            slot,
+            ActionButton {
+                slot,
+                action: id,
+                kind: ACTION_KIND_MACRO,
+            },
+        );
+    }
+    slots.dirty = true;
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
+        .init_resource::<Items>()
+        .init_resource::<crate::net::GuidIndex>()
+        .init_resource::<MountErrors>()
+        .init_resource::<PetTameFailures>()
+        .init_resource::<UiErrorKeys>()
+        .init_resource::<UiErrorTexts>()
+        .init_resource::<crate::ui_chat::ChatLog>()
+        .init_resource::<crate::sound::MessageSounds>()
+        .insert_resource(NetCommands(tx));
+    let mut script = UiScript::new().unwrap();
+    script.set_macro_icons(vec!["Interface\\Icons\\Spell_Fire_FlameBolt".into()]);
+    let view = |name: &str, icon: &str| MacroView {
+        name: name.into(),
+        texture: Some(format!("Interface\\Icons\\{icon}")),
+        ..Default::default()
+    };
+    script.set_macros(MacroState::from_scopes(
+        vec![view("a", "Ability_Ambush"), view("b", "Ability_BackStab")],
+        Vec::new(),
+    ));
+    app.insert_non_send_resource(script);
+    app.add_systems(Update, feed_actions);
+    app.update();
+    app.world_mut()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"
+            SLOT_EVENTS = {}
+            local f = CreateFrame("Frame")
+            f:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+            f:SetScript("OnEvent", function() table.insert(SLOT_EVENTS, arg1) end)
+            "#,
+        )
+        .unwrap();
+    let events = |app: &mut App| {
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .eval::<Vec<i64>>("local t = SLOT_EVENTS SLOT_EVENTS = {} return t")
+            .unwrap()
+    };
+
+    // A load with new icons for both macros.
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .set_macros(MacroState::from_scopes(
+            vec![view("a", "Spell_Holy_Heal"), view("b", "Spell_Holy_Renew")],
+            Vec::new(),
+        ));
+    app.update();
+    assert_eq!(
+        events(&mut app),
+        Vec::<i64>::new(),
+        "a load signals no slot"
+    );
+    assert_eq!(
+        app.world()
+            .non_send_resource::<UiScript>()
+            .eval::<String>("return GetActionTexture(3)")
+            .unwrap(),
+        "Interface\\Icons\\Spell_Holy_Heal",
+        "but the slot shows the loaded icon"
+    );
+
+    app.world_mut()
+        .non_send_resource::<UiScript>()
+        .run(r#"CreateMacro("c", 1, "")"#)
+        .unwrap();
+    app.update();
+    assert_eq!(
+        events(&mut app),
+        Vec::<i64>::new(),
+        "a create signals no slot"
+    );
+
+    app.world_mut()
+        .non_send_resource::<UiScript>()
+        .run("EditMacro(GetMacroIndexByName('a'), nil, 1)")
+        .unwrap();
+    app.update();
+    assert_eq!(
+        events(&mut app),
+        [1, 3],
+        "the edit's two slots, once each, and not macro 2's"
+    );
 }

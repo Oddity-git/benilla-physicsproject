@@ -1,7 +1,7 @@
 //! Benilla's options window (`OptionsFrame.xml`): the shell, the search and scroll, and every
 //! page's rows against the real CVar set, the saved option globals and the API rows.
 
-use benilla_ui::script::{QuadContent, SoundRequest, UiScript, WornDisplay};
+use benilla_ui::script::{QuadContent, SoundRequest, TutorialCall, UiScript, WornDisplay};
 
 /// The options window and the game menu over the manifest slice they need.
 fn harness() -> UiScript {
@@ -17,6 +17,8 @@ fn harness_on(s: UiScript) -> UiScript {
 /// [`harness_on`] with a page's `definers` merged in: the files its rows read, each loaded once
 /// and in the production order.
 fn harness_with(mut s: UiScript, definers: &[&str]) -> UiScript {
+    // No engine: what `UIParent`'s `OnUpdate` calls each tick is kept.
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     const WINDOW: &[&str] = &[
         "Interface\\FrameXML\\GlobalStrings.lua",
@@ -666,7 +668,8 @@ fn a_slider_rows_readout_sits_on_its_labels_line() {
 
 /// A VM with the real registered CVar set, before any XML loads, as the app boots.
 fn audio_harness() -> UiScript {
-    let s = UiScript::new().unwrap();
+    let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.register_cvars(crate::cvars::registered_pairs());
     s
 }
@@ -685,6 +688,8 @@ fn combat_harness() -> UiScript {
 fn interface_harness() -> UiScript {
     let mut s = audio_harness();
     s.set_screen_size(1024.0, 768.0);
+    // No host: the tutorial row's calls are kept for the tests to read, not applied.
+    s.keep_calls();
     harness_with(
         s,
         &[
@@ -1734,9 +1739,15 @@ fn defaults_resets_the_graphics_page_to_registered_defaults() {
         changes.contains(&("farclip".to_string(), "350".to_string())),
         "{changes:?}"
     );
+    // The Brightness row restores through `SetGamma(0)`, which writes `"%f"` of `1 - 0`
+    // (`0x4891f0`): "1.000000" against the registered "1.0".
+    assert!(
+        changes.contains(&("gamma".to_string(), "1.000000".to_string())),
+        "{changes:?}"
+    );
     assert_eq!(
         changes.len(),
-        2,
+        3,
         "only the default writes queue — never the dead pending: {changes:?}"
     );
     // 357, not 350: the registered 350 is off the reference's 177 + n * 60 ladder
@@ -2318,7 +2329,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     let src = chain
         .read_file("Interface\\FrameXML\\GlobalStrings.lua")
         .expect("GlobalStrings.lua in the chain");
-    let strings = UiScript::new().expect("VM");
+    let mut strings = UiScript::new().expect("VM");
+    strings.keep_calls();
     strings
         .run(&String::from_utf8_lossy(&src))
         .expect("GlobalStrings runs clean");
@@ -2867,8 +2879,9 @@ fn the_interface_page_writes_the_three_stock_globals() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
-/// The picker is dead while the switch is off (`UIOptionsFrame.lua:697-701`), both rows run
-/// `TargetofTarget_Update` on a write, and the five entries are the reference's, in its order.
+/// The picker is dead while the switch is off (`UIOptionsFrame.lua:697-701`), both rows only write
+/// their globals, as 1.12's options do (`UIOptionsFrame.lua:65`), and the five entries are the
+/// reference's, in its order.
 #[test]
 fn the_target_of_target_rows_gate_each_other_and_write_their_globals() {
     benilla_formats::wow_data_or_skip!();
@@ -2923,13 +2936,11 @@ fn the_target_of_target_rows_gate_each_other_and_write_their_globals() {
     );
     assert!(
         s.eval::<bool>(
-            "return BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTarget.applyFunc \
-                 == \"TargetofTarget_Update\" \
-             and BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetMode.applyFunc \
-                 == \"TargetofTarget_Update\""
+            "return BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTarget.applyFunc == nil \
+             and BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetMode.applyFunc == nil"
         )
         .unwrap(),
-        "both rows re-decide the frame when they are written"
+        "the frames' own OnUpdates re-decide the frame, as in 1.12"
     );
 
     s.run("BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetModeDropdownButton:Click()")
@@ -2961,6 +2972,53 @@ fn the_target_of_target_rows_gate_each_other_and_write_their_globals() {
         s.take_cvar_changes().is_empty(),
         "still nothing in the CVar table"
     );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// With a target's target up, the switch raises nothing and the frame follows on the next frame,
+/// from `TargetFrame_OnUpdate` and `TargetofTarget_OnUpdate` (`TargetFrame.lua:492-501`). Run from
+/// the row, `TargetofTarget_Update` refreshed the row's own debuffs (`RefreshBuffs(this, …)`,
+/// `TargetFrame.lua:538`) and raised `BuffFrame.lua:281: attempt to index local 'debuffBorder'`.
+#[test]
+fn the_target_of_target_switch_leaves_the_frame_to_its_own_updates() {
+    use benilla_ui::script::UnitState;
+    benilla_formats::wow_data_or_skip!();
+    let mut s = interface_harness();
+    let unit = |name: &str, guid: u64| UnitState {
+        exists: true,
+        is_connected: true,
+        name: Some(name.into()),
+        guid,
+        health: 80,
+        max_health: 100,
+        level: 60,
+        ..UnitState::default()
+    };
+    s.set_unit("player", Some(unit("Tri", 0x100)));
+    s.set_unit("target", Some(unit("Kobold Miner", 0x200)));
+    s.set_unit("targettarget", Some(unit("Tri", 0x100)));
+    s.fire_event("PLAYER_TARGET_CHANGED", vec![]);
+    s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
+    s.run("BenillaOptionsFrameCategoryListRowInterface:Click()")
+        .unwrap();
+    let shown = |s: &mut UiScript| {
+        s.eval::<bool>("return TargetofTargetFrame:IsShown() and true or false")
+            .unwrap()
+    };
+
+    s.run("BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetCheck:Click()")
+        .unwrap();
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    s.tick(0.016);
+    assert!(
+        shown(&mut s),
+        "on: the target frame's OnUpdate brings it up"
+    );
+
+    s.run("BenillaOptionsFrameContainerBodyInterfaceRowTargetOfTargetCheck:Click()")
+        .unwrap();
+    s.tick(0.016);
+    assert!(!shown(&mut s), "off: its own OnUpdate takes it down");
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
@@ -3059,13 +3117,15 @@ fn show_tutorials_reads_the_bank_and_writes_through_clear_and_reset() {
     );
 
     let _ = s.take_cvar_changes();
-    let _ = s.take_tutorial_clears();
-    let _ = s.take_tutorial_resets();
+    let _ = s.take_tutorial_calls();
 
     s.run("BenillaOptionsFrameContainerBodyInterfaceRowShowTutorialsCheck:Click()")
         .unwrap();
-    assert_eq!(s.take_tutorial_clears(), 1, "off clears the bank");
-    assert_eq!(s.take_tutorial_resets(), 0);
+    assert_eq!(
+        s.take_tutorial_calls(),
+        [TutorialCall::Clear],
+        "off clears the bank"
+    );
     assert!(
         s.take_cvar_changes().is_empty(),
         "there is no tutorial CVar in 1.12 — the row must not invent one"
@@ -3088,8 +3148,11 @@ fn show_tutorials_reads_the_bank_and_writes_through_clear_and_reset() {
 
     s.run("BenillaOptionsFrameContainerBodyInterfaceRowShowTutorialsCheck:Click()")
         .unwrap();
-    assert_eq!(s.take_tutorial_resets(), 1, "on resets the bank");
-    assert_eq!(s.take_tutorial_clears(), 0);
+    assert_eq!(
+        s.take_tutorial_calls(),
+        [TutorialCall::Reset],
+        "on resets the bank"
+    );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
@@ -3103,15 +3166,14 @@ fn a_no_op_write_does_not_re_arm_the_tutorials() {
     s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
     s.run("BenillaOptionsFrameCategoryListRowInterface:Click()")
         .unwrap();
-    let _ = s.take_tutorial_clears();
-    let _ = s.take_tutorial_resets();
+    let _ = s.take_tutorial_calls();
 
     // Defaults writes "1" over a row that already reads "1".
     s.run("BenillaOptionsFrameContainerDefaults:Click()")
         .unwrap();
     assert_eq!(
-        (s.take_tutorial_resets(), s.take_tutorial_clears()),
-        (0, 0),
+        s.take_tutorial_calls(),
+        [],
         "the guard held: no bank write for a value that had not moved"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
@@ -4057,6 +4119,7 @@ impl benilla_ui::script::TextMeasure for SteppedFont {
 fn the_two_option_tabs_fit_their_labels_at_the_drawn_scale() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_text_measurer(Box::new(SteppedFont(6.0)));
     let mut s = harness_on(s);
     s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();

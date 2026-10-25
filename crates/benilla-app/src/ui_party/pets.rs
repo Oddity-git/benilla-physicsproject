@@ -25,7 +25,7 @@ use crate::query_cache::Ask;
 /// Which roster a pet token counts its owner in: the two resolve the pet's guid apart
 /// (`0x4e81d0` behind the owner's online bit, `0x491960` with none).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Roster {
+pub(crate) enum Roster {
     Party,
     Raid,
 }
@@ -47,41 +47,38 @@ impl std::ops::Deref for Names<'_> {
     }
 }
 
-/// What the pets' snapshots read: the object manager, the name cache and the creature-type
-/// resolver's sources.
-pub(super) struct Lookup<'a, 'w, 's, 'q> {
-    index: &'a GuidIndex,
-    stores: &'a Query<'w, 's, &'q ObjectStore>,
-    names: &'a NameCache,
-    commands: &'a NetCommands,
-    types: CreatureTypeSources<'a>,
+impl Names<'_> {
+    /// The handle that asks the cache.
+    pub(super) fn commands(&self) -> &NetCommands {
+        &self.commands
+    }
 }
 
-impl<'a, 'w, 's, 'q> Lookup<'a, 'w, 's, 'q> {
-    pub(super) fn new(
-        index: &'a GuidIndex,
-        stores: &'a Query<'w, 's, &'q ObjectStore>,
-        names: &'a Names,
-        types: CreatureTypeSources<'a>,
-    ) -> Self {
-        Self {
-            index,
-            stores,
-            names: &names.cache,
-            commands: &names.commands,
-            types,
-        }
-    }
+/// What the pets' snapshots read: the object manager, the name cache and the creature-type
+/// resolver's sources.
+pub(super) struct Lookup<'a> {
+    /// The object manager's lookup (`0x468460`).
+    pub(super) object: &'a dyn Fn(u64) -> Option<&'a ObjectStore>,
+    pub(super) names: &'a NameCache,
+    pub(super) commands: &'a NetCommands,
+    pub(super) types: CreatureTypeSources<'a>,
+    /// `Spell.dbc`, which the tooltip's owner line reads a creating spell from.
+    pub(super) catalog: Option<&'a benilla_formats::SpellCatalog>,
+    pub(super) study: crate::ui_unit::tooltip_facts::StudySources<'a>,
+    /// `UnitIsPVPFreeForAll` per held unit, the owner's flag a pet answers with (`0x606170`).
+    pub(super) ffa: &'a dyn Fn(u64) -> bool,
+}
 
+impl Lookup<'_> {
     /// The held object's descriptor (`0x468460`).
     pub(super) fn store(&self, guid: u64) -> Option<&ObjectStore> {
-        self.stores.get(*self.index.0.get(&guid)?).ok()
+        (self.object)(guid)
     }
 }
 
 /// The guid `partypetN` or `raidpetN` names for `owner`, off its descriptor while held, else its
 /// record (see [`GroupState::party_pet_guid`], [`GroupState::raid_pet_guid`]).
-fn pet_guid(
+pub(super) fn pet_guid(
     group: &GroupState,
     owner: u64,
     held: Option<&ObjectStore>,
@@ -97,17 +94,19 @@ fn pet_guid(
 /// Whether a held pet of any group member has moved, for the party feed's gate. Every member is
 /// asked as a raid row, whose record leg has no online test: a superset of the party slots'.
 pub(super) fn store_changed(
-    look: &Lookup<'_, '_, '_, '_>,
+    index: &GuidIndex,
+    stores: &Query<&ObjectStore>,
     group: &GroupState,
     own: Option<(u64, &ObjectStore)>,
     changed: &Query<(), Changed<ObjectStore>>,
 ) -> bool {
     let moved = |owner: u64, held: Option<&ObjectStore>| {
         pet_guid(group, owner, held, Roster::Raid)
-            .and_then(|pet| look.index.0.get(&pet))
+            .and_then(|pet| index.0.get(&pet))
             .is_some_and(|&e| changed.get(e).is_ok())
     };
-    group.members.iter().any(|m| moved(m.guid, look.store(m.guid)))
+    let store = |guid: u64| index.0.get(&guid).and_then(|e| stores.get(*e).ok());
+    group.members.iter().any(|m| moved(m.guid, store(m.guid)))
         // Our own pet is a raid row's only, a party's slots being the others'.
         || (group.group_type == super::GROUPTYPE_RAID
             && own.is_some_and(|(guid, store)| moved(guid, Some(store))))
@@ -117,7 +116,7 @@ pub(super) fn store_changed(
 /// `owner` 0, or a member with no pet the roster or the descriptor names
 /// ([`GroupState::party_pet_guid`], [`GroupState::raid_pet_guid`]).
 pub(super) fn member_pet(
-    look: &Lookup<'_, '_, '_, '_>,
+    look: &Lookup<'_>,
     group: &GroupState,
     owner: u64,
     held: Option<&ObjectStore>,
@@ -139,7 +138,19 @@ pub(super) fn member_pet(
                 .names
                 .resolve_unit(guid, Some(store), Ask::New(look.commands))
                 .map(str::to_string);
-            crate::ui_unit::snapshot(store, guid, name, 0, Default::default(), look.types)
+            let mut s =
+                crate::ui_unit::snapshot(store, guid, name, 0, Default::default(), look.types);
+            s.is_pvp_ffa = (look.ffa)(guid);
+            let object = |g: u64| look.store(g);
+            let sources = crate::ui_unit::tooltip_facts::TooltipSources {
+                names: look.names,
+                catalog: look.catalog,
+                object: &object,
+                study: look.study,
+            };
+            s.tooltip =
+                crate::ui_unit::tooltip_facts::tooltip_facts(store, s.creature_type, &sources);
+            s
         }
         None => record_state(
             group,
@@ -244,9 +255,13 @@ pub(in crate::ui_party) mod tests {
         let mut app = App::new();
         app.add_message::<FieldChanged>()
             .init_resource::<GroupState>()
+            .init_resource::<crate::ui_party::calls::GroupEdits>()
             .init_resource::<GuidIndex>()
             .init_resource::<NameCache>()
-            .init_resource::<crate::ui_chat::ChatLog>();
+            .init_resource::<crate::ui_guild::GuildState>()
+            .init_resource::<crate::ui_chat::ChatLog>()
+            .init_resource::<crate::sound::MessageSounds>()
+            .init_resource::<crate::net::Reputations>();
         let (tx, rx) = crossbeam_channel::unbounded();
         // Kept alive for the run: a dropped receiver would fail the name queries.
         std::mem::forget(rx);
@@ -268,7 +283,17 @@ pub(in crate::ui_party) mod tests {
             )
             .unwrap();
         app.insert_non_send_resource(script);
-        app.add_systems(Update, super::super::feed::feed_party);
+        // The feed, then the party lane, as the lanes' drain follows the feeds.
+        app.init_resource::<crate::ui_party::PartyLane>()
+            .add_systems(
+                Update,
+                (
+                    super::super::feed::feed_party,
+                    crate::ui_party::fire_party_lane
+                        .after(super::super::feed::feed_party)
+                        .before(super::super::feed::drain_party),
+                ),
+            );
         app
     }
 
@@ -430,6 +455,43 @@ pub(in crate::ui_party) mod tests {
         );
     }
 
+    /// `UnitIsPVPFreeForAll` on a held pet reads its owner's `PLAYER_FLAGS` 0x80: the unit's
+    /// `UNIT_FIELD_FLAGS` 0x8 (`0x5165ad`), then the player that controls it, its charmer else its
+    /// creator (`0x606170` at `0x5165c3`), and that player's flag (`0x5165cc`).
+    #[test]
+    fn a_party_pets_free_for_all_is_its_owners() {
+        const OBJECT_TYPE: u16 = 2;
+        const CREATEDBY: u16 = 14;
+        const UNIT_FLAGS: u16 = 46;
+        const PLAYER_FLAGS: u16 = 190;
+        let mut app = app();
+        party(&mut app, 1, true);
+        let owner = stream(&mut app, member(1), &summon(pet(1)));
+        set_fields(&mut app, owner, &[(OBJECT_TYPE, 0x19)]);
+        stream(
+            &mut app,
+            pet(1),
+            &[
+                (OBJECT_TYPE, 0x9),
+                (HEALTH, 900),
+                (MAXHEALTH, 1000),
+                (UNIT_FLAGS, 0x8),
+                (CREATEDBY, member(1) as u32),
+                (CREATEDBY + 1, (member(1) >> 32) as u32),
+            ],
+        );
+        frame(&mut app);
+        assert_eq!(flag(&mut app, "UnitIsPVPFreeForAll('partypet1')"), None);
+
+        set_fields(&mut app, owner, &[(PLAYER_FLAGS, 0x80)]);
+        frame(&mut app);
+        assert_eq!(
+            flag(&mut app, "UnitIsPVPFreeForAll('partypet1')"),
+            Some(1.0),
+            "the owner's flag"
+        );
+    }
+
     /// A pet the object manager does not hold answers from its online owner's record, as the
     /// getters fall through the party record to the pet record (`0x496420`): `UnitExists` is 1
     /// through the roster fallback with no object, `UnitIsVisible` is nil, and `UnitLevel` has no
@@ -488,6 +550,58 @@ pub(in crate::ui_party) mod tests {
                 "{dead}"
             );
         }
+    }
+
+    /// The reported shape: the record names the member's old pet from a stats packet; in view they
+    /// call another and walk out of range before its name is known. The snapshot takes the new
+    /// pet's name from `0x609210` (`0x5f0a63`), which misses and answers `UNKNOWNOBJECT`
+    /// (`0x609324`), and copies that (`0x5f0a70`): the old pet's name is not kept for the new one.
+    #[test]
+    fn a_member_leaving_view_with_an_unnamed_new_pet_names_it_unknownobject() {
+        let mut app = app();
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run(r#"UNKNOWNOBJECT = "Unknown""#)
+            .unwrap();
+        party(&mut app, 1, true);
+        let owner = stream(&mut app, member(1), &summon(pet(2)));
+        let new_pet = stream(
+            &mut app,
+            pet(2),
+            &[(HEALTH, 900), (MAXHEALTH, 1000), (PETNUMBER, 7)],
+        );
+        frame(&mut app);
+        assert_eq!(
+            text(&mut app, "UnitName('partypet1')").as_deref(),
+            Some("Unknown"),
+            "held, its name not yet answered"
+        );
+
+        let fields = |app: &App, e: Entity| app.world().get::<ObjectStore>(e).unwrap().clone();
+        let (store, pet_store) = (fields(&app, owner), fields(&app, new_pet));
+        app.world_mut()
+            .resource_scope(|world, mut group: Mut<GroupState>| {
+                super::super::net::member_deactivated(
+                    member(1),
+                    &mut group,
+                    Some(&store),
+                    |g| (g == pet(2)).then_some(&pet_store),
+                    world.resource::<NameCache>(),
+                    world.get_non_send_resource::<UiScript>(),
+                    world.resource::<NetCommands>(),
+                );
+            });
+        for (guid, e) in [(member(1), owner), (pet(2), new_pet)] {
+            app.world_mut().despawn(e);
+            app.world_mut().resource_mut::<GuidIndex>().0.remove(&guid);
+        }
+        frame(&mut app);
+        assert_eq!(
+            text(&mut app, "UnitName('partypet1')").as_deref(),
+            Some("Unknown"),
+            "out of view, the record's copy of the miss, not the old pet's \"Whelp\""
+        );
+        assert_eq!(num(&mut app, "UnitHealth('partypet1')"), 900.0);
     }
 
     /// A pet is found only behind its owner's online bit (`0x4e8227`, `0x4e8884`): an offline
@@ -791,6 +905,7 @@ pub(in crate::ui_party) mod tests {
                 pet_family: 0,
                 rank: 0,
                 type_flags: 0,
+                pet_spell_list: 0,
                 civilian: false,
                 racial_leader: false,
                 display_id: 0,
@@ -885,19 +1000,19 @@ pub(in crate::ui_party) mod tests {
         let creature_type =
             |app: &mut App, token: &str| text(app, &format!("UnitCreatureType('{token}')"));
         assert_eq!(
-            creature_type(&mut app, "raid1").as_deref(),
+            creature_type(&mut app, "raid2").as_deref(),
             Some("야수"),
-            "our own row"
+            "our own row, after the member's"
         );
         assert_eq!(
-            creature_type(&mut app, "raid2").as_deref(),
+            creature_type(&mut app, "raid1").as_deref(),
             Some("야수"),
             "a held member's row"
         );
         set_fields(&mut app, me, &[(BYTES_1, 0)]);
         frame(&mut app);
         assert_eq!(
-            creature_type(&mut app, "raid1").as_deref(),
+            creature_type(&mut app, "raid2").as_deref(),
             Some("인간형"),
             "out of form: our race's type"
         );

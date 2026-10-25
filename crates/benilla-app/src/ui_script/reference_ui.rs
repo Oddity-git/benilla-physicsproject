@@ -1352,14 +1352,7 @@ mod tests {
 
         // Open gaps, each with the window and the click that reach it. The assertion below
         // refuses an entry whose gap has closed.
-        const KNOWN: &[(&str, &str, &str)] = &[
-            (
-                "StaticPopup.xml",
-                "ReplaceTradeEnchant",
-                "a registered 1.12 binding (`0x48d330`) whose body is not yet known; it is built \
-                 once it is. Reached by TRADE_REPLACE_ENCHANT's Accept, an event this engine does not fire yet.",
-            ),
-        ];
+        const KNOWN: &[(&str, &str, &str)] = &[];
 
         let mut missing: Vec<(String, String)> = Vec::new();
         for entry in &gated_chain_entries() {
@@ -1925,13 +1918,10 @@ mod tests {
                  `ShowFriends` too",
             ),
             (
-                "GOSSIP_ENTER_CODE",
-                "UIParent.lua — the code-entry gossip option (a door with a combination); \
-                 benilla's gossip feed carries no code-entry option kind yet",
-            ),
-            (
-                "PLAYER_SKINNED",
-                "UIParent.lua — the corpse-skinned notice; benilla's loot feed does not derive it",
+                "PARTY_INVITE_CANCEL",
+                "UIParent.lua — the invite popup's hide. Its one signal is `SMSG_GROUP_CANCEL`'s \
+                 handler (`0x5e6770`, opcode `0x71`, reads a string, then calls \
+                 `0x48f440`); benilla does not read that packet, and vmangos never sends it",
             ),
             (
                 "TRADE_REQUEST",
@@ -1941,11 +1931,6 @@ mod tests {
                  `0x11d`), so StaticPopupDialogs[\"TRADE\"] is \
                  dead code THERE too, and benilla leaves it unproduced: \
                  producing this would be a divergence, not a fix",
-            ),
-            (
-                "TRADE_REPLACE_ENCHANT",
-                "UIParent.lua — the enchant-replacement confirm inside a trade; benilla's trade \
-                 feed does not derive it",
             ),
             (
                 "CLOSE_WORLD_MAP",
@@ -1963,7 +1948,6 @@ mod tests {
                  flow works without it",
             ),
             ("ITEM_TEXT_TRANSLATION", "ItemTextFrame.lua"),
-            ("PET_UI_CLOSE", "PetPaperDollFrame.lua"),
             (
                 "SHOW_COMPARE_TOOLTIP",
                 "PaperDollFrame.lua — the second `TRADE_REQUEST`: event 377 is \
@@ -1976,11 +1960,6 @@ mod tests {
                  event would be a divergence, not a fix",
             ),
             ("SYSMSG", "UIErrorsFrame.lua"),
-            (
-                "UNIT_MODEL_CHANGED",
-                "four files — the paperdoll model refresh",
-            ),
-            ("UNIT_PORTRAIT_UPDATE", "three files — the portrait refresh"),
             (
                 "ZONE_UNDER_ATTACK",
                 "ChatFrame.lua — registered, but the name is no row of the client's event table \
@@ -2203,7 +2182,11 @@ mod tests {
         ] {
             assert_eq!(insets(f), [0.0; 4], "{f}");
         }
-        assert_eq!(insets("WorldStateScoreFrame"), [13.0, 115.0, 10.0, 13.0]);
+        // Each inset through the setter and getter steps at 4:3: `G(S(13))` is 13.000001.
+        assert_eq!(
+            insets("WorldStateScoreFrame"),
+            [13.000_001, 115.0, 10.0, 13.000_001]
+        );
     }
 
     fn seat_a_player(s: &mut UiScript) {

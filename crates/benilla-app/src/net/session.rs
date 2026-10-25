@@ -11,17 +11,20 @@ use crate::names::NameCache;
 use crate::ui_quest::QuestGiver;
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
+use benilla_ui::script::ReputationListOp;
 use bevy::ecs::system::SystemParam;
 
+use super::{clock_tick, ServerTime};
 use super::{
     AddonInfoMessage, CharActionResultMessage, CharListMessage, CharacterLoginFailedMessage,
     CinematicTriggeredMessage, ClientControlMessage, DisconnectedMessage, DroppedOpcodes,
-    EnteredWorldMessage, GameTime, GuidIndex, HomeBind, KnockBackMessage, LoggedOutMessage,
+    EnteredWorldMessage, GuidIndex, HomeBind, KnockBackMessage, LoggedOutMessage,
     LoginFailedMessage, LoginQueuedMessage, LoginStageMessage, NetCommands, NetHandlerApp,
     NetStatus, ObjectStore, PendingTransfer, Proficiencies, RealmListMessage, Reputations,
-    RosterFailedMessage, SelfGuid, ServerTime, ServerWallClock, TeleportMessage, WorldAuthMessage,
+    RosterFailedMessage, SelfGuid, ServerWallClock, TeleportMessage, WorldAuthMessage,
     WorldportMessage,
 };
+use benilla_world::frame_pace::FrameStep;
 
 /// Registers the session handlers.
 pub(super) fn register(app: &mut App) {
@@ -48,11 +51,15 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::TransferPending, on_transfer)
         .net_handler(K::TransferAborted, on_transfer)
         .net_handler(K::TimeSpeed, on_clock)
+        .net_handler(K::GameSpeedSet, on_clock)
+        .net_handler(K::GameTimeUpdate, on_clock)
+        .net_handler(K::GameTimeSet, on_clock)
         .net_handler(K::ServerUnixTime, on_clock)
         .net_handler(K::Reputations, on_reputations)
         .net_handler(K::ReputationDelta, on_reputation_delta)
         .net_handler(K::ForcedReactions, on_reputations)
         .net_handler(K::ReputationVisible, on_reputations)
+        .net_handler(K::ReputationAtWar, on_reputations)
         .net_handler(K::BindPoint, on_player_store)
         .net_handler(K::Proficiency, on_player_store)
         .net_handler(K::PacketDropped, on_packet_dropped)
@@ -199,28 +206,44 @@ fn on_connected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
     }
 }
 
-fn on_logged_out(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
+fn on_logged_out(
+    In(ev): In<SessionEvent>,
+    mut e: Edges,
+    mut b: Bridge,
+    view_log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
+) {
     if let SessionEvent::LoggedOut = ev {
+        log_teardown(view_log, &b);
         logged_out(
             &mut b.commands,
             &mut b.index,
             &mut b.self_guid,
             &mut e.logged_out,
         );
-        // The reference zeroes the forced table's count only in teardown `0x4d5360` (`0x4d5419`),
-        // whose one caller is `ShutdownGame 0x491180` (`0x4911dc`), never on a worldport. The
-        // session's end stands in for that shutdown: the table is the character's, and one left
-        // here would colour the next character's world. The server resends it at login for a
-        // saved aura (vmangos `Unit.cpp:3511` → `SpellAuras.cpp:2744-2745`).
-        b.reputations.clear_forced();
+        // The reference zeroes the forced table's count and the 64 slots only in teardown
+        // `0x4d5360` (`0x4d5419`, `0x4d541f`), whose one caller is `ShutdownGame 0x491180`
+        // (`0x4911dc`), never on a worldport. The session's end stands in for that shutdown: the
+        // table and the standings are the character's, and ones left here would colour the next
+        // character's world. The server resends the table at login for a saved aura (vmangos
+        // `Unit.cpp:3511` → `SpellAuras.cpp:2744-2745`).
+        b.reputations.tear_down();
     }
 }
 
 /// The bridge's half of the session end; each window's own listener runs after it.
-fn on_disconnected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
+fn on_disconnected(
+    In(ev): In<SessionEvent>,
+    mut e: Edges,
+    mut b: Bridge,
+    mut released: ResMut<super::objects::Released>,
+    view_log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
+) {
     if let SessionEvent::Disconnected { reason, end } = ev {
+        log_teardown(view_log, &b);
         // The same teardown as `on_logged_out`'s.
-        b.reputations.clear_forced();
+        b.reputations.tear_down();
+        // Leaving the world frees the released objects with the live ones (`0x467700`).
+        released.clear();
         disconnected(
             reason,
             end,
@@ -234,6 +257,14 @@ fn on_disconnected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
             &mut e.transfer,
             &mut e.disconnects,
         );
+    }
+}
+
+/// The world left at once: the stores the teardown takes, logged for the views a listener reads
+/// ([`crate::ui_unit::views::ViewLog::torn_down`]).
+fn log_teardown(view_log: Option<ResMut<crate::ui_unit::views::ViewLog>>, b: &Bridge) {
+    if let Some(mut log) = view_log {
+        log.torn_down(&b.index, |e| b.stores.get(e).ok());
     }
 }
 
@@ -272,6 +303,10 @@ fn on_worldport(
     mut e: Edges,
     mut b: Bridge,
     mut group: ResMut<crate::ui_party::GroupState>,
+    script: Option<NonSend<benilla_ui::script::UiScript>>,
+    mut released: ResMut<super::objects::Released>,
+    view_log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
+    player: Option<Res<crate::player::Player>>,
 ) {
     if let SessionEvent::Worldport {
         map_id,
@@ -280,8 +315,22 @@ fn on_worldport(
         needs_ack,
     } = ev
     {
-        // Every streamed roster member is about to be purged; the reference deactivates each.
-        crate::ui_party::net::roster_deactivated(&mut group, &b.index, &b.stores, &b.names, &b.net);
+        // Every streamed roster member is about to be freed, and each one's destructor runs the
+        // roster hook (`0x5dd6a0` → `0x4e85d0` mode 0).
+        let before = view_log.as_ref().map(|_| group.stats.clone());
+        crate::ui_party::net::roster_deactivated(
+            &mut group,
+            &b.index,
+            &b.stores,
+            &b.names,
+            script.as_deref(),
+            &b.net,
+        );
+        let mut view_log = view_log;
+        if let (Some(log), Some(before)) = (view_log.as_deref_mut(), before) {
+            log.records(&before, &group.stats);
+        }
+        log_teardown(view_log, &b);
         worldport(
             map_id,
             position,
@@ -291,8 +340,11 @@ fn on_worldport(
             &mut b.index,
             &mut e.transfer,
             &b.transports,
+            player.as_ref().and_then(|p| p.ride_entity()),
             &mut e.worldports,
         );
+        // Loading a new world frees the released objects with the live ones (`0x467700`).
+        released.clear();
     }
 }
 
@@ -301,20 +353,26 @@ fn on_transfer(In(ev): In<SessionEvent>, mut e: Edges) {
         SessionEvent::TransferPending {
             map_id,
             transport_entry,
-        } => transfer_pending(map_id, transport_entry, &mut e.transfer),
+            from_map,
+        } => transfer_pending(map_id, transport_entry, from_map, &mut e.transfer),
         SessionEvent::TransferAborted { reason } => transfer_aborted(reason, &mut e.transfer),
         _ => {}
     }
 }
 
-fn on_clock(In(ev): In<SessionEvent>, mut b: Bridge) {
+/// The game clock's four messages (`SMSG_LOGIN_SETTIMESPEED`, `SMSG_GAMESPEED_SET`,
+/// `SMSG_GAMETIME_UPDATE`, `SMSG_GAMETIME_SET`) and the server's wall clock.
+fn on_clock(In(ev): In<SessionEvent>, mut b: Bridge, step: Res<FrameStep>) {
     match ev {
-        SessionEvent::TimeSpeed {
-            hours,
-            minutes,
-            day_serial,
-            timescale,
-        } => time_speed(hours, minutes, day_serial, timescale, &mut b.server_time),
+        SessionEvent::TimeSpeed { .. }
+        | SessionEvent::GameSpeedSet { .. }
+        | SessionEvent::GameTimeUpdate { .. }
+        | SessionEvent::GameTimeSet { .. } => {
+            let lines = b.server_time.0.on_message(&ev, clock_tick(&step));
+            for line in lines.into_iter().flatten() {
+                info!("console: {line}");
+            }
+        }
         SessionEvent::ServerUnixTime { unix_time } => {
             server_unix_time(unix_time, &mut b.wall_clock)
         }
@@ -322,16 +380,66 @@ fn on_clock(In(ev): In<SessionEvent>, mut b: Bridge) {
     }
 }
 
+/// `UPDATE_FACTION` (`0x703e50` with 0x174) as a reputation message signals it, on the notice lane
+/// in the packets' order.
+const UPDATE_FACTION: crate::field_watch::FieldNotice = crate::field_watch::FieldNotice::Global {
+    id: crate::field_watch::id::UPDATE_FACTION,
+};
+
+/// `CGUnit_C::RefreshReaction` (`0x606e20`) on the active player from a reputation message, once,
+/// when the object manager holds the player (`0x4d5a55`, `0x4d58ff`): `UNIT_FACTION` for it, its
+/// summon and its charm, then for every held unit the sweep reaches, on the notice lane.
+fn refresh_player_reaction(b: &Bridge, lane: &mut crate::field_watch::NoticeLane) {
+    let Some(me) = b.self_guid.0 else {
+        return;
+    };
+    let Some(store) = b.index.0.get(&me).and_then(|&e| b.stores.get(e).ok()) else {
+        return;
+    };
+    let others = || {
+        let units = b.index.0.iter().filter_map(|(&g, &e)| {
+            let s = b.stores.get(e).ok()?;
+            s.is_unit().then_some((g, &s.0))
+        });
+        crate::field_watch::reaction_sweep(me, units)
+    };
+    lane.write_batch(crate::field_watch::reaction_signals(
+        me,
+        &store.0,
+        Some(me),
+        &others,
+    ));
+}
+
 fn on_reputations(
     In(ev): In<SessionEvent>,
     mut b: Bridge,
     factions: Option<Res<crate::target::ring::Factions>>,
-    mut chat: ResMut<crate::ui_chat::ChatLog>,
+    chat: Res<crate::ui_chat::ChatLog>,
+    // Absent in a harness with no interface.
+    mut lane: Option<ResMut<crate::field_watch::NoticeLane>>,
 ) {
+    let signal = |n: usize, lane: &mut Option<ResMut<crate::field_watch::NoticeLane>>| {
+        if let Some(lane) = lane.as_deref_mut() {
+            lane.write_batch(std::iter::repeat_n(UPDATE_FACTION, n));
+        }
+    };
     match ev {
-        SessionEvent::Reputations { standings } => reputations(standings, &mut b.reputations),
+        SessionEvent::Reputations { standings } => {
+            reputations(standings, &mut b.reputations);
+            // With the player held, the rebuild (`0x4d5694`), whose two sorts signal
+            // (`0x4d55d9` → `0x4d6457`, and `0x4d55de`), then the message's own (`0x4d5699`).
+            let held = self_facts(&b).is_some();
+            if held {
+                b.reputations.list_ops.push(ReputationListOp::Rebuild);
+            }
+            signal(1 + 2 * usize::from(held), &mut lane);
+        }
         SessionEvent::ForcedReactions { reactions } => {
-            forced_reactions(reactions, &mut b.reputations)
+            forced_reactions(reactions, &mut b.reputations);
+            if let Some(lane) = lane.as_deref_mut() {
+                refresh_player_reaction(&b, lane);
+            }
         }
         SessionEvent::ReputationVisible { list_id } => {
             // The chat line names the rank, so it reads the store before the flag lands.
@@ -343,9 +451,22 @@ fn on_reputations(
                     me.race,
                     me.class,
                 );
-                crate::ui_reputation::queue_standing_lines(line, f.catalog(), me.female, &mut chat);
+                crate::ui_reputation::queue_standing_lines(line, f.catalog(), me.female, &chat);
             }
-            reputation_visible(list_id, &mut b.reputations)
+            // A slot newly visible is added and sorted, which signals (`0x4d5738`, `0x4d574a` →
+            // `0x4d5dab`).
+            let listed = reputation_visible(list_id, &mut b.reputations);
+            if listed {
+                b.reputations
+                    .list_ops
+                    .push(ReputationListOp::Visible(list_id));
+            }
+            signal(usize::from(listed), &mut lane);
+        }
+        SessionEvent::ReputationAtWar { list_id, flags } => {
+            reputation_at_war(list_id, flags, &mut b.reputations);
+            // Whether or not the bit moved (`0x4d56f6`).
+            signal(1, &mut lane);
         }
         _ => {}
     }
@@ -379,28 +500,21 @@ fn on_reputation_delta(
     In(ev): In<SessionEvent>,
     mut b: Bridge,
     factions: Option<Res<crate::target::ring::Factions>>,
-    mut chat_log: ResMut<crate::ui_chat::ChatLog>,
+    chat_log: Res<crate::ui_chat::ChatLog>,
     mut quest: ResMut<QuestGiver>,
     quest_log: Option<ResMut<crate::ui_quest_log::QuestLog>>,
+    // Absent in a harness with no interface.
+    mut lane: Option<ResMut<crate::field_watch::NoticeLane>>,
+    tutorials: Option<Res<crate::tutorial::Tutorials>>,
 ) {
     if let SessionEvent::ReputationDelta { standings } = ev {
         crate::combat_log::chat::faction_standing(
             &standings,
             &b.reputations,
             factions.as_deref(),
-            &mut chat_log,
+            &chat_log,
         );
         if let (Some(f), Some(me)) = (factions.as_deref(), self_facts(&b)) {
-            let moved = crate::ui_reputation::rank_moved(
-                &standings,
-                &b.reputations,
-                f.catalog(),
-                me.race,
-                me.class,
-            );
-            if let (true, Some(mut quest_log)) = (moved, quest_log) {
-                quest_log.note_faction_rank_move();
-            }
             let lines = crate::ui_reputation::delta_lines(
                 &standings,
                 &b.reputations,
@@ -408,14 +522,49 @@ fn on_reputation_delta(
                 me.race,
                 me.class,
             );
-            crate::ui_reputation::queue_standing_lines(
-                lines,
-                f.catalog(),
-                me.female,
-                &mut chat_log,
-            );
+            crate::ui_reputation::queue_standing_lines(lines, f.catalog(), me.female, &chat_log);
         }
-        reputation_delta(standings, &mut b.reputations, &mut quest);
+        let ranks = factions
+            .as_deref()
+            .zip(self_facts(&b))
+            .map(|(f, me)| (f.catalog(), me.race, me.class));
+        let latches = reputation_delta(standings, &mut b.reputations, ranks, &mut quest);
+        b.reputations.list_ops.push(ReputationListOp::Standing {
+            listed: latches.listed.clone(),
+            flags_moved: latches.flags_moved,
+        });
+        // A flag byte that moved re-sorts, which signals (`0x4d58c8` → `0x4d5dab`).
+        if latches.flags_moved {
+            if let Some(lane) = lane.as_deref_mut() {
+                lane.write(UPDATE_FACTION);
+            }
+        }
+        // A moved rank rebuilds the quest log and refreshes the active player's reaction once
+        // for the message (`0x4d58ea`-`0x4d5905`); `ranks` holds only with the player.
+        if latches.rank_moved {
+            if let Some(mut quest_log) = quest_log {
+                quest_log.note_faction_rank_move();
+            }
+            if let Some(lane) = lane.as_deref_mut() {
+                refresh_player_reaction(&b, lane);
+            }
+        }
+        // Reputation, with the active player held at level 10 or more (`0x4d5963`-`0x4d597a`).
+        let level = b
+            .self_guid
+            .0
+            .and_then(|g| b.index.0.get(&g))
+            .and_then(|e| b.stores.get(*e).ok())
+            .and_then(|s| s.0.unit_level());
+        if level.is_some_and(|l| l as i32 >= 10) {
+            if let Some(tutorials) = tutorials.as_deref() {
+                tutorials.trigger_now(crate::tutorial::id::REPUTATION);
+            }
+        }
+        // The message's own signal, whatever it held, none included (`0x4d597f`-`0x4d5984`).
+        if let Some(lane) = lane.as_deref_mut() {
+            lane.write(UPDATE_FACTION);
+        }
     }
 }
 
@@ -655,7 +804,12 @@ fn knock_back(
 
 /// `SMSG_TRANSFER_PENDING`: latched for the worldport; its transport block makes `NEW_WORLD`'s
 /// coordinates boat-local.
-fn transfer_pending(map_id: u32, transport_entry: Option<u32>, pending: &mut PendingTransfer) {
+fn transfer_pending(
+    map_id: u32,
+    transport_entry: Option<u32>,
+    from_map: Option<u32>,
+    pending: &mut PendingTransfer,
+) {
     match transport_entry {
         Some(entry) => info!("net: transfer pending → map {map_id} riding transport {entry}"),
         None => info!("net: transfer pending → map {map_id}"),
@@ -663,18 +817,21 @@ fn transfer_pending(map_id: u32, transport_entry: Option<u32>, pending: &mut Pen
     pending.0 = Some(crate::net::PendingTransferInfo {
         map_id,
         transport_entry,
+        from_map,
     });
 }
 
-/// `SMSG_TRANSFER_ABORTED`: clears the latch.
+/// `SMSG_TRANSFER_ABORTED`: clears the latch, which ends the screen the transfer raised as
+/// `0x401a11` does (`0x407e80`); the reason's line is `ui_chat`'s.
 fn transfer_aborted(reason: u8, pending: &mut PendingTransfer) {
     warn!("net: transfer aborted (reason {reason})");
     pending.0 = None;
 }
 
-/// `SMSG_NEW_WORLD`/`SMSG_LOGIN_VERIFY_WORLD`: drops every tracked object, then hands the app
-/// the destination. A transport whose timetable touches the new map is spared, so a ridden boat
-/// sails through the map change and the server's re-create refreshes it in place.
+/// `SMSG_NEW_WORLD`/`SMSG_LOGIN_VERIFY_WORLD`: drops every tracked object, as `0x401bc0` destroys
+/// them, then hands the app the destination. The one exception is the ship a transport transfer
+/// carries us on, when its timetable touches the new map: it sails through the map change, so our
+/// deck-local pose has a deck, and the server's create refreshes it in place.
 fn worldport(
     map_id: u32,
     position: [f32; 3],
@@ -684,12 +841,23 @@ fn worldport(
     index: &mut GuidIndex,
     pending: &mut PendingTransfer,
     transports: &Query<&crate::transport::Transport>,
+    ridden: Option<Entity>,
     worldports: &mut MessageWriter<WorldportMessage>,
 ) {
+    let carried = pending
+        .0
+        .as_ref()
+        .is_some_and(|p| p.transport_entry.is_some());
     index.0.retain(|guid, e| {
-        if transports.get(*e).is_ok_and(|t| t.touches_map(map_id)) {
+        let ours = carried && ridden == Some(*e);
+        if ours && transports.get(*e).is_ok_and(|t| t.touches_map(map_id)) {
             // info, not debug: rare, and the crossing depends on it firing for the ridden boat.
             info!("worldport: sparing transport {guid:#x} (its path touches map {map_id})");
+            // It stands for the new object the post-port create builds, so its clock goes until
+            // that create sets one (`0x5f7080`); the deck holds its pose meanwhile.
+            commands
+                .entity(*e)
+                .remove::<crate::transport::TransportAnchor>();
             return true;
         }
         commands.entity(*e).try_despawn();
@@ -715,20 +883,6 @@ fn worldport(
     });
 }
 
-/// `SMSG_LOGIN_SETTIMESPEED`: the game clock that drives day/night lighting.
-fn time_speed(
-    hours: u8,
-    minutes: u8,
-    day_serial: u32,
-    timescale: f32,
-    server_time: &mut ServerTime,
-) {
-    if server_time.0.is_none() {
-        info!("net: server game-time {hours:02}:{minutes:02} (drives lighting)");
-    }
-    server_time.0 = Some(GameTime::new(hours, minutes, day_serial, timescale));
-}
-
 /// `SMSG_QUERY_TIME_RESPONSE`: the server wall clock that absolute descriptor stamps (the
 /// timed-quest timer) are dated in; its skew against ours is logged once per session.
 fn server_unix_time(unix_time: u32, clock: &mut ServerWallClock) {
@@ -749,7 +903,7 @@ fn server_unix_time(unix_time: u32, clock: &mut ServerWallClock) {
 /// `SMSG_INITIALIZE_FACTIONS`: the login reputation store.
 fn reputations(standings: Vec<(u8, i32)>, reputations: &mut Reputations) {
     info!("net: reputation store ({} slots)", standings.len());
-    reputations.slots = standings;
+    reputations.set_slots(&standings);
 }
 
 /// `SMSG_SET_FORCED_REACTIONS`: the server resends the table whole on every change, so it
@@ -759,40 +913,94 @@ fn forced_reactions(reactions: Vec<(u32, u32)>, reputations: &mut Reputations) {
     reputations.set_forced(reactions);
 }
 
-/// `SMSG_SET_FACTION_STANDING`: overwrites the changed slots, growing the store with flags 0,
-/// and makes each visible unless it is `HIDDEN`, as the reference's handler does (`0x4d5760`).
+/// `SMSG_SET_FACTION_STANDING` (`0x4d5760`), entry by entry: the slot's standing stored, the
+/// slot made visible unless it is visible or `HIDDEN` already (`0x4d5815`), and its at-war bit
+/// set by the faction's rank after the entry below Unfriendly (`0x4d5833`), else cleared when that
+/// rank rose (`0x4d583f`). `ranks` is the catalog and the active player's race and class the rank
+/// reads its base by (`0x4d63a0`); without them the rule is skipped, as every rank reads Neutral
+/// before the player's rebuild names the slots (`0x4d54ee`).
 fn reputation_delta(
     standings: Vec<(u32, i32)>,
     reputations: &mut Reputations,
+    ranks: Option<(&benilla_formats::FactionCatalog, u8, u8)>,
     quest: &mut QuestGiver,
-) {
+) -> DeltaLatches {
     use benilla_formats::faction_flags as flag;
+    let rank = |reputations: &Reputations, slot: usize| {
+        ranks.map(|(catalog, race, class)| {
+            crate::ui_reputation::slot_rank(catalog, reputations, race, class, slot)
+        })
+    };
+    let mut latches = DeltaLatches::default();
     for (list_id, standing) in standings {
         let Some(i) = reputation_slot(list_id, "SMSG_SET_FACTION_STANDING") else {
             continue;
         };
-        if reputations.slots.len() <= i {
-            reputations.slots.resize(i + 1, (0, 0));
+        let old = rank(reputations, i);
+        reputations.set_standing(i, standing);
+        let mut flags = reputations.flags(i);
+        if flags & (flag::VISIBLE | flag::HIDDEN) == 0 {
+            flags |= flag::VISIBLE;
+            // The adder, which lists the slot (`0x4d5826`).
+            latches.listed.push(list_id);
         }
-        reputations.slots[i].1 = standing;
-        if reputations.slots[i].0 & flag::HIDDEN == 0 {
-            reputations.slots[i].0 |= flag::VISIBLE;
+        if let (Some(old), Some(new)) = (old, rank(reputations, i)) {
+            latches.rank_moved |= new != old;
+            if new < 2 {
+                flags |= flag::AT_WAR;
+            } else if new > old {
+                flags &= !flag::AT_WAR;
+            }
         }
+        latches.flags_moved |= flags != reputations.flags(i);
+        reputations.set_flags(i, flags);
     }
     // Standing feeds questgiver status (`SatisfyQuestReputation`); the reference re-asks here too.
     quest.bump_reask();
+    latches
 }
 
-/// `SMSG_SET_FACTION_VISIBLE`: sets `FACTION_FLAG_VISIBLE` on the slot and nothing else; it
-/// carries no standing, and the reputation pane lists a faction by this bit.
-fn reputation_visible(list_id: u32, reputations: &mut Reputations) {
+/// What a standing message's entries latched for after them.
+#[derive(Default)]
+struct DeltaLatches {
+    /// A slot's flag byte moved (`0x4d585d`-`0x4d5876`): the list re-sorts.
+    flags_moved: bool,
+    /// The slots the entries made visible, in their order, each handed to the adder (`0x4d5826`).
+    listed: Vec<u32>,
+    /// A slot's rank moved, `HIDDEN` or not (`0x4d5880`, `0x4d58a9`, `0x4d58ac`): the quest log and
+    /// the reaction refresh read it.
+    rank_moved: bool,
+}
+
+/// `SMSG_SET_FACTION_VISIBLE`: sets `FACTION_FLAG_VISIBLE` on a slot without it, which the pane
+/// lists by (`0x4d572e`-`0x4d5745`); it carries no standing. Whether the slot was newly listed.
+fn reputation_visible(list_id: u32, reputations: &mut Reputations) -> bool {
+    use benilla_formats::faction_flags::VISIBLE;
     let Some(i) = reputation_slot(list_id, "SMSG_SET_FACTION_VISIBLE") else {
+        return false;
+    };
+    let flags = reputations.flags(i);
+    reputations.set_flags(i, flags | VISIBLE);
+    flags & VISIBLE == 0
+}
+
+/// `SMSG_SET_FACTION_ATWAR` (`0x4d56b0`): bit `0x02` of the wire byte becomes the slot's at-war
+/// bit and the byte's other bits are read nowhere (`0x4d56d9`-`0x4d56e9`). It sorts nothing and
+/// refreshes no reaction; the pane's list signals `UPDATE_FACTION` when the bit moved a row.
+fn reputation_at_war(list_id: u32, wire: u8, reputations: &mut Reputations) {
+    use benilla_formats::faction_flags::AT_WAR;
+    let Some(i) = reputation_slot(list_id, "SMSG_SET_FACTION_ATWAR") else {
         return;
     };
-    if reputations.slots.len() <= i {
-        reputations.slots.resize(i + 1, (0, 0));
-    }
-    reputations.slots[i].0 |= benilla_formats::faction_flags::VISIBLE;
+    let flags = reputations.flags(i);
+    reputations.set_flags(
+        i,
+        if wire & AT_WAR != 0 {
+            flags | AT_WAR
+        } else {
+            flags & !AT_WAR
+        },
+    );
 }
 
 /// A wire `repListId` as a store index, or `None` (logged) past the `FACTION_LIST_LEN` array
@@ -831,6 +1039,8 @@ fn packet_dropped(opcode: u16, unparseable: bool, dropped: &mut DroppedOpcodes) 
     }
 }
 
+#[cfg(test)]
+mod clock_tests;
 #[cfg(test)]
 mod reputation_tests;
 
@@ -959,8 +1169,8 @@ mod forced_reaction_tests {
         arrive(&mut app, &[]);
         assert!(forced(&app).is_empty(), "an empty table clears it");
         assert_eq!(
-            app.world().resource::<Reputations>().slots,
-            [(0x20, 5)],
+            app.world().resource::<Reputations>().slot(0),
+            (0x20, 5),
             "the standings are not the table's"
         );
     }
@@ -981,5 +1191,147 @@ mod forced_reaction_tests {
             dispatch(app.world_mut(), vec![end.clone()]);
             assert!(forced(&app).is_empty(), "{end:?} left the table");
         }
+    }
+
+    /// The session's end is the teardown (`0x4d5360`), which zeroes all 64 slots
+    /// (`0x4d541f`-`0x4d542b`), so no standing or at-war bit outlives the character.
+    #[test]
+    fn the_session_end_zeroes_the_slots() {
+        for end in [
+            SessionEvent::LoggedOut,
+            SessionEvent::Disconnected {
+                reason: "gone".into(),
+                end: SessionEnd::LoggedOut,
+            },
+        ] {
+            let mut app = app();
+            dispatch(
+                app.world_mut(),
+                vec![SessionEvent::Reputations {
+                    standings: vec![(0x03, 5000); 64],
+                }],
+            );
+            dispatch(app.world_mut(), vec![end.clone()]);
+            let reps = app.world().resource::<Reputations>();
+            assert!(reps.slots().all(|s| s == (0, 0)), "{end:?} left a slot");
+        }
+    }
+}
+
+#[cfg(test)]
+mod worldport_tests {
+    use super::*;
+    use crate::net::handlers::dispatch;
+
+    const RIDDEN: u64 = 0xF120_0000_0000_0001;
+    const IN_VIEW: u64 = 0xF120_0000_0000_0002;
+
+    /// Two ships whose paths touch maps 1 and 0, one of them ridden, and a worldport to map 0,
+    /// announced with a transport or not: which ships outlive it.
+    fn kept_across(riding_transfer: bool) -> (bool, bool) {
+        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let world = app.world_mut();
+        let ship = |world: &mut World, guid: u64| {
+            let e = world
+                .spawn((
+                    crate::net::Guid(guid),
+                    crate::transport::Transport::sailing_for_test((1, 0)),
+                ))
+                .id();
+            world.resource_mut::<GuidIndex>().0.insert(guid, e);
+            e
+        };
+        let ridden = ship(world, RIDDEN);
+        let in_view = ship(world, IN_VIEW);
+        world.insert_resource(crate::player::Player::riding_for_test(ridden, RIDDEN));
+        world.resource_mut::<PendingTransfer>().0 = Some(crate::net::PendingTransferInfo {
+            map_id: 0,
+            transport_entry: riding_transfer.then_some(20808),
+            from_map: Some(1),
+        });
+        dispatch(
+            world,
+            vec![SessionEvent::Worldport {
+                map_id: 0,
+                position: [0.0; 3],
+                orientation: 0.0,
+                needs_ack: true,
+            }],
+        );
+        world.flush();
+        let alive = |world: &World, guid: u64, e: Entity| {
+            world.resource::<GuidIndex>().0.contains_key(&guid) && world.get_entity(e).is_ok()
+        };
+        (alive(world, RIDDEN, ridden), alive(world, IN_VIEW, in_view))
+    }
+
+    /// The ship kept across a worldport stands for the new object the reference builds from the
+    /// post-port create (`0x401bc0`), so that create sets its clock (`0x5f7080`) as a new one's.
+    #[test]
+    fn the_ship_kept_across_a_worldport_takes_its_next_create_as_new() {
+        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let world = app.world_mut();
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        let ridden = world
+            .spawn((
+                crate::net::Guid(RIDDEN),
+                crate::transport::Transport::sailing_for_test((1, 0)),
+                crate::transport::TransportAnchor {
+                    progress_ms: 5,
+                    at: old,
+                },
+            ))
+            .id();
+        world.resource_mut::<GuidIndex>().0.insert(RIDDEN, ridden);
+        world.insert_resource(crate::player::Player::riding_for_test(ridden, RIDDEN));
+        world.resource_mut::<PendingTransfer>().0 = Some(crate::net::PendingTransferInfo {
+            map_id: 0,
+            transport_entry: Some(20808),
+            from_map: Some(1),
+        });
+        dispatch(
+            world,
+            vec![SessionEvent::Worldport {
+                map_id: 0,
+                position: [0.0; 3],
+                orientation: 0.0,
+                needs_ack: true,
+            }],
+        );
+        world.flush();
+        let fresh = std::time::Instant::now();
+        let create = SessionEvent::ObjectCreate {
+            guid: RIDDEN,
+            kind: benilla_protocol::EntityKind::GameObject,
+            display_id: None,
+            position: [0.0; 3],
+            orientation: 0.0,
+            scale: 1.0,
+            speeds: None,
+            mover: None,
+            transport_progress: Some(benilla_protocol::TransportClock {
+                progress_ms: 777,
+                arrived: Some(fresh),
+            }),
+            transport: None,
+            spline: None,
+            fields: benilla_protocol::ObjectFields::from_pairs(&[(21, 15)])
+                .into_created(benilla_protocol::messages::ObjectType::GameObject),
+        };
+        dispatch(world, crate::net::wire(vec![create]));
+        world.flush();
+        let anchor = world
+            .get::<crate::transport::TransportAnchor>(ridden)
+            .expect("anchored");
+        assert_eq!((anchor.progress_ms, anchor.at), (777, fresh));
+    }
+
+    /// `0x401bc0` destroys every object at `SMSG_NEW_WORLD`; only the ship a transport transfer
+    /// carries us on is kept, until its create arrives. A ship merely in view goes with its
+    /// colliders, as does the ridden one on a transfer that does not ride it (a hearth).
+    #[test]
+    fn a_worldport_keeps_only_the_ship_we_ride_through_it() {
+        assert_eq!(kept_across(true), (true, false));
+        assert_eq!(kept_across(false), (false, false));
     }
 }

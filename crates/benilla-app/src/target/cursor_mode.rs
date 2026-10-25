@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use crate::net::{ObjectStore, Reputations, SelfPlayer};
+use crate::net::{ObjectStore, SelfPlayer};
 
 use super::ring::Factions;
 use super::{go_is_nearest, Hovered, HoveredObject};
@@ -127,7 +127,7 @@ pub(crate) mod npc_flags {
 }
 
 pub(super) const UNIT_FLAG_SKINNABLE: u32 = 0x0400_0000;
-const UNIT_FLAG_PACIFIED: u32 = 0x0002_0000;
+pub(crate) const UNIT_FLAG_PACIFIED: u32 = 0x0002_0000;
 
 /// The hovered unit is one the unit dispatcher `0x60bea0` forks to its attack arm for (`0x60c192`):
 /// alive or feigning, refused by `CanInteract` and passed by `CanAttack`. The sword also needs the
@@ -223,17 +223,30 @@ pub(super) fn go_interact_range_sq(type_id: i32) -> f32 {
     }
 }
 
-/// Why `usable 0x5f3130`'s player arms, ahead of its lock and range arms, refuse a GameObject.
-/// The cursor grays on any (`0x5f3093`, the Inspect and Mail cursors' `0x5f58a8`, `0x5f6858`),
-/// and the click raises [`PlayerRefusal::error_key`] (`0x5f874b`). Not built: the shapeshift
-/// (`0x5f31df`), combat (`0x5f3231`) and immune arms.
+/// Why `usable 0x5f3130`'s player arms, ahead of its lock and range arms, or the door's own slot
+/// ahead of them (`0x5f4360`), refuse a GameObject. The cursor grays on any (the type's slot 6 at
+/// `0x5f3093`, the Inspect and Mail cursors' `0x5f58a8`, `0x5f6858`), and the click raises
+/// [`PlayerRefusal::error_key`] (`0x5f874b`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlayerRefusal {
+    /// A door with autoClose resting opposite its start (`0x5f42f0`): error 0xe3.
+    Moving,
     /// Dead or a ghost (`IsDeadOrGhost 0x605f30` at `0x5f315f`), for every type: error 0x7e.
     Dead,
+    /// The player-control flag `[0xb4b3e4]` clear (`0x5f316e`): error 0x7f.
+    LockedOut,
     /// Mounted (`0x5f31a8`) at an object without a `Lock.dbc` row (`0x5f8180`, a pointer test, so
     /// an all-empty row counts) that is no MAILBOX (`0x5f31bb`): error 0x19f.
     Mounted,
+    /// Shapeshifted (`0x60e9f0` at `0x5f31e1`) into a form without flag `0x8` (`0x5f3210`), at an
+    /// object without a lock row: error 0x1a0.
+    Shapeshifted,
+    /// `UNIT_FLAG_IN_COMBAT` (`0x5f3237`) at an object whose notInCombat column is set
+    /// (`0x5f5970`): error 0x1a1.
+    InCombat,
+    /// `UNIT_FIELD_FLAGS` bit 31 (`0x5f3272`) at a chest or an object whose noDamageImmune column
+    /// is set (`0x5f59a0`): error 0x169.
+    Immune,
 }
 
 impl PlayerRefusal {
@@ -241,25 +254,87 @@ impl PlayerRefusal {
     /// GlobalStrings text, so `0x4945b0` drops it unshown.
     pub(super) fn error_key(self) -> Option<&'static str> {
         match self {
+            PlayerRefusal::Moving => Some("ERR_USE_OBJECT_MOVING"),
             PlayerRefusal::Dead => Some("ERR_PLAYER_DEAD"),
+            PlayerRefusal::LockedOut => Some("ERR_CLIENT_LOCKED_OUT"),
             PlayerRefusal::Mounted => None,
+            PlayerRefusal::Shapeshifted => Some("ERR_NOT_WHILE_SHAPESHIFTED"),
+            PlayerRefusal::InCombat => Some("ERR_NOT_IN_COMBAT"),
+            PlayerRefusal::Immune => Some("ERR_USE_CANT_IMMUNE"),
         }
     }
 }
 
-/// [`PlayerRefusal`] for our player at an object of `go_type`, `has_lock_row` its `Lock.dbc` row.
-pub(super) fn go_player_refusal(
-    me: &ObjectStore,
-    has_lock_row: bool,
-    go_type: i32,
-) -> Option<PlayerRefusal> {
-    if me.0.is_dead_or_ghost() {
-        Some(PlayerRefusal::Dead)
-    } else if me.0.unit_mount_display_id() != 0 && !has_lock_row && go_type != GO_TYPE_MAILBOX {
-        Some(PlayerRefusal::Mounted)
-    } else {
-        None
+/// `UNIT_FLAG_IN_COMBAT` (`[unit+0xa0]` bit 19, `0x5f323d`).
+const UNIT_FLAG_IN_COMBAT: u32 = 0x8_0000;
+/// `[unit+0xa0]` bit 31 (`0x5f3278`), which `0x5f3130` reads as immune.
+const UNIT_FLAG_IMMUNE: u32 = 0x8000_0000;
+/// `GAMEOBJECT_TYPE_DOOR` (0), whose handler (vtable `0x80b2a0`) puts `0x5f4360` in slot 6.
+const GO_TYPE_DOOR: i32 = 0;
+/// `GAMEOBJECT_TYPE_CHEST` (3), which `0x5f59a0` refuses while immune whatever its columns.
+const GO_TYPE_CHEST: i32 = 3;
+
+/// What `usable`'s player arms and the door's slot read: our player and the object.
+pub(super) struct GoUse<'a> {
+    pub(super) me: &'a ObjectStore,
+    /// `[0xb4b3e4]` clear ([`crate::player::OwnControlLost`]).
+    pub(super) control_lost: bool,
+    /// `SpellShapeshiftForm.dbc`'s rows, for the form's flag `0x8`.
+    pub(super) forms: Option<&'a std::collections::HashMap<u32, benilla_formats::ShapeshiftForm>>,
+    pub(super) go: &'a ObjectStore,
+    pub(super) anim: Option<&'a crate::go_anim::GoAnim>,
+    /// The template, for the columns; `None` in flight, which `0x5f8150` reads as 0.
+    pub(super) template: Option<&'a crate::go_templates::GoTemplate>,
+    /// The object's `Lock.dbc` row exists (`0x5f8180`).
+    pub(super) has_lock_row: bool,
+}
+
+/// [`PlayerRefusal`] for our player at an object, in the reference's order.
+pub(super) fn go_player_refusal(u: &GoUse) -> Option<PlayerRefusal> {
+    use crate::go_templates::GoColumn;
+    let column = |id| u.template.map_or(0, |t| t.column(&u.go.0, id));
+    let go_type = u.go.0.gameobject_type_id();
+    // The door's slot 6 runs ahead of `0x5f3130` (`0x5f4366`): with autoClose, a door that
+    // starts open refuses at substate 1, one that starts closed at substate 3.
+    if go_type == GO_TYPE_DOOR && column(GoColumn::AutoClose) != 0 {
+        let blocked = if column(GoColumn::StartOpen) != 0 {
+            crate::go_anim::ANIM_CLOSED
+        } else {
+            crate::go_anim::ANIM_OPENED
+        };
+        if crate::go_anim::substate_anim(u.anim, u.go) == Some(blocked) {
+            return Some(PlayerRefusal::Moving);
+        }
     }
+    let me = &u.me.0;
+    if me.is_dead_or_ghost() {
+        return Some(PlayerRefusal::Dead);
+    }
+    if u.control_lost {
+        return Some(PlayerRefusal::LockedOut);
+    }
+    // A lock row skips the mount and form arms (`0x5f319c`).
+    if !u.has_lock_row {
+        if me.unit_mount_display_id() != 0 && go_type != GO_TYPE_MAILBOX {
+            return Some(PlayerRefusal::Mounted);
+        }
+        let barred = u.forms.is_some_and(|forms| {
+            crate::ui_session::form_bars_interaction(forms, me.unit_shapeshift_form())
+        });
+        if barred {
+            return Some(PlayerRefusal::Shapeshifted);
+        }
+    }
+    let flags = me.unit_flags();
+    if flags & UNIT_FLAG_IN_COMBAT != 0 && column(GoColumn::NotInCombat) != 0 {
+        return Some(PlayerRefusal::InCombat);
+    }
+    if flags & UNIT_FLAG_IMMUNE != 0
+        && (go_type == GO_TYPE_CHEST || column(GoColumn::NoDamageImmune) != 0)
+    {
+        return Some(PlayerRefusal::Immune);
+    }
+    None
 }
 
 /// `GameObjectFlags` IN_USE (`0x1`) and NO_INTERACT (`0x10`), which `0x5f2f80` rejects together.
@@ -540,6 +615,9 @@ struct CorpseFacts {
     skin_latch: bool,
     /// `d2`, centre to centre.
     dist_sq: f32,
+    /// Any loot target held (`[player+0x1d28/2c]` nonzero), which `CanLootNow` refuses
+    /// (`0x5ec1f6`).
+    loot_held: bool,
     /// The already-looting override: `[player+0x1d28/2c] == corpse GUID`.
     looting_this: bool,
     /// `CanAutoInteract`, which `CanLootNow` asks first and then skips its range (`0x5ec11b`).
@@ -550,10 +628,13 @@ struct CorpseFacts {
 }
 
 fn corpse_cursor(f: CorpseFacts) -> Option<(CursorKind, bool)> {
-    // Leg 1, lootable: able within `CanLootNow 0x5ec110`'s reach or while this corpse's loot
-    // window is open; Pickup or LootAll by key 0 (`0x41f8f0` at `0x4827f8`), grayed at `0x482818`.
+    // Leg 1, lootable: able where `CanLootNow 0x5ec110` allows (`0x4827d7`), its reach and no loot
+    // target held, or while this corpse's loot window is open (`0x4827e3`); Pickup or LootAll by
+    // key 0 (`0x41f8f0` at `0x4827f8`), grayed at `0x482818`.
     if f.lootable {
-        let able = f.can_auto_interact || f.dist_sq <= CORPSE_INTERACT_RANGE_SQ || f.looting_this;
+        let can_loot_now =
+            !f.loot_held && (f.can_auto_interact || f.dist_sq <= CORPSE_INTERACT_RANGE_SQ);
+        let able = can_loot_now || f.looting_this;
         return Some((loot_cursor(f.auto_loot, f.shift_held), !able));
     }
     // Leg 2, the PvP insignia (`0x482875..0x4828a2`), inert in 1.12.1 as no player holds a
@@ -583,10 +664,10 @@ pub(super) fn classify_cursor(
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub(super) struct CursorInputs<'w, 's> {
-    factions: Option<Res<'w, Factions>>,
-    reputations: Res<'w, Reputations>,
-    // `own_control_lost` is the attack leg's `[0xb4b3e4]` clear.
+    relations: super::RelationWorld<'w, 's>,
     player: Res<'w, crate::player::Player>,
+    // The attack leg's `[0xb4b3e4]` clear.
+    own_control: Res<'w, crate::player::OwnControlLost>,
     approach: Res<'w, crate::player::Approach>,
     #[allow(clippy::type_complexity)]
     units: Query<
@@ -612,16 +693,17 @@ pub(super) struct CursorInputs<'w, 's> {
     stone: Option<Res<'w, crate::ui_dialog_verbs::MeetingStone>>,
 }
 
-/// The cursor and the attack fork over a pick; no pick, or nothing resolvable, reads Point.
+/// The cursor and the attack fork over a pick; no pick, or nothing resolvable, reads Point, the
+/// classifier's clear (`0x523d30`), which [`crate::cursor`] shows as the base mode.
 pub(super) fn classify(
     inputs: &CursorInputs,
     hovered: &Hovered,
     hovered_object: &HoveredObject,
 ) -> (WorldCursor, AttackFork) {
     let CursorInputs {
-        factions,
-        reputations,
+        relations,
         player,
+        own_control,
         approach,
         units,
         self_q,
@@ -645,7 +727,7 @@ pub(super) fn classify(
         let store = store?;
         let (self_tf, self_store) = self_q.single().ok()?;
         let reaction = go_reaction(
-            factions.as_deref(),
+            relations.factions(),
             store.0.gameobject_faction(),
             Some(self_store),
         );
@@ -676,7 +758,16 @@ pub(super) fn classify(
                 .locks
                 .as_deref()
                 .is_some_and(|l| l.0.slots(lock_id).is_some());
-        let refused = go_player_refusal(self_store, has_lock_row, go_type).is_some();
+        let refused = go_player_refusal(&GoUse {
+            me: self_store,
+            control_lost: own_control.0,
+            forms: go_inputs.spells.as_deref().map(|s| &s.forms),
+            go: store,
+            anim,
+            template: tmpl,
+            has_lock_row,
+        })
+        .is_some();
         // `usable 0x5f3130`'s player arms, lock arm (`0x5f32a6`), then range arm (`0x5f330c`).
         // The lock arm needs `GO_FLAG_LOCKED`, so an herb the player cannot gather stays lit and
         // refuses on the click, while a padlocked door grays.
@@ -688,7 +779,7 @@ pub(super) fn classify(
             .is_some_and(|slots| {
                 super::lock::resolve_lock(
                     slots,
-                    &player_actions.spells,
+                    &player_actions.openers,
                     go_inputs.spells.as_deref(),
                     go_inputs.skill_lines.as_ref().map(|s| &s.catalog),
                     Some(self_store),
@@ -716,12 +807,15 @@ pub(super) fn classify(
         let dead = store.0.unit_is_dead();
         if dead {
             if store.0.unit_lootable() {
-                // Grayed by `CanLootNow 0x5ec110`'s melee reach; the reference's mid-loot state
-                // block and open-loot-window override are not applied to units.
+                // Lit where `CanLootNow 0x5ec110` allows (`0x4824fe`), its melee reach and no loot
+                // target held, or over the unit being looted (`0x48250a`).
                 let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+                let held = loot_latch.0;
+                let can_loot_now = held.is_none() && (can_auto_interact || in_melee);
+                let looting_this = held.is_some() && held == hovered.guid;
                 return Some((
                     loot_cursor(loot_cfg.auto_loot, shift),
-                    !(can_auto_interact || in_melee),
+                    !(can_loot_now || looting_this),
                 ));
             }
             // Skin also needs the learn latch `[0xb700e4 + 4×isPlayerTarget]` (`0x482589`): a
@@ -732,14 +826,11 @@ pub(super) fn classify(
             return None; // a plain corpse: Point
         }
 
+        let rel = relations.get();
+        let (me, unit) = (relations.me()?, relations.unit_of(hovered.guid?, store));
         // `CanInteract 0x6067f0`, asked at `0x482310` through `CanInteractNow 0x606880`, picks
         // the ladder; it is not a reaction threshold.
-        if super::can_interact(
-            Some(store),
-            factions.as_deref(),
-            reputations,
-            Some(self_store),
-        ) {
+        if rel.can_interact(&me, &unit) {
             let status = hovered.guid.and_then(|g| quest.status(g));
             // No matching bit clears the cursor (`je 0x4826cb`) without reaching the attack leg:
             // Point, never the sword.
@@ -748,16 +839,11 @@ pub(super) fn classify(
         }
         // `CanAttack 0x606980` (`0x482680`), the predicate TAB, the combat flash and
         // `UnitCanAttack` share; not attackable clears the cursor (`0x4826cb`): Point.
-        if !super::can_attack(
-            Some(store),
-            factions.as_deref(),
-            reputations,
-            Some(self_store),
-        ) {
+        if !rel.can_attack(&me, &unit) {
             return None;
         }
         attack_fork.set(true);
-        player_attack_legs(self_store, player.own_control_lost)
+        player_attack_legs(self_store, own_control.0)
             .then_some((CursorKind::Attack, dist_sq > ATTACK_RANGE_SQ))
     };
     // The corpse classifier `0x482740`.
@@ -771,6 +857,7 @@ pub(super) fn classify(
             insignia: store.0.corpse_pvp_insignia(),
             skin_latch: learned.skin_player_corpse.is_some(),
             dist_sq: corpse_tf.translation.distance_squared(self_tf.translation),
+            loot_held: loot_latch.0.is_some(),
             looting_this: loot_latch.0.is_some() && loot_latch.0 == hovered.corpse_guid,
             can_auto_interact,
             auto_loot: loot_cfg.auto_loot,

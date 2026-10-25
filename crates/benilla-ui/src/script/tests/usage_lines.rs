@@ -504,6 +504,7 @@ fn is_frame_type_raises_is_object_type_line() {
 #[test]
 fn set_shadow_offset_raises_its_usage_line_on_a_font_and_a_simplehtml() {
     let s = script();
+    crate::test_support::install_law43(&s);
     s.run(r#"ShadowFont = CreateFont("ShadowFont"); ShadowHTML = CreateFrame("SimpleHTML", "ShadowHTML")"#)
         .unwrap();
     for (call, line) in [
@@ -526,10 +527,29 @@ fn set_shadow_offset_raises_its_usage_line_on_a_font_and_a_simplehtml() {
     s.run(
         r#"
         ShadowFont:SetShadowOffset("2", -1); local x, y = ShadowFont:GetShadowOffset()
-        assert(x == 2 and y == -1)
+        assert(x == law(2) and y == law(-1))
         ShadowHTML:SetShadowOffset("H2", 3, "-4"); x, y = ShadowHTML:GetShadowOffset("H2")
-        assert(x == 3 and y == -4)
+        assert(x == law(3) and y == law(-4))
     "#,
     )
     .unwrap();
+}
+
+/// `SortGuildRoster` tests argument 1 with `lua_isstring` (`0x4d1cb8`), so a number is its
+/// string, and anything else raises `Usgae: SortGuildRoster("type")` (`0x849bf0`, `0x4d1cc7`),
+/// the binary's spelling, with no call made.
+#[test]
+fn sort_guild_roster_raises_its_own_usage_line() {
+    let mut s = UiScript::new().unwrap();
+    s.keep_calls();
+    for call in ["SortGuildRoster()", "SortGuildRoster({})"] {
+        let e = err(&s, call);
+        assert!(
+            e.contains(r#"Usgae: SortGuildRoster("type")"#),
+            "{call}: {e}"
+        );
+    }
+    assert!(s.take_guild_calls().is_empty());
+    s.run("SortGuildRoster(5)").unwrap();
+    assert_eq!(s.take_guild_calls(), [GuildCall::Sort("5".into())]);
 }

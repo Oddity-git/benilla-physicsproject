@@ -8,6 +8,7 @@ use super::test_ui::load_ui as load_xml;
 /// A 1024-wide screen, so the 1024-wide bar spans x 0..1024 and its offsets are screen coordinates.
 fn harness(extra: &[&str]) -> UiScript {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for f in crate::ui_script::test_ui::production_order(&[
         &[
@@ -180,7 +181,7 @@ fn poll_beat(s: &mut UiScript) {
     s.tick(11.0);
 }
 
-/// The app pushes the averaged RTT; both bandwidth returns stay 0, as benilla counts no throughput.
+/// The app pushes the averaged RTT as the third return; the two rates stay 0 until it pushes them.
 #[test]
 fn get_net_stats_reports_the_pushed_latency() {
     benilla_formats::wow_data_or_skip!();

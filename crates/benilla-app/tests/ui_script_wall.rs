@@ -3,8 +3,9 @@
 //! values.
 //!
 //! A file counts if it contains the identifier `UiScript` anywhere (a type, a `use`, a doc
-//! comment). `CEILING` is the standing count of gameplay files and `SLACK` how far under it the
-//! count may sit, as in `world_api_wall.rs`. `WOW_UISCRIPT_DUMP=1` prints the files.
+//! comment), or `HostedVm`, the system param that is the VM with its call host. `CEILING` is the
+//! standing count of gameplay files and `SLACK` how far under it the count may sit, as in
+//! `world_api_wall.rs`. `WOW_UISCRIPT_DUMP=1` prints the files.
 //!
 //! Window feeds (`ui_*`), `capture/` probes, `devtools/` instruments and test modules are reported;
 //! only gameplay files, the ones that can reach zero, are gated.
@@ -38,8 +39,11 @@ fn family(rel: &str) -> Family {
     }
 }
 
-/// The standing count of `Game` files; raise it only with the reason written down.
-const CEILING: usize = 40;
+/// The standing count of `Game` files; raise it only with the reason written down. 41: the call
+/// host's window close cores (`script_calls/windows.rs`), the host's own code, which drives the VM
+/// at each core's signal point. 42: the host's engine appliers (`script_calls/engine.rs`), which
+/// show a refused follow's line in the calling VM and post its events at their signal points.
+const CEILING: usize = 42;
 
 /// How far under [`CEILING`] the count may sit before the test asks for the ceiling to follow it.
 const SLACK: usize = 4;
@@ -59,7 +63,8 @@ fn the_vm_is_named_by_no_more_files_than_the_ceiling_says() {
                 return None;
             }
             let text = std::fs::read_to_string(&p).ok()?;
-            names_ident(&text, "UiScript").then(|| (family(&rel), rel))
+            (names_ident(&text, "UiScript") || names_ident(&text, "HostedVm"))
+                .then(|| (family(&rel), rel))
         })
         .collect();
     files.sort();

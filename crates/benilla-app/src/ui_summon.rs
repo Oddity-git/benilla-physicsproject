@@ -17,17 +17,17 @@
 //! nothing, so no stale or zero guid reaches the server. The reference never clears the guid or
 //! zone, only the deadline (`0x49014a`), so its `ConfirmSummon()` sends whatever is left.
 
-use benilla_ui::script::{SummonConfirmUiState, UiScript};
+use benilla_ui::script::SummonConfirmUiState;
 use bevy::prelude::*;
 
 use crate::area::AreaTableRes;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands};
 use crate::query_cache::Ask;
-use crate::ui_script::{UiFeed, UiInput};
+use crate::ui_script::UiFeed;
 
 /// The latched question, the reference's four globals: written by [`net::request`], read by
-/// [`feed_summon`] and [`drain_summon`].
+/// [`feed_summon`] and [`SummonSteps`].
 #[derive(Resource, Default)]
 pub(crate) struct SummonState {
     /// `[0xb4e358]`/`[0xb4e35c]`, echoed by Accept; 0 when nothing has asked this session.
@@ -43,14 +43,14 @@ pub(crate) struct SummonState {
 
 impl SummonState {
     /// The latch, `0x4963a0`.
-    fn latch(&mut self, summoner: u64, zone: u32, delay_ms: u32, now: f64) {
+    pub(crate) fn latch(&mut self, summoner: u64, zone: u32, delay_ms: u32, now: f64) {
         self.summoner = summoner;
         self.zone = zone;
         self.expires_at = Some(now + f64::from(delay_ms) / 1000.0);
         self.ask = true;
     }
 
-    fn pending(&self) -> Option<u64> {
+    pub(crate) fn pending(&self) -> Option<u64> {
         (self.summoner != 0).then_some(self.summoner)
     }
 
@@ -65,64 +65,56 @@ impl SummonState {
 /// Push the three getters' answers every frame, and fire `CONFIRM_SUMMON` (no arguments) for an
 /// owed question.
 fn feed_summon(
-    script: Option<NonSendMut<UiScript>>,
-    mut summon: ResMut<SummonState>,
+    // The latch, which the Accept reads inside its call: an engine turn, its events signalled
+    // after.
+    mut vm: crate::script_calls::VmWith<ResMut<'static, SummonState>>,
     names: Res<NameCache>,
-    commands: Res<NetCommands>,
     areas: Option<Res<AreaTableRes>>,
     // Real: the deadline was stamped on this clock.
     time: Res<Time<Real>>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
+    vm.turn(|script, mut summon| {
+        let Some(script) = script else {
+            return;
+        };
 
-    // The getters' defaults already answer a zeroed bank. Not `pending()`: a zero-guid request
-    // still latches and fires in the reference, and must not leave `ask` owed.
-    if summon.summoner == 0 && !summon.ask {
-        return;
-    }
+        // The getters' defaults already answer a zeroed bank. Not `pending()`: a zero-guid request
+        // still latches and fires in the reference, and must not leave `ask` owed.
+        if summon.summoner == 0 && !summon.ask {
+            return;
+        }
 
-    // The getter's calls are its lookups with the callback `0x48b710` (`0x48b6e1`): the popup's
-    // `OnUpdate` makes one a frame (`StaticPopup.lua:1746`), so a miss is asked while it shows and
-    // a refused name again, once per answer. The push itself only reads; a zero guid names nobody
-    // and is never asked about.
-    let looked_up = script.take_summon_summoner_lookups() > 0;
-    let summoner_name = match summon.pending() {
-        Some(guid) => names
-            .resolve_player(
-                guid,
-                if looked_up {
-                    Ask::Event(&commands)
-                } else {
-                    Ask::Read
-                },
-            )
-            .unwrap_or_default()
-            .to_string(),
-        None => String::new(),
-    };
-    script.set_summon_confirm(SummonConfirmUiState {
-        summoner: summoner_name,
-        area: area_name(summon.zone, areas.as_deref()),
-        time_left_ms: summon.time_left_ms(time.elapsed_secs_f64()),
-    });
+        // The push only reads: the getter's calls are its lookups with the callback `0x48b710`,
+        // which ask a miss inside the call (`0x48b6e1`, [`benilla_ui::script::RecordAsk::Summoner`]).
+        let summoner_name = match summon.pending() {
+            Some(guid) => names
+                .resolve_player(guid, Ask::Read)
+                .unwrap_or_default()
+                .to_string(),
+            None => String::new(),
+        };
+        script.set_summon_confirm(SummonConfirmUiState {
+            summoner: summoner_name,
+            area: area_name(summon.zone, areas.as_deref()),
+            time_left_ms: summon.time_left_ms(time.elapsed_secs_f64()),
+        });
 
-    if !summon.ask {
-        return;
-    }
-    summon.ask = false;
-    // The `summon` trace's middle link, between the packet and the response.
-    if benilla_assets::trace::enabled_for("summon") {
-        benilla_assets::trace::line(
-            "summon",
-            &format!(
-                "fire CONFIRM_SUMMON summoner={:#x} zone={}",
-                summon.summoner, summon.zone
-            ),
-        );
-    }
-    script.fire_event("CONFIRM_SUMMON", Vec::new());
+        if !summon.ask {
+            return;
+        }
+        summon.ask = false;
+        // The `summon` trace's middle link, between the packet and the response.
+        if benilla_assets::trace::enabled_for("summon") {
+            benilla_assets::trace::line(
+                "summon",
+                &format!(
+                    "fire CONFIRM_SUMMON summoner={:#x} zone={}",
+                    summon.summoner, summon.zone
+                ),
+            );
+        }
+        script.fire_event("CONFIRM_SUMMON", Vec::new());
+    })
 }
 
 /// `GetSummonConfirmAreaName()` (`0x48b720`): the summoner's bare `AreaTable.dbc` row name or
@@ -134,31 +126,28 @@ fn area_name(zone: u32, areas: Option<&AreaTableRes>) -> String {
         .to_string()
 }
 
-/// Turn each Accept into `CMSG_SUMMON_RESPONSE`, gated on a latched summoner, never the deadline.
-fn drain_summon(
-    script: Option<NonSendMut<UiScript>>,
-    summon: Res<SummonState>,
-    commands: Res<NetCommands>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let confirms = script.take_summon_confirms();
-    if confirms == 0 {
-        return;
-    }
-    let Some(summoner) = summon.pending() else {
-        debug!("ui_summon: ConfirmSummon() with nothing latched — nothing to answer with");
-        return;
-    };
-    if benilla_assets::trace::enabled_for("summon") {
-        benilla_assets::trace::line(
-            "summon",
-            &format!("SEND CMSG_SUMMON_RESPONSE summoner={summoner:#x} n={confirms}"),
-        );
-    }
-    for _ in 0..confirms {
-        let _ = commands.0.send(ClientCommand::SummonResponse { summoner });
+/// `ConfirmSummon()` inside its call ([`benilla_ui::script::SummonCall`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SummonSteps<'w> {
+    summon: Option<Res<'w, SummonState>>,
+    net: Res<'w, NetCommands>,
+}
+
+impl SummonSteps<'_> {
+    /// `0x48b770`: `CMSG_SUMMON_RESPONSE` with the latched summoner (`0x48b7d0`), the deadline
+    /// unread; with nothing latched, nothing (the module's deviation).
+    pub(crate) fn confirm(&self) {
+        let Some(summoner) = self.summon.as_deref().and_then(SummonState::pending) else {
+            debug!("ui_summon: ConfirmSummon() with nothing latched — nothing to answer with");
+            return;
+        };
+        if benilla_assets::trace::enabled_for("summon") {
+            benilla_assets::trace::line(
+                "summon",
+                &format!("SEND CMSG_SUMMON_RESPONSE summoner={summoner:#x}"),
+            );
+        }
+        let _ = self.net.0.send(ClientCommand::SummonResponse { summoner });
     }
 }
 
@@ -257,9 +246,11 @@ impl Plugin for UiSummonPlugin {
             Update,
             (
                 // Before the feed, so the frame a session ends feeds nothing from it.
-                end_session_summon.before(feed_summon),
+                // Before the pass: `ConfirmSummon`'s call reads the latch.
+                end_session_summon
+                    .before(feed_summon)
+                    .before(crate::vm_pass::VmPass::Start),
                 feed_summon.in_set(UiFeed),
-                drain_summon.after(UiInput),
             ),
         );
     }
@@ -268,12 +259,13 @@ impl Plugin for UiSummonPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::UiScript;
 
-    /// The getter's calls are the lookups (`0x48b6e1`, callback `0x48b710`), which the popup's
-    /// `OnUpdate` makes every frame: the packet and the frames without a call ask nothing, a call
-    /// asks once while the answer is pending, and the call after a refusal asks again.
+    /// The push only reads the summoner's name: the packet and the frames ask nothing, the
+    /// getter's own lookup asking a miss inside its call (`0x48b6e1`,
+    /// [`benilla_ui::script::RecordAsk::Summoner`]).
     #[test]
-    fn the_summoner_is_asked_by_each_getter_call_once_per_answer() {
+    fn the_push_reads_the_summoner_and_asks_nothing() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.insert_resource(NetCommands(tx))
@@ -282,43 +274,15 @@ mod tests {
             .init_resource::<Time<Real>>()
             .add_systems(Update, feed_summon);
         app.insert_non_send_resource(UiScript::new().unwrap());
-        let call = |app: &mut App| {
-            app.world_mut()
-                .non_send_resource_mut::<UiScript>()
-                .run("GetSummonConfirmSummoner()")
-                .unwrap();
-            app.update();
-        };
         app.world_mut()
             .resource_mut::<SummonState>()
             .latch(0x2a, 1519, 120_000, 0.0);
-        app.update();
-        assert!(
-            crate::query_cache::queries(&rx).is_empty(),
-            "the packet only reads"
-        );
-        call(&mut app);
-        assert_eq!(crate::query_cache::queries(&rx).len(), 1, "a call asks");
-        call(&mut app);
-        assert!(
-            crate::query_cache::queries(&rx).is_empty(),
-            "once while the answer is pending"
-        );
-        app.world_mut()
-            .resource_mut::<NameCache>()
-            .insert_player(0x2a, String::new(), None);
-        for _ in 0..600 {
+        for _ in 0..3 {
             app.update();
         }
         assert!(
             crate::query_cache::queries(&rx).is_empty(),
-            "no frame without a call asks"
-        );
-        call(&mut app);
-        assert_eq!(
-            crate::query_cache::queries(&rx).len(),
-            1,
-            "the call after the refusal asks again"
+            "the packet and the frames only read"
         );
     }
 

@@ -4,6 +4,7 @@
 //! Lookup runs CheckButton's table, then Button's, then the frame table, the client's class chain,
 //! so `SetChecked` is nil on a plain Button and `GetText` on a plain Frame.
 
+use crate::layout::Len;
 use mlua::{Lua, MultiValue, ObjectLike, Table, Value};
 
 use super::font::FontId;
@@ -726,8 +727,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     "Usage: {who}:SetFontString(fontstring)"
                 )));
             };
-            // Two checks in the reference's order, a widget at all (`0x780b27`), then a FontString
-            // (`0x780b90`), so a Frame or a Texture gets the second message.
+            // Two checks in the reference's order, an object at all (`0x780b27`), then a FontString
+            // (`0x780b90`), so a Frame, a Texture or a Font object gets the second message.
             let rh = {
                 let not_an_object = || {
                     mlua::Error::runtime(format!(
@@ -736,9 +737,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 };
                 let id = super::object::decode_id(&fs).map_err(|_| not_an_object())?;
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                let known_widget =
-                    model.id_to_frame.contains_key(&id) || model.id_to_region.contains_key(&id);
-                if !known_widget {
+                let known_object = model.id_to_frame.contains_key(&id)
+                    || model.id_to_region.contains_key(&id)
+                    || model.fonts.of_handle(id).is_some();
+                if !known_object {
                     return Err(not_an_object());
                 }
                 match model.id_to_region.get(&id).copied() {
@@ -775,21 +777,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // GetTextWidth/GetTextHeight (`0x782290`/`0x782390`) forward to the label's extents (vtable
-    // `0x1c`/`0x20`). The width is the natural, unwrapped one: the laid-out width would feed a
-    // size-to-text caller (`MoneyFrame.lua:202`) its own output. 0 before measurement and with no
-    // label, where the reference dereferences `+0x338` and what it does on null is untraced.
-    for (name, region_getter) in [
-        ("GetTextWidth", "GetStringWidth"),
-        // 1.12 has no `GetStringHeight`; `0x782390` reads the label's height.
-        ("GetTextHeight", "GetHeight"),
-    ] {
+    // GetTextWidth/GetTextHeight (`0x782290`/`0x782390`) read the label's size slot (`+0x338`,
+    // layout vtable `0x1c`/`0x20`, `0x772930`/`0x772a60`), store it as a float and answer `G` of it
+    // (`0x782348`..`0x782366`): the label's `GetWidth`/`GetHeight` exactly, whose width is the
+    // authored one or the unwrapped text's, floored at one unit, so a size-to-text caller
+    // (`MoneyFrame.lua:202`) never reads its own output. 0 with no label (`0x78244d`).
+    for (name, region_getter) in [("GetTextWidth", "GetWidth"), ("GetTextHeight", "GetHeight")] {
         m.set(
             name,
             lua.create_function(move |lua, this: Table| {
                 let label = get_slot_texture(lua, &this, Slot::Text)?;
                 match label {
-                    Value::Table(t) => t.call_method::<f32>(region_getter, ()),
+                    Value::Table(t) => t.call_method::<f64>(region_getter, ()),
                     _ => Ok(0.0),
                 }
             })?,
@@ -868,7 +867,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 for id in [f.normal, f.disabled, f.highlight] {
                     super::font::set(&mut model, id, super::FontMask::FONT, |fo| {
                         fo.font = Some(path.clone());
-                        fo.height = Some(height);
+                        fo.height = Some(Len::Script(height));
                         fo.outline = flags;
                         fo.monochrome = monochrome;
                     });
@@ -883,9 +882,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetFont",
         lua.create_function(|lua, this: Table| {
             let (_, f) = fonts_of(lua, &this)?;
-            let block = {
+            let (block, u) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.fonts.get(f.normal).block.clone()
+                (
+                    model.fonts.get(f.normal).block.clone(),
+                    model.layout_units(),
+                )
             };
             let path = match block.font {
                 Some(p) => Value::String(lua.create_string(&p)?),
@@ -893,7 +895,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             };
             Ok((
                 path,
-                block.height.unwrap_or(0.0),
+                // The shared getter (`0x780a41` → `0x79f3b0`): `G` of the height (`0x79f3e3`).
+                block.height.map_or(0.0, |h| h.get(u)),
                 block.outline.flags_text(block.monochrome),
             ))
         })?,
@@ -928,12 +931,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     "SetPushedTextOffset(x, y)",
                 ));
             };
-            let units = lua
-                .app_data_ref::<Model>()
-                .expect("model app_data")
-                .layout_units();
             with_button(lua, &this, |bs| {
-                bs.pushed_text_offset = [units.store(x as f32), units.store(y as f32)];
+                bs.pushed_text_offset = [Len::Script(x as f32), Len::Script(y as f32)];
             })
         })?,
     )?;
@@ -947,7 +946,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 .app_data_ref::<Model>()
                 .expect("model app_data")
                 .layout_units();
-            Ok((units.load(x), units.load(y)))
+            Ok((x.get(units), y.get(units)))
         })?,
     )?;
 
@@ -1210,13 +1209,15 @@ pub(super) fn click_button(lua: &Lua, id: u32, button: &str, down: bool, scripte
     if !down {
         super::nameplate::note_click(lua, id, button);
     }
-    // The take runs whatever the handler did (`0x4c1867`): a row whose `OnClick` errored still
-    // loots.
+    // The take runs whatever the handler did (`0x4c1867`), inside the click: a row whose `OnClick`
+    // errored still loots, and the click's next listener reads what the take did.
     if let Some(slot) = take_loot {
-        // The slot is 0-based; the take queue speaks the 1-based row.
-        lua.app_data_mut::<Model>()
-            .expect("model app_data")
-            .loot_picks
-            .push(slot + 1);
+        // The slot is 0-based; the call speaks the 1-based row.
+        let take = super::ScriptCall::Loot(super::loot::LootCall::Take(slot + 1));
+        if let Err(e) = super::calls::submit(lua, take) {
+            lua.app_data_mut::<Model>()
+                .expect("model app_data")
+                .record_lua_error(&e);
+        }
     }
 }

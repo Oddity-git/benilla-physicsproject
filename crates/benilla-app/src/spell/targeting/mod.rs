@@ -29,8 +29,9 @@
 //! Cancels: ESC through `UIParent.lua:1490` ([`feed_targeting_to_vm`], [`ScriptCursor::stop_targeting`]),
 //! the right-button down edge ([`cancel_targeting_on_right_press`]), a new spell's press, which
 //! aborts and proceeds (`TryCast 0x6e4b60` at `0x6e4d62`), and the bar's re-press of the same
-//! spell (`UseAction 0x4e5ee0`). A cancel clears the word and sends nothing; movement never
-//! cancels (`0x515090`).
+//! spell (`UseAction 0x4e5ee0`). Each is `StopTargeting 0x6e4900`, the cancel with its failed flag
+//! ([`crate::spell::CastCore::stop_targeting`]): the word clears, nothing is sent, and the record's
+//! caster fires `SPELLCAST_FAILED`. Movement never cancels (`0x515090`).
 
 mod corpse;
 mod cursor;
@@ -42,8 +43,10 @@ mod world;
 pub(crate) use corpse::fixture as corpse_fixture;
 pub(crate) use corpse::{corpse_pick_admits, publish_corpse_pick, CorpsePick};
 pub(crate) use cursor::{drive_targeting_cursor, ground_cast_radius};
-pub(crate) use item::{commit_item_cast_on_pick, EnchantConfirmItem};
-pub(crate) use pick::{publish_unit_pick, PickChecks, UnitPick};
+pub(crate) use item::EnchantConfirmItem;
+pub(crate) use pick::{
+    publish_go_pick, publish_unit_pick, spell_opens_go, GoPick, GoPickChecks, PickChecks, UnitPick,
+};
 pub(crate) use world::{commit_ground_cast_on_click, commit_object_cast_on_click};
 
 use bevy::prelude::*;
@@ -81,6 +84,8 @@ pub(crate) struct BindChecks<'w, 's> {
     /// The caster, a unit and the caster's auto-attack target (`[caster+0xc48]`, which
     /// `GetMinMaxRange` looks up) as the range compare reads them.
     range_units: super::RangeUnits<'w, 's>,
+    /// The item cache the range's ranged-slot scale reads ([`super::with_ranged_slot`]).
+    items: Option<Res<'w, crate::items::Items>>,
 }
 
 impl BindChecks<'_, '_> {
@@ -94,21 +99,41 @@ impl BindChecks<'_, '_> {
             .is_some_and(|store| store.0.unit_charmed_by().is_some())
     }
 
-    fn is_self(&self, entity: Entity) -> bool {
-        self.self_q
-            .iter()
-            .next()
-            .is_some_and(|(me, _)| me == entity)
+    /// The record's caster (`0xceac50`, resolved at `0x6e5b89`), which `BindTarget`'s relations
+    /// and its range test read: the pet bar's unit for a cast it handed the attempt, else the
+    /// active player. `None` while that caster is not streamed.
+    fn caster(
+        &self,
+        commit: super::cast_send::CastCommit,
+    ) -> Option<(Entity, Option<&crate::net::ObjectStore>)> {
+        match commit.unit_caster() {
+            Some(guid) => {
+                let entity = *self.index.as_deref()?.0.get(&guid)?;
+                Some((entity, self.stores.get(entity).ok()))
+            }
+            None => self.self_q.iter().next(),
+        }
+    }
+
+    fn is_caster(&self, entity: Entity, commit: super::cast_send::CastCommit) -> bool {
+        self.caster(commit)
+            .is_some_and(|(caster, _)| caster == entity)
     }
 
     /// `BindTarget 0x6e5b40`'s unit branch: whether this unit binds the word under this spell,
-    /// its gates and then its relation checks ([`super::cast_target::unit_binds`]). An unknown
-    /// spell has no row to gate on.
-    fn unit_binds(&self, spell_id: u32, word: u16, entity: Entity) -> bool {
+    /// its gates and then its relation checks ([`super::cast_target::unit_binds`]) from the
+    /// cast's caster. An unknown spell has no row to gate on.
+    fn unit_binds(
+        &self,
+        spell_id: u32,
+        commit: super::cast_send::CastCommit,
+        word: u16,
+        entity: Entity,
+    ) -> bool {
         let target_store = self.stores.get(entity).ok();
         let owner_store =
             |store| super::cast_target::owner_store(store, self.index.as_deref(), &self.stores);
-        let me = self.self_q.iter().next();
+        let me = self.caster(commit);
         let self_store = me.and_then(|(_, store)| store);
         let rel = super::cast_target::TargetRelations {
             target_store,
@@ -131,14 +156,19 @@ impl BindChecks<'_, '_> {
             },
         };
         let def = self.spells.as_deref().and_then(|s| s.catalog.get(spell_id));
-        super::cast_target::unit_binds(def, word, self.is_self(entity), &rel)
+        super::cast_target::unit_binds(def, word, self.is_caster(entity, commit), &rel)
     }
 
-    /// The spell's min/max range against this unit, through the one compare the pre-send gate
-    /// asks ([`super::cast_target::RangeInputs::refusal`]); our own body is distance 0. An
-    /// unknown spell or a missing row passes.
-    fn range_refusal(&self, spell_id: u32, entity: Entity) -> Option<u8> {
-        let mut range = self.range_inputs(entity);
+    /// The spell's min/max range from the cast's caster against this unit, through the one
+    /// compare the pre-send gate asks ([`super::cast_target::RangeInputs::refusal`]); the caster's
+    /// own body is distance 0. An unknown spell or a missing row passes.
+    fn range_refusal(
+        &self,
+        spell_id: u32,
+        commit: super::cast_send::CastCommit,
+        entity: Entity,
+    ) -> Option<u8> {
+        let mut range = self.range_inputs(commit, entity);
         range.target = self.range_units.unit(entity);
         self.refusal(spell_id, range)
     }
@@ -147,16 +177,32 @@ impl BindChecks<'_, '_> {
     /// unit's (`6e35fe`), but with no unit to read the second reach from it reads the caster's
     /// again (`6e3605`–`6e361e`). On the ranged arm, which the corpse spells use, no unit means no
     /// moving bonus; a melee row would fall back to the auto-attack target (`0x6e3580`).
-    fn corpse_range_refusal(&self, spell_id: u32, entity: Entity) -> Option<u8> {
-        let mut range = self.range_inputs(entity);
+    fn corpse_range_refusal(
+        &self,
+        spell_id: u32,
+        commit: super::cast_send::CastCommit,
+        entity: Entity,
+    ) -> Option<u8> {
+        let mut range = self.range_inputs(commit, entity);
         range.target = Some(benilla_formats::RangeUnit::still(range.caster.reach));
         self.refusal(spell_id, range)
     }
 
-    /// Our position, reach and motion and the candidate's position, each position the pose the
-    /// hover picks against.
-    fn range_inputs(&self, entity: Entity) -> super::cast_target::RangeInputs {
-        let me = self.self_q.iter().next();
+    /// The caster's position, reach and motion and the candidate's position, each position the
+    /// pose the hover picks against.
+    fn range_inputs(
+        &self,
+        commit: super::cast_send::CastCommit,
+        entity: Entity,
+    ) -> super::cast_target::RangeInputs {
+        let me = self.caster(commit);
+        let caster = match (commit.unit_caster(), me) {
+            (Some(_), Some((unit, _))) => self
+                .range_units
+                .unit(unit)
+                .unwrap_or(benilla_formats::RangeUnit::still(super::DEFAULT_REACH)),
+            _ => self.player_caster(self.range_units.caster()),
+        };
         super::cast_target::RangeInputs {
             self_pos: me
                 .and_then(|(e, _)| self.poses.get(e).ok())
@@ -166,9 +212,26 @@ impl BindChecks<'_, '_> {
                 .get(entity)
                 .ok()
                 .map(GlobalTransform::translation),
-            caster: self.range_units.caster(),
+            caster,
             target: None,
         }
+    }
+
+    /// The active player as `GetMinMaxRange` reads it, its ranged-slot item included.
+    pub(super) fn player_caster(
+        &self,
+        unit: benilla_formats::RangeUnit,
+    ) -> benilla_formats::RangeUnit {
+        let me = self.self_q.iter().next().and_then(|(_, store)| store);
+        super::with_ranged_slot(
+            unit,
+            me.map(|s| &s.0),
+            |g| {
+                let e = *self.index.as_deref()?.0.get(&g)?;
+                self.stores.get(e).ok().map(|s| &s.0)
+            },
+            self.items.as_deref(),
+        )
     }
 
     fn refusal(&self, spell_id: u32, range: super::cast_target::RangeInputs) -> Option<u8> {
@@ -178,12 +241,16 @@ impl BindChecks<'_, '_> {
     }
 
     /// What the corpse legs read of this corpse: `CORPSE_FLAG_BONES` and the reaction gate
-    /// `0x6067d0`. A corpse whose store has not streamed binds nothing.
-    fn corpse_facts(&self, entity: Entity) -> Option<corpse::CorpseFacts> {
+    /// `0x6067d0`, from the cast's caster. A corpse whose store has not streamed binds nothing.
+    fn corpse_facts(
+        &self,
+        commit: super::cast_send::CastCommit,
+        entity: Entity,
+    ) -> Option<corpse::CorpseFacts> {
         Some(corpse::CorpseFacts::of(
             self.stores.get(entity).ok()?,
             self.factions.as_deref(),
-            self.self_q.iter().next().and_then(|(_, s)| s),
+            self.caster(commit).and_then(|(_, s)| s),
         ))
     }
 }
@@ -193,7 +260,7 @@ impl BindChecks<'_, '_> {
 /// - `Location`: `TargetingWantsLocation 0x6e6320`, `word & 0x60`, the terrain click.
 /// - `Item`: `TargetingWantsItem 0x6e6330`, `word & 0x4010`, the bag and paper-doll clicks.
 /// - `GameObject`: `TargetingWantsGameObject 0x6e62d0`, `word & 0x4800`, the world object click.
-/// - `Unit`: `SpellCanTargetUnit 0x6e6460`, the unit arm of the world click.
+/// - `Unit`: `SpellCanTargetObject 0x6e6460`, the unit arm of the world click.
 /// - `Corpse`: `0x6e6230`, `word & 0x8600`, the pick's corpse flag `0x40` ([`corpse`]).
 ///
 /// The masks overlap on `TARGET_FLAG_LOCKED`, so a lock spell answers both the item and the
@@ -208,8 +275,8 @@ pub(crate) enum TargetingWants {
     Corpse,
 }
 
-/// The unit-shaped bits of the flag_word, the first gate `SpellCanTargetUnit` tests before it runs
-/// the candidate through the unit arm's relation and liveness checks.
+/// The unit-shaped bits of the flag_word, the first gate `SpellCanTargetObject 0x6e6460` tests
+/// before it runs the candidate through the unit arm's relation and liveness checks.
 const UNIT_WORD_BITS: u16 = 0x0002 | 0x0004 | 0x0008 | 0x0080 | 0x0100 | 0x0200 | 0x0400 | 0x8000;
 
 impl TargetingWants {
@@ -255,7 +322,7 @@ impl CursorPicks {
 /// The targeting mode, `Some` while the flag_word is nonzero. Entered by the cast-send path
 /// ([`super::cast_target::CastWireTarget::Targeting`]), cleared by a commit or a cancel.
 #[derive(Resource, Default)]
-pub(crate) struct SpellTargeting(Option<Targeting>, u32);
+pub(crate) struct SpellTargeting(Option<Targeting>);
 
 struct Targeting {
     spell_id: u32,
@@ -264,12 +331,29 @@ struct Targeting {
     commit: super::cast_send::CastCommit,
     /// The standing flag_word `0xcecac0`; more than one seam can answer yes to it.
     word: u16,
+    /// The spell holds the in-flight slot `0xceca88`: its attempt pushed it (`0x6e5026`), which
+    /// it does for no item or one with `ITEM_FLAG_PLAYERCAST` (`0x6e500b`-`0x6e501f`).
+    in_slot: bool,
 }
 
 impl SpellTargeting {
     /// `IsTargeting 0x6e48a0`.
     pub(crate) fn active(&self) -> bool {
         self.0.is_some()
+    }
+
+    /// The cursor's spell when it holds the in-flight slot ([`super::inflight::Inflight`]).
+    pub(crate) fn in_slot(&self) -> Option<u32> {
+        self.0.as_ref().filter(|t| t.in_slot).map(|t| t.spell_id)
+    }
+
+    /// The guid of the item whose cast holds the in-flight slot from the cursor (`0xcecab0`): the
+    /// attempt pushed it with its spell (`0x6e5026`).
+    pub(crate) fn in_slot_item(&self) -> Option<u64> {
+        self.0
+            .as_ref()
+            .filter(|t| t.in_slot)
+            .and_then(|t| t.commit.item_guid())
     }
 
     /// `GetTargetingSpellId 0x6e48e0`, whatever the word wants: for the bar's checked state, the
@@ -283,15 +367,15 @@ impl SpellTargeting {
         self.0.as_ref().is_some_and(|t| wants.matches(t.word))
     }
 
-    /// `SpellCanTargetUnit`'s predicate `0x6e6460`, its unit leg, with the range flag both callers
-    /// pass (the world hover `0x4828d0` at `48290b`, the Lua `SpellCanTargetUnit 0x6e6d00`):
+    /// `SpellCanTargetObject 0x6e6460`, its unit leg, with the range flag both callers pass (the
+    /// world hover `0x4828d0` at `48290b`, the Lua `SpellCanTargetUnit 0x6e6d00`):
     /// `BindTarget`'s gates and relation checks (`6e6507`–`6e65ab`), then min² ≤ d² ≤ max²
     /// (`6e677c`–`6e6802`), so a unit inside the minimum is out too. There is no line-of-sight
     /// test.
     pub(crate) fn can_target_unit(&self, entity: Entity, checks: &BindChecks) -> bool {
         self.0.as_ref().is_some_and(|t| {
-            checks.unit_binds(t.spell_id, t.word, entity)
-                && checks.range_refusal(t.spell_id, entity).is_none()
+            checks.unit_binds(t.spell_id, t.commit, t.word, entity)
+                && checks.range_refusal(t.spell_id, t.commit, entity).is_none()
         })
     }
 
@@ -312,6 +396,11 @@ impl SpellTargeting {
         self.0.as_ref().map(|t| (t.spell_id, t.commit, t.word))
     }
 
+    /// The standing word and whether its spell holds the slot.
+    fn word_in_slot(&self) -> Option<(u16, bool)> {
+        self.0.as_ref().map(|t| (t.word, t.in_slot))
+    }
+
     /// The pending spell when the standing word answers `wants`. A surface that draws or binds for
     /// one seam reads this, never [`Self::spell`], or an armed lockpick gets an AoE reticle.
     pub(crate) fn spell_for(&self, wants: TargetingWants) -> Option<u32> {
@@ -321,12 +410,39 @@ impl SpellTargeting {
             .map(|t| t.spell_id)
     }
 
+    /// The cursor up for a spell its attempt pushed.
+    #[cfg(test)]
     pub(crate) fn enter(&mut self, spell_id: u32, commit: super::cast_send::CastCommit, word: u16) {
+        self.enter_as(spell_id, commit, word, true);
+    }
+
+    /// The cursor up, holding the in-flight slot or not (`in_slot`).
+    pub(crate) fn enter_as(
+        &mut self,
+        spell_id: u32,
+        commit: super::cast_send::CastCommit,
+        word: u16,
+        in_slot: bool,
+    ) {
         self.0 = Some(Targeting {
             spell_id,
             commit,
             word,
+            in_slot,
         });
+    }
+
+    /// The pop of the cursor's spell (`0x6e4b2c`); the word stays as it stands.
+    pub(super) fn leave_slot(&mut self) {
+        if let Some(t) = &mut self.0 {
+            t.in_slot = false;
+        }
+    }
+
+    /// The standing cast and its commit while its word wants an item, which `BindTarget
+    /// 0x6e5b40` binds a passed item to.
+    pub(crate) fn wanting_item(&self) -> Option<(u32, super::cast_send::CastCommit)> {
+        self.pending_for(TargetingWants::Item)
     }
 
     /// The pending cast when the standing word answers `wants`, so no commit fires on a word its
@@ -336,6 +452,21 @@ impl SpellTargeting {
             .as_ref()
             .filter(|t| wants.matches(t.word))
             .map(|t| (t.spell_id, t.commit))
+    }
+
+    /// `BindLocation 0x6e60f0` at `point` (WoW space): the pending cast, its commit and the bind,
+    /// when the word wants a location; `None` binds nothing. The terrain click's and the minimap
+    /// click's.
+    pub(crate) fn location_commit(
+        &self,
+        point: [f32; 3],
+    ) -> Option<(
+        u32,
+        super::cast_send::CastCommit,
+        super::cast_send::TargetedBind,
+    )> {
+        let (spell_id, commit) = self.pending_for(TargetingWants::Location)?;
+        Some((spell_id, commit, self.location_bind(point)?))
     }
 
     /// `BindLocation 0x6e60f0`'s fork: SOURCE (`0x20`) is tested before DEST (`0x40`). The
@@ -352,22 +483,9 @@ impl SpellTargeting {
         }
     }
 
+    /// The word cleared, by a commit or a cancel ([`crate::spell::CastCore::cancel`]).
     pub(crate) fn clear(&mut self) {
         self.0 = None;
-    }
-
-    /// A cancel, not a commit: `StopTargeting 0x6e4900`, or `TryCast`'s supersede (`0x6e4d62`),
-    /// both the cast abort with its disarm flag (`0x6e4940(cl=1)`), counted for the tradeskill
-    /// repeat's disarm ([`Self::aborts`]). Nothing up, nothing aborts (`0x6e4907`).
-    pub(crate) fn cancel(&mut self) {
-        if self.0.take().is_some() {
-            self.1 = self.1.wrapping_add(1);
-        }
-    }
-
-    /// The cancels so far, wrapping: only a change is read.
-    pub(crate) fn aborts(&self) -> u32 {
-        self.1
     }
 }
 
@@ -379,9 +497,9 @@ impl SpellTargeting {
 pub(crate) fn cancel_targeting_on_right_press(
     mut presses: MessageReader<WorldRightPress>,
     payload_held: Res<crate::ui_script::CursorPayloadHeld>,
-    mut targeting: ResMut<SpellTargeting>,
+    mut cursor: crate::spell::CursorCancel,
 ) {
-    if !targeting.active() {
+    if !cursor.active() {
         // A press buffered while idle must not replay as a cancel once the mode turns on.
         presses.clear();
         return;
@@ -390,7 +508,7 @@ pub(crate) fn cancel_targeting_on_right_press(
         return;
     }
     debug!("ui_action: targeting cancelled (right-click)");
-    targeting.cancel();
+    cursor.stop_targeting();
 }
 
 /// [`SpellTargeting::picks_self`] as the frame began, which the world pick reads
@@ -412,40 +530,49 @@ pub(crate) fn publish_picks_self(
 }
 
 /// Push the targeting state into the VM each frame, before the input pass, so a word armed last
-/// frame stands for this frame's clicks: the ESC chain's word, the bag and doll pickup reroute's
-/// item half, and `CURRENT_SPELL_CAST_CHANGED` on each edge. That event hides the enchant confirm
-/// popups (`UIParent.lua:449`); its one emitter `0x4b3250` is called from the cast arm, abort and
-/// bind sites, `StopTargeting 0x6e4900` among them. It fires on the spell changing, so a cancel
-/// and re-arm in one frame still counts.
+/// frame stands for this frame's clicks: the ESC chain's word and the bag and doll pickup
+/// reroute's item half. A script call pushes the same view inside the call
+/// ([`ScriptCursor::push_view`]). The word's changes signal `CURRENT_SPELL_CAST_CHANGED` where they
+/// are made ([`crate::ui_cast::CastReport::Changed`]).
 pub(crate) fn feed_targeting_to_vm(
-    targeting: Res<SpellTargeting>,
-    checks: BindChecks,
-    tokens: crate::ui_unit::UnitTokens,
-    mut last: Local<crate::ui_script::VmMemo<Option<u32>>>,
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    mut vm: crate::script_calls::VmWith<(
+        Res<'static, SpellTargeting>,
+        crate::ui_unit::UnitTokens<'static, 'static>,
+        BindChecks<'static, 'static>,
+    )>,
 ) {
-    if let Some(mut script) = script {
-        let last = last.get(&script);
-        script.set_spell_targeting(targeting.active());
-        script.set_item_pick_armed(targeting.wants(TargetingWants::Item));
-        // `SpellCanTargetUnit(unit)`: the VM resolves the token to a guid (`0x6e6d3a`), and
-        // `0x6e6460`'s unit leg answers for that guid. The units to ask are the held ones the
-        // resolver's inputs list, the `target` chains' included.
-        let targetable: Vec<u64> = script
-            .held_unit_guids()
-            .into_iter()
-            .filter(|&guid| {
-                tokens
-                    .held(guid)
-                    .is_some_and(|(entity, _)| targeting.can_target_unit(entity, &checks))
-            })
-            .collect();
-        script.set_spell_targetable_units(targetable);
-        if *last != targeting.spell() {
-            *last = targeting.spell();
-            script.fire_event("CURRENT_SPELL_CAST_CHANGED", vec![]);
+    vm.turn(|script, (targeting, tokens, checks)| {
+        if let Some(script) = script {
+            push_targeting_view(script, &targeting, &checks, &tokens);
         }
-    }
+    })
+}
+
+/// Push what the VM reads of the targeting word: `SpellIsTargeting`, the pickup reroute's item
+/// half and `SpellCanTargetUnit`'s units.
+fn push_targeting_view(
+    script: &mut benilla_ui::script::UiScript,
+    targeting: &SpellTargeting,
+    checks: &BindChecks,
+    tokens: &crate::ui_unit::UnitTokens,
+) {
+    script.set_spell_targeting(targeting.active());
+    script.set_item_pick_armed(targeting.wants(TargetingWants::Item));
+    // `SpellTargetWantsLocation` (`0x6e6320`), which `Minimap:PingLocation` asks (`0x4eee74`).
+    script.set_location_pick_armed(targeting.wants(TargetingWants::Location));
+    // `SpellCanTargetUnit(unit)`: the VM resolves the token to a guid (`0x6e6d3a`), and
+    // `0x6e6460`'s unit leg answers for that guid. The units to ask are the held ones the
+    // resolver's inputs list, the `target` chains' included.
+    let targetable: Vec<u64> = script
+        .held_unit_guids()
+        .into_iter()
+        .filter(|&guid| {
+            tokens
+                .held(guid)
+                .is_some_and(|(entity, _)| targeting.can_target_unit(entity, checks))
+        })
+        .collect();
+    script.set_spell_targetable_units(targetable);
 }
 
 /// `BindTarget 0x6e5b40`'s unit arm, for the world click (`0x493540` at `4935d5`) and
@@ -460,10 +587,10 @@ fn bind_target_unit(
     let Some((spell_id, commit, word)) = ladder.ground.pending() else {
         return;
     };
-    if !checks.unit_binds(spell_id, word, entity) {
+    if !checks.unit_binds(spell_id, commit, word, entity) {
         return;
     }
-    let range = checks.range_refusal(spell_id, entity);
+    let range = checks.range_refusal(spell_id, commit, entity);
     merge(
         ladder,
         spell_id,
@@ -474,13 +601,18 @@ fn bind_target_unit(
 }
 
 /// `BindTarget`'s merge (`6e602c`–`6e60d7`): a bind whose mask is in `0x8202`, a unit or a corpse,
-/// runs the range test `0x6e47b0` (`6e6063`). Out of range raises "Out of range." or "Target too
-/// close" and binds nothing; otherwise the emptied word commits (`SendCast 0x6e54f0`).
+/// runs the range test `0x6e47b0` (`6e6063`). Out of range is reported (`0x6e6089`, "Out of
+/// range." or "Target too close") and binds nothing; otherwise the emptied word commits (`SendCast
+/// 0x6e54f0`).
 ///
-/// Deviation: a range failure leaves targeting armed and working. The reference's report
-/// (`0x6e6089`) also cancels the cast (`0x6e2218` → `0x6e4940`), clearing its caster, and then
-/// restores the pre-click word, so every later click fails the caster test (`0x6e5b93`) and the
-/// cursor is stranded until a cancel; that is a defect, and staying armed is what a player can use.
+/// Deviation: a range failure leaves targeting armed and working. The reference's report cancels
+/// the cast (`0x6e2218` → `0x6e4940`): its line, `SPELLCAST_FAILED` and the tradeskill disarm,
+/// which benilla keeps; with the word the bind emptied it also sends `CMSG_CANCEL_CAST` for the
+/// unsent spell (`0x6e4970`) and clears the caster, then restores the pre-click word (`0x6e6096`),
+/// so every later click fails the caster test (`0x6e5b93`) and the cursor is stranded until a
+/// cancel. That is a defect: benilla's cancel finds the cursor up, so it drops the word, with its
+/// signal (`0x6e495c`), instead of sending, and the cursor is re-armed as its attempt left it,
+/// its caster and its hold on the slot included, which is what a player can use.
 fn merge(
     ladder: &mut crate::spell::CastLadder,
     spell_id: u32,
@@ -490,7 +622,11 @@ fn merge(
 ) {
     if let Some(reason) = range {
         debug!("ui_action: cast {spell_id} not bound at {bound:x?} — range ({reason:#x})");
-        ladder.cast_errors.push_local(spell_id, reason);
+        let word = ladder.ground.word_in_slot();
+        ladder.report_local(crate::ui_action::CastFail::local(spell_id, reason));
+        if let Some((word, in_slot)) = word {
+            ladder.core().rearm_cursor(spell_id, commit, word, in_slot);
+        }
         return;
     }
     debug!("ui_action: cast {spell_id} committed at {bound:x?}");
@@ -505,13 +641,23 @@ pub(crate) struct ScriptCursor<'w, 's> {
     checks: BindChecks<'w, 's>,
     ladder: crate::spell::CastLadder<'w, 's>,
     picks: ResMut<'w, CursorPicks>,
+    /// The item a confirm popup stands over, and the enchant rows the item gate reads.
+    parked: ResMut<'w, EnchantConfirmItem>,
+    enchants: Option<Res<'w, crate::items::Enchants>>,
 }
 
 impl ScriptCursor<'_, '_> {
+    /// Push the targeting view into the VM after a script call, inside the call, as the reference's
+    /// `SpellIsTargeting` (`0x6e6cd0`) reads the word the call left.
+    pub(crate) fn push_view(&self, script: &mut benilla_ui::script::UiScript) {
+        push_targeting_view(script, &self.ladder.ground, &self.checks, &self.tokens);
+    }
+
     /// `SpellTargetUnit(unit)` (`0x6e6d90`). The binding already raised the usage and
     /// unknown-token errors and dropped a call made while not targeting. Here a token that names
-    /// no unit raises "Out of range." (0x59) and ends targeting, as the reference's abort clears
-    /// the word, and a unit goes to [`bind_target_unit`].
+    /// no unit is reported as "Out of range." (0x59) for the record's spell (`0x6e6e12`-
+    /// `0x6e6e20`), whose tail cancels the cursor's spell in flight, and a unit goes to
+    /// [`bind_target_unit`].
     pub(crate) fn spell_target_unit(&mut self, token: &str) {
         // An earlier call may have bound or ended the cast: not targeting, no-op.
         let Some(spell_id) = self.ladder.ground.spell() else {
@@ -521,10 +667,10 @@ impl ScriptCursor<'_, '_> {
             Some((entity, guid)) => bind_target_unit(&mut self.ladder, &self.checks, entity, guid),
             None => {
                 debug!("ui_action: SpellTargetUnit({token}) names no unit — cast {spell_id} ends");
-                self.ladder
-                    .cast_errors
-                    .push_local(spell_id, super::validator::ERR_OUT_OF_RANGE);
-                self.ladder.ground.clear();
+                self.ladder.report_local(crate::ui_action::CastFail::local(
+                    spell_id,
+                    super::validator::ERR_OUT_OF_RANGE,
+                ));
             }
         }
     }
@@ -535,11 +681,68 @@ impl ScriptCursor<'_, '_> {
         self.picks.bind_all(&mut self.ladder, &self.checks);
     }
 
-    /// The ESC chain's `SpellStopTargeting()` (`0x6e6e30`): `StopTargeting 0x6e4900`, word
-    /// cleared, no packet.
+    /// `Minimap:PingLocation`'s ground cast (`0x4eef05`): the ground point `at` (WoW space) bound
+    /// as the waiting spell's location and sent ([`SpellTargeting::location_commit`]).
+    pub(crate) fn bind_location(&mut self, at: [f32; 3]) {
+        let Some((spell_id, commit, bound)) = self.ladder.ground.location_commit(at) else {
+            return;
+        };
+        debug!(
+            "ui_action: minimap ground cast {spell_id} at wow ({:.2}, {:.2}, {:.2}) as {bound:?}",
+            at[0], at[1], at[2]
+        );
+        self.ladder.commit_targeted(spell_id, commit, bound);
+    }
+
+    /// The ESC chain's `SpellStopTargeting()` (`0x6e6e30`): `StopTargeting 0x6e4900`.
     pub(crate) fn stop_targeting(&mut self) {
         debug!("ui_action: targeting cancelled (ESC chain)");
-        self.ladder.ground.cancel();
+        self.ladder.stop_targeting();
+    }
+
+    /// A bag or paper-doll click while targeting wants an item ([`item::pick_item`]); the confirm
+    /// popup it raised, if any.
+    pub(crate) fn pick_item(
+        &mut self,
+        pick: benilla_ui::script::ItemPick,
+    ) -> Option<item::ConfirmPopup> {
+        item::pick_item(
+            &mut self.ladder,
+            self.enchants.as_deref(),
+            &mut self.parked,
+            pick,
+        )
+    }
+
+    /// `ClickTargetTradeButton(7)` (`check`) or `ReplaceTradeEnchant()` on the partner's slot 7
+    /// ([`item::trade_enchant`]).
+    pub(crate) fn trade_enchant(
+        &mut self,
+        script: &mut benilla_ui::script::UiScript,
+        partner_enchant: Option<u32>,
+        check: bool,
+    ) {
+        item::trade_enchant(
+            &mut self.ladder,
+            self.enchants.as_deref(),
+            script,
+            partner_enchant,
+            check,
+        );
+    }
+
+    /// `BindEnchant()` or `ReplaceEnchant()` ([`item::confirm_enchant`]); the popup a bind's
+    /// rerun raised, if any.
+    pub(crate) fn confirm_enchant(
+        &mut self,
+        answer: benilla_ui::script::EnchantAnswer,
+    ) -> Option<item::ConfirmPopup> {
+        item::confirm_enchant(
+            &mut self.ladder,
+            self.enchants.as_deref(),
+            &mut self.parked,
+            answer,
+        )
     }
 }
 
@@ -573,11 +776,15 @@ mod tests {
         world.init_resource::<crate::spell::QueuedMeleeSpell>();
         world.init_resource::<crate::spell::Cooldowns>();
         world.init_resource::<crate::spell::SpellModifiers>();
-        world.init_resource::<crate::ui_action::CastErrors>();
+        world.init_resource::<crate::ui_cast::CastReports>();
         world.init_resource::<crate::spell::AutoRepeatActive>();
+        world.init_resource::<crate::creature_anim::AttackStopInFlight>();
+        world.init_resource::<crate::creature_anim::UnitEdits>();
+        world.init_resource::<bevy::ecs::message::Messages<crate::player::StandStateRequest>>();
         world.init_resource::<crate::ui_tradeskill::TradeSkillOpens>();
         world.init_resource::<SpellTargeting>();
         world.init_resource::<CursorPicks>();
+        world.init_resource::<EnchantConfirmItem>();
         world.init_resource::<crate::spell::HeldForPick>();
         world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
         world.init_resource::<crate::ui_party::GroupState>();
@@ -606,7 +813,9 @@ mod tests {
         world.insert_resource(spells);
         // `UNIT_FIELD_HEALTH` 100: a store with no health reads dead to `BindTarget`'s gates.
         let live = || ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[(22, 100)]));
-        world.spawn((SelfPlayer, Guid(ME), GlobalTransform::default(), live()));
+        let me = world
+            .spawn((SelfPlayer, Guid(ME), GlobalTransform::default(), live()))
+            .id();
         let ally = world
             .spawn((
                 Guid(ALLY),
@@ -614,12 +823,17 @@ mod tests {
                 live(),
             ))
             .id();
+        // The object manager's index, which every token resolves its guid through.
+        let index = &mut world.resource_mut::<crate::net::GuidIndex>().0;
+        index.insert(ME, me);
+        index.insert(ALLY, ally);
         world.insert_resource(crate::target::Selection {
             target: Some(ally),
             guid: Some(ALLY),
             ..Default::default()
         });
         let mut script = UiScript::new().expect("a VM");
+        script.keep_calls();
         script.set_spell_targeting(true);
         world.insert_non_send_resource(script);
         (world, rx, ally)
@@ -678,7 +892,9 @@ mod tests {
     }
 
     fn errors(world: &mut World) -> Vec<crate::ui_action::CastFail> {
-        std::mem::take(&mut world.resource_mut::<crate::ui_action::CastErrors>().0)
+        world
+            .resource_mut::<crate::ui_cast::CastReports>()
+            .take_refusals()
     }
 
     /// `0x6e6d90` past the binding's checks: a token naming no unit ends the cast with "Out of
@@ -770,11 +986,14 @@ mod tests {
                 .query_filtered::<Entity, With<SelfPlayer>>()
                 .single(world)
                 .unwrap();
-            world.entity_mut(me).insert(unit(0x19, ALLY));
+            // Our `UNIT_FIELD_SUMMON` names the pet, the `"pet"` the resolver takes (`0x515a6e`).
+            let mut mine = unit(0x19, ALLY);
+            mine.0.merge(benilla_protocol::ObjectFields::from_pairs(&[
+                (8, PET as u32),
+                (9, (PET >> 32) as u32),
+            ]));
+            world.entity_mut(me).insert(mine);
             let pet = world.spawn((Guid(PET), unit(0x09, ALLY))).id();
-            let mut bar = crate::ui_pet::PetBar::default();
-            bar.spells.pet_guid = PET;
-            world.insert_resource(bar);
             let mut index = world.resource_mut::<crate::net::GuidIndex>();
             index.0.insert(ME, me);
             index.0.insert(ALLY, ally);
@@ -950,6 +1169,7 @@ mod tests {
                         pet_family: 0,
                         rank: 0,
                         type_flags: 0,
+                        pet_spell_list: 0,
                         civilian: false,
                         racial_leader: false,
                         display_id: 0,
@@ -1117,8 +1337,12 @@ mod tests {
                 Some(&def),
                 &CastCandidates {
                     selection: Some(guid),
+                    selection_held: true,
                     caster: Some(ME),
+                    auto_self: Some(ME),
+                    auto_self_store: Some(&store),
                     main_hand_item: None,
+                    long_range: false,
                 },
                 false,
                 &TargetRelations {
@@ -1240,11 +1464,22 @@ mod tests {
                 false,
                 false,
             ),
+            // Friendly by `UnitReaction`'s party rung (`0x6062b0`), which reads the party slots
+            // alone: a party member of the other faction binds both words, a raid member neither.
             (
                 "a party member of the other faction",
                 gf::player(2),
                 None,
                 (ALLY, Party),
+                false,
+                true,
+                true,
+            ),
+            (
+                "a raid member of the other faction",
+                gf::player(2),
+                None,
+                (ALLY, Raid),
                 false,
                 false,
                 false,
@@ -1303,6 +1538,7 @@ mod tests {
                         Party => group.members = vec![member(0)],
                         Raid => {
                             group.group_type = crate::ui_party::GROUPTYPE_RAID;
+                            group.own_raid_row = Some(ME);
                             group.members = vec![member(1)];
                         }
                     }
@@ -1353,8 +1589,12 @@ mod tests {
                             Some(&def),
                             &CastCandidates {
                                 selection: Some(guid),
+                                selection_held: true,
                                 caster: Some(ME),
+                                auto_self: Some(ME),
+                                auto_self_store: None,
                                 main_hand_item: None,
+                                long_range: false,
                             },
                             false,
                             &targeting.context().rel,

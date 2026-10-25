@@ -56,13 +56,15 @@ const TARGET_FLAG_CORPSE_ALLY: u16 = 0x8000;
 
 /// A decoded `SpellCastTargets` in the server's write order (`SpellCastTargetsInfo.cpp:180-234`),
 /// not its read order: any mix of UNIT, GAMEOBJECT and CORPSE_* bits yields one packed guid.
-/// Item, corpse, source and string targets are read and dropped.
+/// Item, corpse and string targets are read and dropped.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpellCastTargets {
     pub mask: u16,
     pub unit_target: Option<u64>,
     /// The `TARGET_FLAG_GAMEOBJECT` target, such as the chest an open-lock cast opens.
     pub go_target: Option<u64>,
+    /// The `TARGET_FLAG_SOURCE_LOCATION` point, read ahead of the dest (`0x7e4f22`).
+    pub source: Option<Vector3d>,
     pub dest: Option<Vector3d>,
 }
 
@@ -88,9 +90,11 @@ fn read_spell_cast_targets(r: &mut impl Read) -> io::Result<SpellCastTargets> {
     if mask & (TARGET_FLAG_ITEM | TARGET_FLAG_TRADE_ITEM) != 0 {
         let _item_guid = read_packed_guid(r)?;
     }
-    if mask & TARGET_FLAG_SOURCE_LOCATION != 0 {
-        let _src = Vector3d::read(r)?;
-    }
+    let source = if mask & TARGET_FLAG_SOURCE_LOCATION != 0 {
+        Some(Vector3d::read(r)?)
+    } else {
+        None
+    };
     let dest = if mask & TARGET_FLAG_DEST_LOCATION != 0 {
         Some(Vector3d::read(r)?)
     } else {
@@ -103,6 +107,7 @@ fn read_spell_cast_targets(r: &mut impl Read) -> io::Result<SpellCastTargets> {
         mask,
         unit_target,
         go_target,
+        source,
         dest,
     })
 }
@@ -170,10 +175,19 @@ pub struct SpellGo {
     pub spell_id: u32,
     pub cast_flags: u16,
     pub hits: Vec<u64>,
-    /// `(guid, SpellMissInfo)`; a reflect's trailing outcome byte is dropped.
-    pub misses: Vec<(u64, u8)>,
+    pub misses: Vec<SpellGoMiss>,
     pub targets: SpellCastTargets,
     pub ammo_display_id: Option<u32>,
+}
+
+/// One `SMSG_SPELL_GO` miss entry: the target and its `SpellMissInfo`, and for a reflect (11) the
+/// reflected spell's outcome on its caster, 0 otherwise (the client's `[ebp-0x68]` array, read
+/// by `0x6e7df3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpellGoMiss {
+    pub target: u64,
+    pub info: u8,
+    pub reflect_result: u8,
 }
 
 pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
@@ -191,12 +205,18 @@ pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
     let miss_count = read_u8(r)?;
     let mut misses = Vec::with_capacity(capacity_hint(miss_count, usize::from(u8::MAX)));
     for _ in 0..miss_count {
-        let guid = read_u64_le(r)?;
-        let reason = read_u8(r)?;
-        if reason == SPELL_MISS_REFLECT {
-            let _reflect_result = read_u8(r)?;
-        }
-        misses.push((guid, reason));
+        let target = read_u64_le(r)?;
+        let info = read_u8(r)?;
+        let reflect_result = if info == SPELL_MISS_REFLECT {
+            read_u8(r)?
+        } else {
+            0
+        };
+        misses.push(SpellGoMiss {
+            target,
+            info,
+            reflect_result,
+        });
     }
 
     let targets = read_spell_cast_targets(r)?;
@@ -344,6 +364,16 @@ pub fn cast_spell_item(spell_id: u32, item_guid: u64) -> Vec<u8> {
     body.extend_from_slice(&spell_id.to_le_bytes());
     body.extend_from_slice(&TARGET_FLAG_ITEM.to_le_bytes());
     crate::wire::write_packed_guid(item_guid, &mut body).expect("vec write");
+    body
+}
+
+/// Body of `CMSG_CAST_SPELL` at the partner's trade slot `slot`: `TARGET_FLAG_TRADE_ITEM` and the
+/// slot as a packed guid, the bind of `0x6e6900` (`0x6e6915`-`0x6e6925`), written by the targets
+/// writer `0x7e4e10` as any item target.
+pub fn cast_spell_trade_item(spell_id: u32, slot: u8) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&spell_id.to_le_bytes());
+    super::items::write_cast_targets(&mut body, super::items::UseItemTarget::TradeItem(slot));
     body
 }
 

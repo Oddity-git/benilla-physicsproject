@@ -21,6 +21,8 @@ fn quiet(s: &UiScript) {
 /// OnLoads format `UnitName("player")` into their labels.
 fn session() -> UiScript {
     let mut s = UiScript::new().unwrap();
+    // No engine behind it: `RaidFrame`'s `RequestRaidInfo()` at world entry is kept.
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.set_unit(
         "player",
@@ -503,10 +505,12 @@ fn the_battleground_blips_and_the_flag_follow_the_position_family() {
             BattlefieldPositionView {
                 uv: (0.25, 0.75),
                 name: Some("Alliedguy".into()),
+                ..Default::default()
             },
             BattlefieldPositionView {
                 uv: (0.0, 0.0),
                 name: None,
+                ..Default::default()
             },
         ],
         Some(BattlefieldFlagView {

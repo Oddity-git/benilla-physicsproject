@@ -69,11 +69,22 @@ pub(crate) struct SpellVisuals(pub(crate) SpellVisualCatalog);
 /// `crate::sound` in emission order.
 #[derive(Message, Clone, Copy, Debug)]
 pub(crate) enum SpellKitSound {
-    /// Ring this kit at the unit; a looping kit (`SoundEntries` flag 0x200) becomes the unit's
-    /// tracked hold loop until [`Self::StopHold`] (`0x458830` → `0x61fec0`, one-shot `0x458870`).
-    Play { entity: Entity, kit_sound: u32 },
-    /// The cast or channel hold ended: stop the unit's hold loop (`0x614150`).
-    StopHold { entity: Entity },
+    /// Ring this kit at the unit for `spell_id`'s kit, 0 for a kit push; a looping kit
+    /// (`SoundEntries` flag 0x200) becomes the unit's tracked hold loop until [`Self::StopHold`]
+    /// (`0x458830` → `0x61fec0`, one-shot `0x458870`). The effect it rides carries the spell
+    /// (`+0x18`), which the stop keys on.
+    Play {
+        entity: Entity,
+        spell_id: u32,
+        kit_sound: u32,
+    },
+    /// Stop the unit's hold loop: for `Some(spell)`, only a loop that spell's kit rang, as
+    /// `0x614150(spell, 0)` stops only the effects whose spell matches (`0x614167`); for `None`,
+    /// whatever loop it holds, as a new hold replaces the old.
+    StopHold {
+        entity: Entity,
+        spell_id: Option<u32>,
+    },
     /// Ring this kit at a world point, the kit play's `extra` override (`0x60f49e`): a missile's
     /// ground arrival. Always a one-shot: no shipped ground-arrival kit loops.
     PlayAt { pos: Vec3, kit_sound: u32 },
@@ -151,6 +162,9 @@ pub(crate) enum SpellKitFx {
         entity: Entity,
         spell_id: u32,
         class: FxClass,
+        /// `0x614150`'s `force`: the cast edges stop unforced, sparing the spell's state effects
+        /// (kind 2), which the aura's removal and the channel's change stop forced.
+        force: bool,
     },
 }
 
@@ -166,8 +180,37 @@ pub(crate) struct ChainProcPlay {
     pub(crate) proc: benilla_formats::ChainProc,
 }
 
-/// One projectile per target on the GO's Speed > 0 branch (`0x6e8a50` → `0x60a3d0`), consumed
-/// by `crate::entities::missile`.
+/// One unit a missile flies at (`0x6e8b84` → `0x60a3d0`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MissileTarget {
+    pub(crate) unit: Entity,
+    /// `None` for a hit; for a miss the `SpellMissInfo`, where the missile still flies and the
+    /// arrival reports it (`0x61dd50`).
+    pub(crate) miss: Option<u8>,
+    /// The byte a reflect carries after its code (`0x6e8279`, the missile's `+0x4c`): the outcome
+    /// the flight turned back at the caster takes, 0 a hit (`0x61e17b`).
+    pub(crate) reflect: u8,
+}
+
+/// What a missile flown at a point carries (`0x60a5fc`-`0x60a6cd`): the list it was launched for,
+/// walked on arrival (`0x61d870`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GroundList {
+    /// The hit list, no reasons: each unit plays the impact kit (`0x61da2d`).
+    Hits(Vec<Entity>),
+    /// The miss list with its reasons: each unit with a nonzero one is reported (`0x61d9dc`).
+    Misses(Vec<(Entity, u8)>),
+}
+
+/// One missile at the GO's point, the launcher's location arm (`0x6e8bd4`, a zero guid).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GroundShot {
+    pub(crate) at: Vec3,
+    pub(crate) list: GroundList,
+}
+
+/// One GO's projectiles on the Speed > 0 branch (`0x6e8a50` → `0x60a3d0`), consumed by
+/// `crate::entities::missile`.
 #[derive(Message, Clone)]
 pub(crate) struct MissileSpawn {
     pub(crate) caster: Entity,
@@ -182,15 +225,11 @@ pub(crate) struct MissileSpawn {
     pub(crate) dest_tag: Option<u16>,
     /// `Spell.dbc` Speed; flight time is distance over speed (`0x61ceb0`).
     pub(crate) speed: f32,
-    /// `None` for a hit; for a miss the `SpellMissInfo`, where the missile still flies and arrival
-    /// plays the victim's dodge (3) or block (5) clip.
-    pub(crate) targets: Vec<(Entity, Option<u8>)>,
-    /// With no targets and a DEST point on the GO, one projectile flies at the point (`0x6e8a50`'s
-    /// empty-hit arm, `0x6e8aa2`), arriving as [`super::CastEventKind::GroundImpact`].
-    /// The reference latches on `flags & 0x60` and aims a SOURCE-only cast at a zeroed DEST
-    /// point; this launches only with a real DEST (`flags & 0x40`), a zeroed aim being a quirk
-    /// not aped.
-    pub(crate) ground_aim: Option<Vec3>,
+    /// One missile per listed unit, hits and misses.
+    pub(crate) targets: Vec<MissileTarget>,
+    /// The missiles at the GO's point, one per list that took the location arm, arriving as
+    /// [`super::CastEventKind::GroundImpact`].
+    pub(crate) grounds: Vec<GroundShot>,
     /// The caster's ranged fallback visual, carried to arrival when the caster may be gone.
     pub(crate) weapon_visual: Option<u32>,
     /// `SpellVisual` field 10: the sound the projectile loops in flight (`CMissile+0x40`).
@@ -235,26 +274,114 @@ impl WeaponVisualSrc<'_, '_> {
     /// The caster's ranged weapon's substitute `SpellVisual` id.
     fn caster(&mut self, caster: Entity) -> Option<u32> {
         let (net_entity, store) = self.units.get(caster).ok()?;
-        let s = &store.0;
-        let display_id = match net_entity?.kind {
-            EntityKind::Unit => s.unit_virtual_item_display(2),
-            // 17: vmangos `EQUIPMENT_SLOT_RANGED`.
-            EntityKind::Player => s
-                .player_visible_item_entry(17)
-                .filter(|e| *e != 0)
-                // The visible item's change looked it up (`0x5ed764`); this only reads.
-                .and_then(|entry| self.items.as_deref()?.held(entry, Ask::Read))
-                .map(|t| t.display_info_id),
-            _ => None,
-        }
-        .filter(|d| *d != 0)?;
-        let visual = self
-            .displays
-            .as_deref()?
-            .catalog
-            .get(display_id)?
-            .spell_visual;
-        (visual != 0).then_some(visual)
+        ranged_weapon_visual(
+            net_entity,
+            store,
+            self.items.as_deref(),
+            self.displays.as_deref(),
+        )
+    }
+}
+
+/// A caster's ranged weapon's substitute `SpellVisual` id, read off its descriptor.
+fn ranged_weapon_visual(
+    net_entity: Option<&NetEntity>,
+    store: &ObjectStore,
+    items: Option<&Items>,
+    displays: Option<&ItemDisplays>,
+) -> Option<u32> {
+    let s = &store.0;
+    let display_id = match net_entity?.kind {
+        EntityKind::Unit => s.unit_virtual_item_display(2),
+        // 17: vmangos `EQUIPMENT_SLOT_RANGED`.
+        EntityKind::Player => s
+            .player_visible_item_entry(17)
+            .filter(|e| *e != 0)
+            // The visible item's change looked it up (`0x5ed764`); this only reads.
+            .and_then(|entry| items?.held(entry, Ask::Read))
+            .map(|t| t.display_info_id),
+        _ => None,
+    }
+    .filter(|d| *d != 0)?;
+    let visual = displays?.catalog.get(display_id)?.spell_visual;
+    (visual != 0).then_some(visual)
+}
+
+/// Whether `0x6ec220` starts its precast: the caster is a unit (`0x6ec245`, type mask bit 3)
+/// and the spell resolves a visual for it (`0x60d450` returns a row, else `0x6ec2a9`). A caster
+/// with no [`NetEntity`] counts as a unit.
+fn precast_resolves(
+    spells: Option<&crate::ui_action::Spells>,
+    visuals: Option<&SpellVisuals>,
+    kind: Option<&NetEntity>,
+    store: Option<&ObjectStore>,
+    items: Option<&Items>,
+    displays: Option<&ItemDisplays>,
+    spell_id: u32,
+) -> bool {
+    let (Some(spells), Some(visuals)) = (spells, visuals) else {
+        return false; // no client data
+    };
+    let unit = kind.is_none_or(|n| matches!(n.kind, EntityKind::Unit | EntityKind::Player));
+    unit && resolve_stages(spells, &visuals.0, spell_id, || {
+        ranged_weapon_visual(kind, store?, items, displays)
+    })
+    .is_some()
+}
+
+/// What `0x6ec220` decides its precast by, for the active player's send ([`super::precast_at_send`]):
+/// the decision is made where the send is, so the queued start already carries it.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct PrecastVisuals<'w, 's> {
+    spells: Option<Res<'w, crate::ui_action::Spells>>,
+    visuals: Option<Res<'w, SpellVisuals>>,
+    kinds: Query<'w, 's, &'static NetEntity>,
+    weapon: WeaponVisualSrc<'w, 's>,
+}
+
+impl PrecastVisuals<'_, '_> {
+    /// Whether `spell_id` precasts on `caster` ([`precast_resolves`]).
+    pub(crate) fn resolves(&self, caster: Entity, spell_id: u32) -> bool {
+        precast_resolves(
+            self.spells.as_deref(),
+            self.visuals.as_deref(),
+            self.kinds.get(caster).ok(),
+            self.weapon.units.get(caster).ok().map(|(_, store)| store),
+            self.weapon.items.as_deref(),
+            self.weapon.displays.as_deref(),
+            spell_id,
+        )
+    }
+}
+
+/// The same decision's tables for a caller that holds the stores and the item cache itself, the
+/// `SMSG_SPELL_START` handler.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct PrecastTables<'w, 's> {
+    visuals: Option<Res<'w, SpellVisuals>>,
+    displays: Option<Res<'w, ItemDisplays>>,
+    kinds: Query<'w, 's, &'static NetEntity>,
+}
+
+impl PrecastTables<'_, '_> {
+    /// Whether `spell_id` precasts on `caster`, whose descriptor is `store` ([`precast_resolves`]).
+    pub(crate) fn resolves(
+        &self,
+        spells: Option<&crate::ui_action::Spells>,
+        items: &Items,
+        caster: Entity,
+        store: Option<&ObjectStore>,
+        spell_id: u32,
+    ) -> bool {
+        precast_resolves(
+            spells,
+            self.visuals.as_deref(),
+            self.kinds.get(caster).ok(),
+            store,
+            Some(items),
+            self.displays.as_deref(),
+            spell_id,
+        )
     }
 }
 
@@ -467,7 +594,11 @@ fn play_kit(
         }
     }
     if let Some(kit_sound) = kit.sound.filter(|_| play.sound) {
-        out.sounds.write(SpellKitSound::Play { entity, kit_sound });
+        out.sounds.write(SpellKitSound::Play {
+            entity,
+            spell_id,
+            kit_sound,
+        });
     }
     // The camera shake plays at every stage, gated on nothing.
     if let Some(group) = kit.shake {
@@ -555,13 +686,80 @@ fn play_impact(
     }
 }
 
+/// What one GO's two launcher calls fly (`0x6e823a` for the hits, `0x6e8279` for the misses with
+/// their reasons and reflect bytes, the second only for a nonempty miss list): the targets and the
+/// shots at the point of [`MissileSpawn`].
+#[derive(Default)]
+struct LauncherShots {
+    targets: Vec<MissileTarget>,
+    grounds: Vec<GroundShot>,
+}
+
+/// `0x6e8a50` per list: a nonempty list whose target mask has UNIT or GAMEOBJECT (`0x802`,
+/// `0x6e8ac6`) flies one missile per unit, passing over a dead one (`0x6e8b24`), unless the mask
+/// also carries a point (`0x60`) and the visual's field 15 lacks bit 0 (`0x6e8aab`, `0x6e8ad4`).
+/// Otherwise a mask with a point flies one missile at it carrying the list (`0x6e8ba4`,
+/// `0x6e8bd4`), the empty hit list included; with no point it flies nothing. It aims at the DEST
+/// point when the mask has one (`0x60a584`, `0x60a5b2`), else at the SOURCE point (`0x60a5ce`).
+fn launcher_shots(go: &SpellGoTargets, flags: u32, dead: impl Fn(Entity) -> bool) -> LauncherShots {
+    let points = go.target_mask & 0x60 != 0;
+    let point = if go.target_mask & 0x40 != 0 {
+        go.dest
+    } else {
+        go.source
+    };
+    let per_unit = go.target_mask & 0x802 != 0 && (!points || flags & 0x1 != 0);
+    let mut shots = LauncherShots::default();
+    let ground = |list: GroundList, shots: &mut LauncherShots| {
+        if let (true, Some(at)) = (points, point) {
+            shots.grounds.push(GroundShot { at, list });
+        }
+    };
+    if per_unit && !go.hits.is_empty() {
+        shots.targets.extend(
+            go.hits
+                .iter()
+                .filter(|&&e| !dead(e))
+                .map(|&unit| MissileTarget {
+                    unit,
+                    miss: None,
+                    reflect: 0,
+                }),
+        );
+    } else {
+        ground(GroundList::Hits(go.hits.clone()), &mut shots);
+    }
+    if go.misses.is_empty() {
+        // `0x6e8244`: no second call.
+    } else if per_unit {
+        shots
+            .targets
+            .extend(
+                go.misses
+                    .iter()
+                    .filter(|&&(e, ..)| !dead(e))
+                    .map(|&(unit, code, reflect)| MissileTarget {
+                        unit,
+                        miss: Some(code),
+                        reflect,
+                    }),
+            );
+    } else {
+        let list = go.misses.iter().map(|&(e, code, _)| (e, code)).collect();
+        ground(GroundList::Misses(list), &mut shots);
+    }
+    shots
+}
+
 /// The cast-edge router: wire [`CastEvent`]s and the public channel field → animation intents.
 ///
 /// - Start: the precast kit's anim becomes the [`CastHold`] (stage 4) and its sound rings.
-/// - Go: the hold drops and the cast kit plays; the GO's targets play their impacts inline when
-///   `Spell.dbc` Speed is 0 (`0x6e8bf0`), else fly a [`MissileSpawn`] (`0x6e8a50`).
+/// - Go: the hold drops, its spell's and the running auto-repeat spell's, and the cast kit plays;
+///   the GO's targets play their impacts inline when `Spell.dbc` Speed is 0 (`0x6e8bf0`), else
+///   fly a [`MissileSpawn`] (`0x6e8a50`).
 /// - Impact: a missile arrived on this unit ([`play_impact`]).
-/// - Fail: the hold drops silently.
+/// - Fail, and the auto-repeat stop's reap (`0x614150(spell, 0)` at `0x6ea139`): that spell's hold
+///   drops silently, with its own loop and models.
 /// - Channel: `UNIT_CHANNEL_SPELL` polled per frame (`0x612a30`); observers have no packet. A set
 ///   field holds the channel kit's anim and rings its sound once, a cleared one drops it.
 pub(super) fn route_cast_visuals(
@@ -576,7 +774,11 @@ pub(super) fn route_cast_visuals(
     mut sheaths: MessageWriter<super::SheathRequest>,
     mut spawns: KitSpawnWriters,
     visuals: Option<Res<SpellVisuals>>,
-    spells: Option<Res<crate::ui_action::Spells>>,
+    // The running auto-repeat spell `[0xceac30]`, whose kits every go stops on its caster.
+    (spells, auto_repeat): (
+        Option<Res<crate::ui_action::Spells>>,
+        Option<Res<crate::spell::AutoRepeatActive>>,
+    ),
     mut weapon_src: WeaponVisualSrc,
     units: Query<(Entity, &ObjectStore), Without<ItemObject>>,
     holds: Query<&CastHold>,
@@ -640,13 +842,16 @@ pub(super) fn route_cast_visuals(
         match ev.kind {
             CastEventKind::Start => {
                 // A replacing cast reaps the prior hold's loop and persistent models first.
-                out.sounds
-                    .write(SpellKitSound::StopHold { entity: ev.entity });
+                out.sounds.write(SpellKitSound::StopHold {
+                    entity: ev.entity,
+                    spell_id: None,
+                });
                 if let Some(prior) = held_spell(&pending, ev.entity) {
                     out.fx.write(SpellKitFx::Reap {
                         entity: ev.entity,
                         spell_id: prior,
                         class: FxClass::Hold,
+                        force: true,
                     });
                 }
                 // A ranged-attribute START draws the ranged weapon (`0x6e78f3`); vmangos sends
@@ -671,20 +876,13 @@ pub(super) fn route_cast_visuals(
                     |s| s.precast,
                     || weapon_src.caster(ev.entity),
                 ) {
-                    // The `0x400` weapon-visual hold: a ranged visual play sets it (`0x60d020`),
-                    // any other clears it (`0x6ec39e`); it keeps a remote shooter drawn.
                     let ranged = spells
                         .catalog
                         .get(ev.spell_id)
                         .is_some_and(|d| d.ranged_slot());
-                    // Fallible: `model_fade::apply_despawn_fade` is unordered against this chain
-                    // and can despawn the unit before these commands apply.
-                    if ranged {
-                        commands.entity(ev.entity).try_insert(super::RangedHold);
-                    } else {
-                        commands.entity(ev.entity).try_remove::<super::RangedHold>();
-                    }
-                    // The hold resolver takes only an id above 0 (`0x612a0a jle`).
+                    // The hold resolver takes only an id above 0 (`0x612a0a jle`). Fallible:
+                    // `model_fade::apply_despawn_fade` is unordered against this chain and can
+                    // despawn the unit before these commands apply.
                     if let Some(anim_id) = kit.positive_anim() {
                         commands.entity(ev.entity).try_insert(CastHold {
                             anim_id,
@@ -696,6 +894,7 @@ pub(super) fn route_cast_visuals(
                     if let Some(kit_sound) = kit.sound {
                         out.sounds.write(SpellKitSound::Play {
                             entity: ev.entity,
+                            spell_id: ev.spell_id,
                             kit_sound,
                         });
                     }
@@ -714,19 +913,54 @@ pub(super) fn route_cast_visuals(
                 }
             }
             CastEventKind::Go => {
-                // Spell-id-keyed (`0x614150(spellId, 0)`): a proc's GO keeps another spell's hold.
-                if held_spell(&pending, ev.entity) == Some(ev.spell_id) {
-                    commands.entity(ev.entity).try_remove::<CastHold>();
-                    pending.insert(ev.entity, None);
+                // The go's own stop is skipped for a channelled spell (`AttributesEx & 0x4`) while
+                // the caster channels (`UNIT_CHANNEL_SPELL` nonzero), `0x6e7fca`-`0x6e7fde`.
+                let channelling = spells
+                    .catalog
+                    .get(ev.spell_id)
+                    .is_some_and(|d| d.attributes_ex & 0x4 != 0)
+                    && units
+                        .get(ev.entity)
+                        .is_ok_and(|(_, store)| store.0.unit_channel_spell() != 0);
+                if !channelling {
+                    // Spell-id-keyed (`0x614150(spellId, 0)` at `0x6e7fe8`): a proc's GO keeps
+                    // another spell's hold.
+                    if held_spell(&pending, ev.entity) == Some(ev.spell_id) {
+                        commands.entity(ev.entity).try_remove::<CastHold>();
+                        pending.insert(ev.entity, None);
+                    }
+                    // The spell's own loop, whatever the hold: a precast kit with no anim still
+                    // starts a loop.
+                    out.sounds.write(SpellKitSound::StopHold {
+                        entity: ev.entity,
+                        spell_id: Some(ev.spell_id),
+                    });
+                    out.fx.write(SpellKitFx::Reap {
+                        entity: ev.entity,
+                        spell_id: ev.spell_id,
+                        class: FxClass::Hold,
+                        force: false,
+                    });
                 }
-                // Reaped whatever the hold: a precast kit with no anim still starts a loop.
-                out.sounds
-                    .write(SpellKitSound::StopHold { entity: ev.entity });
-                out.fx.write(SpellKitFx::Reap {
-                    entity: ev.entity,
-                    spell_id: ev.spell_id,
-                    class: FxClass::Hold,
-                });
+                // Then the running auto-repeat spell's on the same unit, `0x614150([0xceac30], 0)`
+                // whenever it is set (`0x6e7fed`-`0x6e7ffb`), whoever casts the go: the gate of
+                // the go's own stop (`0x6e7fca`) does not reach it.
+                if let Some(repeat) = auto_repeat.as_ref().and_then(|a| a.0) {
+                    if held_spell(&pending, ev.entity) == Some(repeat) {
+                        commands.entity(ev.entity).try_remove::<CastHold>();
+                        pending.insert(ev.entity, None);
+                    }
+                    out.sounds.write(SpellKitSound::StopHold {
+                        entity: ev.entity,
+                        spell_id: Some(repeat),
+                    });
+                    out.fx.write(SpellKitFx::Reap {
+                        entity: ev.entity,
+                        spell_id: repeat,
+                        class: FxClass::Hold,
+                        force: false,
+                    });
+                }
                 // A ranged-slot GO redraws ranged before the cast kit (`0x60f34c`, gate
                 // `Attributes & 0x2`, stages 0 and 4): what redraws a bow an emote lowered.
                 if spells
@@ -750,16 +984,6 @@ pub(super) fn route_cast_visuals(
                     |s| s.cast,
                     || weapon_src.caster(ev.entity),
                 ) {
-                    // The `0x400` hold re-asserted per shot, or cleared for a non-ranged play.
-                    if spells
-                        .catalog
-                        .get(ev.spell_id)
-                        .is_some_and(|d| d.ranged_slot())
-                    {
-                        commands.entity(ev.entity).try_insert(super::RangedHold);
-                    } else {
-                        commands.entity(ev.entity).try_remove::<super::RangedHold>();
-                    }
                     play_kit(
                         ev.entity,
                         ev.spell_id,
@@ -771,14 +995,17 @@ pub(super) fn route_cast_visuals(
                     );
                 }
             }
-            CastEventKind::Impact { weapon_visual } => {
-                // The arrival flinches every living target, no hostility test (`0x61dc74`).
+            CastEventKind::Impact {
+                weapon_visual,
+                wound,
+            } => {
+                // A hit arrival flinches every living target, no hostility test (`0x61dc74`).
                 play_impact(
                     ev.entity,
                     ImpactPlay {
                         spell_id: ev.spell_id,
                         weapon_visual,
-                        flinch: true,
+                        flinch: wound,
                         seq: ev.seq,
                     },
                     spells,
@@ -799,34 +1026,40 @@ pub(super) fn route_cast_visuals(
                     out.shakes.write(SpellKitShake::PlayAt { pos, group });
                 }
             }
-            CastEventKind::Fail => {
+            CastEventKind::Fail | CastEventKind::Reap => {
                 if held_spell(&pending, ev.entity) == Some(ev.spell_id) {
                     commands.entity(ev.entity).try_remove::<CastHold>();
                     pending.insert(ev.entity, None);
                 }
-                out.sounds
-                    .write(SpellKitSound::StopHold { entity: ev.entity });
+                // The spell's own loop only (`0x614167`): a cancel's reap of the record's
+                // spell spares a channel another spell runs.
+                out.sounds.write(SpellKitSound::StopHold {
+                    entity: ev.entity,
+                    spell_id: Some(ev.spell_id),
+                });
                 out.fx.write(SpellKitFx::Reap {
                     entity: ev.entity,
                     spell_id: ev.spell_id,
                     class: FxClass::Hold,
+                    force: false,
                 });
             }
         }
     }
 
-    // Speed 0 plays every impact now (`0x6e8bf0`), Speed > 0 flies one projectile per target.
-    // Misses fly too; the reference deflects them off the target, which is not built.
+    // Speed 0 plays every impact now (`0x6e8bf0`), with or without a caster unit (`0x6e816b`);
+    // Speed > 0 flies the launcher's missiles from a caster unit ([`launcher_shots`]).
     for go in go_targets.read() {
         let Some(display) = spells.catalog.get(go.spell_id) else {
             continue;
         };
-        // Resolved once per GO (`0x6e802e`); every consumer below reads the merged row.
-        let wv = weapon_src.caster(go.caster);
+        // Resolved once per GO (`0x6e802e`); every consumer below reads the merged row. A caster
+        // that is no unit we hold reads the spell's own row (`0x6e8038`).
+        let wv = go.caster.and_then(|caster| weapon_src.caster(caster));
         let stages = resolve_stages(spells, &visuals.0, go.spell_id, || wv);
         // The dest one-shot (`0x6e8088`): field 12's model once at the dest point when field 6 is
-        // 0, fired at GO whatever the hit list.
-        if let Some(dest) = go.dest {
+        // 0, fired at GO whatever the hit list, for a caster unit only (`0x6e8082`).
+        if let (Some(dest), Some(_)) = (go.dest, go.caster) {
             if let Some(stages) = stages {
                 if stages.missile_gate == 0 && stages.area_effect != 0 {
                     if let Some(path) = visuals.0.effect_path(stages.area_effect) {
@@ -855,47 +1088,49 @@ pub(super) fn route_cast_visuals(
                     &mut out,
                 );
             }
-        } else {
-            // The spawn gate is Speed alone (`0x60a3d0`): basic shots have no visual row.
-            let path = stages.and_then(|s| {
-                (s.missile_model >= 1).then(|| {
-                    visuals
-                        .0
-                        .effect_path(s.missile_model)
-                        .unwrap_or(ERROR_CUBE)
-                        .to_string()
-                })
+        } else if let Some(caster) = go.caster {
+            // No caster unit flies nothing (`0x6e8219`), nor does a spell with no visual row
+            // (`0x6e8041`); the launcher needs the visual's field 6 or the wire's ammo
+            // (`0x6e8a7f`, `0x6e8a88`).
+            let Some(stages) = stages.filter(|s| {
+                s.missile_gate != 0 || go.ammo_display_id.is_some_and(|ammo| ammo != 0)
+            }) else {
+                continue;
+            };
+            let path = (stages.missile_model >= 1).then(|| {
+                visuals
+                    .0
+                    .effect_path(stages.missile_model)
+                    .unwrap_or(ERROR_CUBE)
+                    .to_string()
             });
             // An out-of-table ordinal reads adjacent `.rdata` in the reference; here, the base.
-            let dest_tag =
-                stages.and_then(|s| MISSILE_ATTACH_TABLE.get(s.missile_attach as usize).copied());
-            let missile_sound = stages.and_then(|s| s.missile_sound);
-            let targets: Vec<(Entity, Option<u8>)> = go
-                .hits
-                .iter()
-                .map(|&e| (e, None))
-                .chain(go.misses.iter().map(|&(e, code)| (e, Some(code))))
-                .collect();
-            // Only an empty hit array consults the ground point (`0x6e8abc … je 0x6e8ba2`).
-            let ground_aim = targets.is_empty().then_some(go.dest).flatten();
-            if !targets.is_empty() || ground_aim.is_some() {
+            let dest_tag = MISSILE_ATTACH_TABLE
+                .get(stages.missile_attach as usize)
+                .copied();
+            let shots = launcher_shots(go, stages.flags, |e| {
+                units
+                    .get(e)
+                    .is_ok_and(|(_, store)| store.is_unit() && store.0.is_dead_or_ghost())
+            });
+            if !shots.targets.is_empty() || !shots.grounds.is_empty() {
                 // The release gate (`0x6e7a70`, inverted): a cast kit animation above 0 waits for
                 // the release keyframe (`0x6e8295 jg`); Stand launches at once (`0x6e829d`).
-                let awaits_release = stages
-                    .filter(|s| s.cast != 0)
-                    .and_then(|s| visuals.0.kit(s.cast))
+                let awaits_release = (stages.cast != 0)
+                    .then(|| visuals.0.kit(stages.cast))
+                    .flatten()
                     .is_some_and(|k| k.positive_anim().is_some());
                 missiles.write(MissileSpawn {
-                    caster: go.caster,
+                    caster,
                     spell_id: go.spell_id,
                     path,
                     ammo_display_id: go.ammo_display_id,
                     dest_tag,
                     speed: display.speed,
-                    targets,
-                    ground_aim,
+                    targets: shots.targets,
+                    grounds: shots.grounds,
                     weapon_visual: wv,
-                    missile_sound,
+                    missile_sound: stages.missile_sound,
                     awaits_release,
                 });
             }
@@ -912,13 +1147,17 @@ pub(super) fn route_cast_visuals(
         }
         channel_cache.insert(entity, cur);
         if cur != 0 {
-            out.sounds.write(SpellKitSound::StopHold { entity });
+            out.sounds.write(SpellKitSound::StopHold {
+                entity,
+                spell_id: None,
+            });
             if prev != 0 {
                 // A channel replacing a channel reaps the old spell's effects first.
                 out.fx.write(SpellKitFx::Reap {
                     entity,
                     spell_id: prev,
                     class: FxClass::Hold,
+                    force: true,
                 });
             }
             // No ranged fallback on the channel poll (`0x612a30`).
@@ -934,7 +1173,11 @@ pub(super) fn route_cast_visuals(
                     pending.insert(entity, Some(cur));
                 }
                 if let Some(kit_sound) = kit.sound {
-                    out.sounds.write(SpellKitSound::Play { entity, kit_sound });
+                    out.sounds.write(SpellKitSound::Play {
+                        entity,
+                        spell_id: cur,
+                        kit_sound,
+                    });
                 }
                 // The CharProc dispatcher's second caller (`0x612b18`): Drain Life's beam is
                 // reached only here, on the rising edge, and lives until the field clears.
@@ -969,11 +1212,15 @@ pub(super) fn route_cast_visuals(
                 commands.entity(entity).try_remove::<CastHold>();
                 pending.insert(entity, None);
             }
-            out.sounds.write(SpellKitSound::StopHold { entity });
+            out.sounds.write(SpellKitSound::StopHold {
+                entity,
+                spell_id: Some(prev),
+            });
             out.fx.write(SpellKitFx::Reap {
                 entity,
                 spell_id: prev,
                 class: FxClass::Hold,
+                force: true,
             });
         }
     }
@@ -1057,6 +1304,7 @@ pub(crate) fn arm_aura_state_fx(
                     entity,
                     spell_id,
                     class: FxClass::AuraState,
+                    force: true,
                 });
                 procs.write(AuraProc::Reap { entity, spell_id });
                 // The forced stop takes the 0x1000 effect too (`0x614179`).
@@ -1110,7 +1358,11 @@ pub(crate) fn arm_aura_state_fx(
             }
             // Ungated; a same-frame duplicate of the impact hand-off's collapses downstream.
             if let Some(kit_sound) = kit.sound {
-                sounds.write(SpellKitSound::Play { entity, kit_sound });
+                sounds.write(SpellKitSound::Play {
+                    entity,
+                    spell_id,
+                    kit_sound,
+                });
             }
             // The stage-2 anim leg, on the add edge only: an aura refreshed in place keeps its id,
             // and `0x604d00` fires neither arm.
@@ -1205,6 +1457,7 @@ pub(super) fn arm_loot_fx(
                     entity: was,
                     spell_id: LOOT_FX_KEY,
                     class: FxClass::Hold,
+                    force: true,
                 });
             }
         }

@@ -73,8 +73,15 @@ mod tests {
                     r.read_to_end(&mut bytes).await.ok()?;
                     String::from_utf8(bytes).ok()
                 });
+                // An asset path is `/`-separated on every platform, but the in-memory reader joins
+                // a child with the platform's separator (`PathBuf::join`), `\` on Windows.
+                let asset_path = path
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 if let Some(text) = text {
-                    out.push((path.to_string_lossy().into_owned(), text));
+                    out.push((asset_path, text));
                 }
             }
         }
@@ -91,7 +98,7 @@ mod tests {
     )]
     fn the_ui_quad_shader_composes_and_translates() {
         use bevy::shader::{Shader, ShaderCache, ShaderCacheSource, ShaderDefVal};
-        let app = crate::game_plugins::schedule_tests::headless_client();
+        let app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let server = app.world().resource::<AssetServer>();
         let source = server.get_source(AssetSourceId::from("embedded")).unwrap();
         let mut files = Vec::new();

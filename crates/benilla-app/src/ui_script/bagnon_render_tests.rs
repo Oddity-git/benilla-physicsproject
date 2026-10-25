@@ -83,6 +83,7 @@ fn roster() -> crate::glue_session::roster::Roster {
         class: 1, // Warrior
         gender: 0,
         level: 60,
+        new_character: false,
         skin: 0,
         face: 0,
         hair_style: 0,
@@ -125,6 +126,7 @@ fn descriptor_snapshot(seat: &benilla_ui::script::UnitState) -> benilla_ui::scri
 /// A session's VM: the whole interface, `INSTALLED` walked in dependency order, a real backpack.
 fn seat(root: &Path, seat: Seat) -> UiScript {
     let mut s = UiScript::new().expect("VM");
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
 
     let mut registry: Vec<AddOnInfo> = INSTALLED
@@ -163,7 +165,7 @@ fn seat(root: &Path, seat: Seat) -> UiScript {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -663,16 +665,17 @@ fn a_button_reports_its_own_label_width() {
         .expect("the label asks to be measured");
     s.set_measured_text_unwrapped(&[(req.id, 61.0, 12.0, req.key)]);
 
+    // Through the getter steps, `G(S(v))` at 4:3.
     assert_eq!(
         s.eval::<f64>("return ProbeWidthButton:GetTextWidth()")
             .expect("Button:GetTextWidth"),
-        61.0,
+        benilla_ui::test_support::law43(61.0),
         "the Button reports its LABEL's natural extent"
     );
     assert_eq!(
         s.eval::<f64>("return ProbeWidthButton:GetTextHeight()")
             .expect("Button:GetTextHeight"),
-        12.0
+        benilla_ui::test_support::law43(12.0)
     );
     // A Button with no label answers 0; the reference reads a FontString pointer that a bare
     // `CreateFrame("Button")` leaves null, and what it does then is untraced.
@@ -844,7 +847,7 @@ fn open_bagnon_stacked(root: &Path) -> UiScript {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -1054,7 +1057,8 @@ fn a_fontheight_with_no_font_attr_beside_it_is_never_read() {
     let s = open_bagnon_stacked(&root);
     assert_eq!(
         resolved_font(&s, "AutoFollowStatusText"),
-        ("Fonts\\FRIZQT__.TTF".into(), "12".into()),
+        // 12 through the getter steps, `G(S(12))` at 4:3.
+        ("Fonts\\FRIZQT__.TTF".into(), "12.000000298023".into()),
         "AutoFollowStatusText inherits GameFontNormal (12) and declares <FontHeight val=20> with \
          no font= — the 20 is dead XML in the reference, so 20 here means we are reading an \
          attribute the client never reaches"
@@ -1143,9 +1147,9 @@ fn bagnon_forevers_records_survive_the_logout_boundary() {
         "the login scan records the occupied slot's short link"
     );
 
-    // An equipped bag: the inventory slot (20) first, then the container and its `BAG_UPDATE`,
-    // the order `feed_char.before(feed_containers)` holds. The size row reads the bag item's own
-    // count and link, so the other order records the bag without its link.
+    // An equipped bag: the inventory slot (20) and the container pushed, then its `BAG_UPDATE`,
+    // which the lanes' drain fires after every push. The size row reads the bag item's own count
+    // and link, so an event ahead of the inventory push records the bag without its link.
     let mut inv: benilla_ui::script::InventorySlots = Default::default();
     inv[20] = Some(benilla_ui::script::InvSlotView {
         item_id: 4497,
@@ -1177,13 +1181,7 @@ fn bagnon_forevers_records_survive_the_logout_boundary() {
 
     // The logout boundary: the despawn frame (no self store), then the shutdown events.
     let mut memory = crate::ui_items::feed::FeedMemory::default();
-    crate::ui_items::feed::apply_container_source(
-        &mut s,
-        &mut memory,
-        None,
-        Default::default(),
-        Vec::new(),
-    );
+    crate::ui_items::feed::push_containers(&mut s, &mut memory, None);
     s.fire_event("PLAYER_LEAVING_WORLD", Vec::new());
     s.fire_event("PLAYER_LOGOUT", Vec::new());
     let (size, item) = s

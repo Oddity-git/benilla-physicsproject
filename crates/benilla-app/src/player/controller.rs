@@ -5,6 +5,9 @@
 
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 /// Free-flies until the server places us, then drives the avatar and streams its movement as the
 /// mover; the dev chord with `F` toggles free fly.
 #[allow(clippy::type_complexity)]
@@ -21,6 +24,8 @@ pub(super) fn control(
         Res<camera_dynamics::CameraOptions>,
         // Only `nearclip` is read here, for the self-avatar fade.
         Res<benilla_world::view::ViewDistance>,
+        // Whether the live view is customised, the auto-return's view gate (`0x50fc30`).
+        Option<Res<camera_view::CameraViews>>,
     ),
     mut net: (
         Res<NetCommands>,
@@ -49,7 +54,7 @@ pub(super) fn control(
         // `SMSG_STANDSTATE_UPDATE`, applied locally and ungated, with nothing sent back.
         MessageReader<super::ServerStandState>,
     ),
-    speed_capsule: (
+    mut speed_capsule: (
         Res<MoveSpeed>,
         Res<PlayerCapsule>,
         Res<InspectMode>,
@@ -64,6 +69,14 @@ pub(super) fn control(
         Res<scoped_view::ScopedView>,
         // The loading cover blanks input at the source; a gesture in flight is unwound below.
         Res<crate::loading_screen::LoadingScreen>,
+        // Our own `[0xb4b3e4]`, which a control verdict on our character writes.
+        ResMut<super::OwnControlLost>,
+        // The active player, whom the posture verbs read and act on whichever body is driven.
+        SelfPosture,
+        // `ChrClasses.dbc`, whose relic flag the sheath toggle's ranged candidate reads.
+        Option<Res<crate::chr_classes::ChrClassTable>>,
+        // The predicted stand state `[player+0x1d68]`, which the posture verbs write.
+        ResMut<super::StandPending>,
     ),
     mut commands: Commands,
     mut player: ResMut<Player>,
@@ -79,11 +92,20 @@ pub(super) fn control(
         Local<Option<camera::PressGesture>>,
         Local<Option<camera::PressGesture>>,
     ),
-    // The liquid query, the transports, and the parent chain from a deck collider to its transport.
+    // The liquid query, the transports, the parent chain from a deck collider to its transport,
+    // and the active mover `0xc4da98`, as whether it is our own character.
     world_q: (
         benilla_world::world_point::WorldPoint,
         TransportQuery,
         Query<&ChildOf>,
+        Query<Has<crate::net::SelfPlayer>, With<crate::net::ActiveMover>>,
+        // Our create's transport block and the transport it names, placed or not yet.
+        (
+            Query<&crate::transport::TransportRider, With<Embodied>>,
+            Res<crate::net::GuidIndex>,
+            Query<&Transform, (Without<Embodied>, Without<FlyCam>, Without<Camera>)>,
+            Query<&crate::net::ObjectStore>,
+        ),
     ),
 ) {
     let (world, transports, child_of) = (&world_q.0, &world_q.1, &world_q.2);
@@ -119,6 +141,7 @@ pub(super) fn control(
         } else {
             pointer.3.tracking_style
         },
+        view_customised: pointer.6.as_ref().is_some_and(|v| v.current_customised()),
         ..*pointer.3
     };
     let dt = time.delta_secs();
@@ -162,7 +185,7 @@ pub(super) fn control(
             speed: body
                 .single()
                 .ok()
-                .and_then(|(_, _, _, _, _, _, _, speeds, ..)| speeds)
+                .and_then(|(_, _, _, _, _, _, speeds, ..)| speeds)
                 .map_or(0.0, |s| crate::net::current_speed(&s.0, player.move_flags)),
             command: follow_command,
             scoped: scoped.active(),
@@ -178,11 +201,11 @@ pub(super) fn control(
     // which skips the turn and pitch emitters (`0x514755`). Dead fails the shared precondition
     // `0x5144e0` (health above zero), so a corpse is stunned to the input tick; a ghost has
     // health 1. The stand state gates the mouse alone: `0x5145e0` wants the predicted
-    // `GetStandState() == 0` (`0x5ed570`; `stand_pending` is `[player+0x1d68]`).
+    // `GetStandState() == 0` (`0x5ed570`; [`super::StandPending`] is `[player+0x1d68]`).
     let (stunned, dead, stand_byte) = body
         .single()
         .ok()
-        .and_then(|(.., store, _, _, _, _, _)| {
+        .and_then(|(.., store, _, _, _, _)| {
             store.map(|s| {
                 (
                     s.0.unit_flags() & UNIT_FLAG_STUNNED != 0,
@@ -192,7 +215,16 @@ pub(super) fn control(
             })
         })
         .unwrap_or((false, false, 0));
-    let stand_state = player.stand_pending.unwrap_or(stand_byte);
+    // The prediction is the active player's ([`posture`]): a possessed body reads its own byte.
+    let self_driven = speed_capsule
+        .11
+        .single()
+        .is_some_and(|(.., embodied)| embodied);
+    let stand_state = if self_driven {
+        speed_capsule.13.stand_state(stand_byte)
+    } else {
+        stand_byte
+    };
     // The shared precondition `0x5144e0`, once per tick. Its far-sight conjunct,
     // `!(IsActivePlayer(mover) && [mover+0x1c70] & 1)`, reads the resolved subject (`0x5ee290`
     // latches only once resolved) and spares a possessed mover, which sets the same field.
@@ -213,7 +245,7 @@ pub(super) fn control(
         let f = body
             .single()
             .ok()
-            .and_then(|(.., store, _, _, _, _, _)| store.and_then(|s| s.0.player_drunk_byte()))
+            .and_then(|(.., store, _, _, _, _)| store.and_then(|s| s.0.player_drunk_byte()))
             .map_or(0.0, drunk::fraction);
         if !may_turn {
             0.0
@@ -228,7 +260,7 @@ pub(super) fn control(
         *right_click = None;
     }
     let focused = window.focused;
-    run_look_session(
+    let looked = run_look_session(
         mouse_motion,
         both_buttons,
         &mut rig,
@@ -255,6 +287,12 @@ pub(super) fn control(
     if !mouse_turns_body || player.control_lost || player.reseat {
         player.face_yaw = yaw_before_look;
     }
+    // The hand-off runs on each motion and on the press that completes both mouse bits, motion or
+    // none (`0x514924`-`0x514966`), behind the same body gate `0x5145e0`.
+    let hands_off = (looked || input::both_engaged(binds, &rig, both_buttons))
+        && mouse_turns_body
+        && !player.control_lost
+        && !player.reseat;
     {
         let cur = cursor_opts.bypass_change_detection();
         if cur.visible != opts_shadow.visible
@@ -268,7 +306,17 @@ pub(super) fn control(
     // A rebound zoom key steps 1.0 per press, the stock `CameraZoomIn(1.0)` (`Bindings.xml:707`).
     let zoom = binds.amount(crate::bindings::Input::CameraZoomIn)
         - binds.amount(crate::bindings::Input::CameraZoomOut);
-    apply_zoom_scroll(zoom, dt, &mut rig, zoom_max);
+    apply_zoom_scroll(zoom, dt, &mut rig, zoom_max, pointer.2.move_speed);
+    // The `MoveView*` axes, the camera update's `0x5112d0`, after this frame's calls.
+    rig.view_axes.apply(binds.view_calls());
+    camera_axes::tick(
+        &mut rig,
+        &mut cam,
+        dt,
+        look_cfg,
+        pointer.2.move_speed,
+        zoom_max,
+    );
 
     // Free fly is a dev tool on the dev chord: a bare `F` is the player's to bind.
     if crate::run_mode::dev_chord(&keys, KeyCode::KeyF) {
@@ -277,10 +325,11 @@ pub(super) fn control(
 
     // The server's movement edges and their acks. Speed changes come back unacked while we drive,
     // for the movement stream to ack with the live pose.
-    let speed_acks = wire_in::apply_server_moves(
+    let server_moves = wire_in::apply_server_moves(
         &time,
         &mut commands,
         &mut player,
+        &mut speed_capsule.10,
         &mut cam,
         &net.0,
         &mut net.1,
@@ -295,14 +344,38 @@ pub(super) fn control(
         body.single()
             .ok()
             .map(|(_, t, ..)| (t.translation, server_ride::yaw_of(t.rotation))),
+        self_seat(&world_q.4),
     );
+    let speed_acks = server_moves.speed_acks;
+    if let (true, Ok((e, ..))) = (server_moves.precast_ended, body.single()) {
+        crate::creature_anim::end_precast(&mut commands, e, crate::creature_anim::PrecastTail::Run);
+    }
 
     let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).normalize_or_zero();
 
     // On a transport, recompose the rider from the deck's pose this frame, before input integrates.
-    ride::carry(&mut player, &mut cam, transports);
+    ride::carry(&mut player, &mut cam, transports, &world_q.4 .1);
 
     if player.active && !player.detached {
+        // The cast bar's self-cancel, at the command press ([`input::cancels_cast`]) and ahead of
+        // the mover: between the press `0x5150a7` and the cancel `0x51512a` stands only the taint
+        // test `0x494a50`, so it runs whoever drives the body. It reads the commands, never the
+        // streamed word, which a root empties of direction bits. The cast cancel tests no mover
+        // (`0x5150f2`); the channel's compares the player with the active mover
+        // (`0x51517b`-`0x515191`), which possession sets to the creature and lost control zeroes
+        // (`0x5fa600`), so steering a possessed creature, or pressing while feared, ends a cast but
+        // not a channel.
+        let active_mover = world_q.3.iter().next();
+        let autorun_on = input::toggle_autorun(binds, &mut player);
+        if input::cancels_cast(
+            binds,
+            autorun_on,
+            input::both_engaged(binds, &rig, both_buttons),
+            active_mover.is_some(),
+        ) {
+            net.7.pressed = true;
+            net.7.mover_is_player = active_mover == Some(true);
+        }
         // Not driving, while the camera stays on the body and input, physics and the stream yield:
         // - `server_riding`: a server spline (Charge, knockback, taxi, a flee path) owns the body;
         //   `drive_self_ride` has mirrored it into `Player`, reporting FORWARD on purpose.
@@ -312,6 +385,13 @@ pub(super) fn control(
         //   carry no guid, so driving would write one body's pose onto another.
         // Possession is none of these: it runs the ordinary path below, on the creature.
         if player.server_riding || player.control_lost || player.reseat {
+            // The latch outlives the yield: lost control and an unresolved reseat leave the tick
+            // no unit (`0x51466e`), but a ride keeps the mover and fails `0x5144e0`, so the tick
+            // the ride's monster move runs (`0x602053`), and each press's, clears the bit
+            // (`0x514748`).
+            if player.server_riding && active_mover.is_some() {
+                player.autorun = false;
+            }
             // The moving body's transform is the truth; without this the camera stays behind
             // during a fear. Not while reseating, when `Player` still holds the body let go.
             if player.control_lost && !player.reseat {
@@ -399,7 +479,6 @@ pub(super) fn control(
             mouselook,
             turning,
             translating,
-            autorun_armed,
             turn_left,
             turn_right,
             ..
@@ -412,7 +491,7 @@ pub(super) fn control(
         }
         // The driven unit's own speeds: the reference's input path never reads ours for another
         // mover, so a possessed creature moves and turns at its own.
-        let mover_speeds = body.single().ok().and_then(|q| q.7).map(|s| s.0);
+        let mover_speeds = body.single().ok().and_then(|q| q.6).map(|s| s.0);
         // Zero is the ctor state, not a rate: a unit whose create block has not landed falls back.
         let turn_rate = mover_speeds
             .map(|s| s.turn_rate)
@@ -474,14 +553,23 @@ pub(super) fn control(
         // mover reads `CMovement+0x40` after the input phase.
         walk::update(&mut player, &body, binds);
         // The stand state and the sheath toggle, which interlock; returns the committed stand.
+        let reads = posture::PlayerReads {
+            control_lost: speed_capsule.10 .0,
+        };
         let stand_now = posture::update(
             &mut player,
+            &mut speed_capsule.13,
             &body,
+            &speed_capsule.11,
             binds,
             &net.0,
+            &mut commands,
             &mut net.3,
+            &mut net.14,
             &mut net.10,
             &mut net.15,
+            reads,
+            speed_capsule.12.as_deref().map(|t| &t.0),
             moving,
             turned,
         );
@@ -559,12 +647,34 @@ pub(super) fn control(
             (0.0, 0.0)
         };
 
+        // The pitch keys: the input tick's pitch emitter (`0x515010`, behind `0x514755` and the
+        // swim test `0x514766`), then the mover's pitch at the pitch rate (`0x7c4f80`), before
+        // the swim mover reads it.
+        swim::pitch_emitter(
+            &mut player,
+            (
+                binds.pressed(crate::bindings::Input::PitchUp),
+                binds.pressed(crate::bindings::Input::PitchDown),
+            ),
+            follow_command & camera::follow_cmd::RIGHT_MOUSE != 0,
+            may_turn,
+            swimming,
+        );
+        // The integration runs in any mode the bits survive into (`0x7c53b9`), at three quarters
+        // under a direction bit or FALLING (`0x200f`, `0x7c5cb3`).
+        let moving = if swimming {
+            swim_fwd != 0.0 || swim_side != 0.0
+        } else {
+            (may_translate && (fwd_axis != 0 || side_axis != 0)) || player.airborne_since.is_some()
+        };
+        swim::integrate_pitch_keys(&mut player, turn_rate, moving, dt);
+
         // The mounted Space flourish, the jump-key handler `0x60dea0`: mounted, still and grounded
         // plays MountSpecial (94) locally, then sends `CMSG_MOUNTSPECIAL_ANIM`; moving jumps;
         // turning in place eats the press. Airborne, the press falls through and the mover drops
         // it (the reference's ground-clearance test `0x605650`; the airborne arc stands in).
         if want_jump && !moving && !swimming && player.airborne_since.is_none() {
-            if let Ok((e, .., store, _, _, _, _, _)) = body.single() {
+            if let Ok((e, .., store, _, _, _, _)) = body.single() {
                 if store.is_some_and(|s| s.0.unit_mount_display_id() != 0) {
                     want_jump = false;
                     if !turning {
@@ -576,15 +686,12 @@ pub(super) fn control(
         }
 
         // The mover pitch (`CMovement+0x20`), in every mode: held when unsteered (`0x7c4f80`) and
-        // set by mouse look to the aim through `SetPitch` (`0x7c6f70`), an unconditional store
-        // clamped ±89° (the ±π/2 clamp is the pitch keys'), whose write precedes its SWIMMING test
-        // (`0x7c6f91`). A left-drag orbit steers nothing. It is written per mouse motion (event
-        // `0x400500cb`), not per frame, so other writers survive a still mouse. The aim includes
-        // the pivot bias, as `0x5103e0` passes `[cam+0x104] + [cam+0xf4]`.
-        let aim_pitch = cam.pitch + rig.smart_pivot.bias();
-        if mouselook && aim_pitch != player.aim_pitch_seen {
-            player.aim_pitch_seen = aim_pitch;
-            player.mover_pitch = aim_pitch.clamp(-MOUSELOOK_PITCH_CLAMP, MOUSELOOK_PITCH_CLAMP);
+        // set by mouse look to the aim ([`swim::hand_off_pitch`]), whose write precedes its
+        // SWIMMING test (`0x7c6f91`). A left-drag orbit steers nothing. It is written per mouse
+        // motion (event `0x400500cb`), not per frame, so other writers survive a still mouse. The
+        // aim includes the pivot bias, as `0x5103e0` passes `[cam+0x104] + [cam+0xf4]`.
+        if hands_off {
+            swim::hand_off_pitch(&mut player, cam.pitch + rig.smart_pivot.bias());
         }
         let mut swim_pitch = 0.0_f32;
         // Pre-step feet Y, the true take-off height: the step already rises one jump tick.
@@ -666,6 +773,7 @@ pub(super) fn control(
         ride::update_attachment(
             &mut player,
             transports,
+            &world_q.4 .1,
             child_of,
             ground,
             grounded,
@@ -777,19 +885,7 @@ pub(super) fn control(
             &dynamics,
         );
 
-        // The cast bar's self-cancel: a new directional start, a jump, or autorun's on edge (the
-        // interrupt mask `0x10f0` at `0x5150ce` is forward, back, strafe and autorun, and a clear
-        // edge returns early at `0x5150c8`); turning and pitch never cancel. Only our own
-        // character's moves count: vmangos breaks a channel on the caster's own movement
-        // (`Spell::update`), so a possessed creature's steps must not end Mind Control.
         let steering_ourselves = player.foreign_mover.is_none();
-        if steering_ourselves
-            && (move_flags_now & move_flags::ANY_MOVE & !player.move_flags != 0
-                || jumped
-                || autorun_armed)
-        {
-            net.7 .0 = true;
-        }
         // The loot window's walk-away, the movement-start guard `0x60e990`: forward, back, strafe,
         // keyboard turn, pitch and jump close it, mouse-look facing does not, and only for our
         // own character.
@@ -813,7 +909,7 @@ pub(super) fn control(
             gated,
             mover: player.foreign_mover.or(self_guid),
         };
-        movement_net::stream_self_movement(
+        let precast_ended = movement_net::stream_self_movement(
             &net.0 .0,
             &mut player,
             move_flags_now,
@@ -834,10 +930,46 @@ pub(super) fn control(
             wire_transport,
             skip,
         );
+        if let (true, Ok((e, ..))) = (precast_ended, body.single()) {
+            crate::creature_anim::end_precast(
+                &mut commands,
+                e,
+                crate::creature_anim::PrecastTail::Run,
+            );
+        }
     } else {
         // Free fly. Park the mover first, so a detach mid-move leaves no stale flags for observers
         // to extrapolate; a no-op once stopped.
         movement_net::park_mover(&net.0 .0, &mut player);
         camera::fly_free(dt, &keys, typing, &mut rig, &mut cam, &mut cam_t);
     }
+}
+
+/// Our create's transport block, the [`crate::transport::TransportRider`] tail on the body we
+/// steer, and the streamed transport it names, as [`wire_in::apply_server_moves`] seats a login
+/// aboard it.
+#[allow(clippy::type_complexity)]
+fn self_seat(
+    q: &(
+        Query<&crate::transport::TransportRider, With<Embodied>>,
+        Res<crate::net::GuidIndex>,
+        Query<&Transform, (Without<Embodied>, Without<FlyCam>, Without<Camera>)>,
+        Query<&crate::net::ObjectStore>,
+    ),
+) -> Option<wire_in::SelfSeat> {
+    let rider = q.0.single().ok()?;
+    let entity = *q.1 .0.get(&rider.transport_guid)?;
+    // 0x630a80: the lookup `0x468460` with the game object mask 0x20, then the transport bit 0x8
+    // of its flags.
+    let fields = &q.3.get(entity).ok()?.0;
+    if fields.object_type_mask().unwrap_or(0) & 0x20 == 0 || fields.gameobject_flags() & 0x8 == 0 {
+        return None;
+    }
+    Some(wire_in::SelfSeat {
+        entity,
+        guid: rider.transport_guid,
+        local_pos: rider.local_pos,
+        local_orientation: rider.local_orientation,
+        deck: *q.2.get(entity).ok()?,
+    })
 }

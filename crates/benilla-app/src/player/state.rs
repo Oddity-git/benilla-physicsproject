@@ -285,6 +285,30 @@ pub(crate) fn incapacitated_flags(flags: u32, translate_gated: bool, turn_gated:
     out
 }
 
+/// The local player's own control, the reference's `[0xb4b3e4]` cleared (`0x4958e0`): written by
+/// `0x5fa600` only when the named unit is our own character (`0x5fa6d0`), so a possessed
+/// creature's loss ([`Player::control_lost`] on a released guid) never reaches it. The item and
+/// cursor gates, StartAttack, `HasFullControl` and `PLAYER_CONTROL_LOST` read this one. A resource
+/// of its own, so its many readers do not order against every other writer of [`Player`].
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnControlLost(pub(crate) bool);
+
+/// A stand state committed locally, sent or from `SMSG_STANDSTATE_UPDATE`, whose echo into
+/// `UNIT_FIELD_BYTES_1` has not landed: the reference's predicted cache `[player+0x1d68]`
+/// (`0x5f0790`). A resource of its own, so a script call's stand change writes it inside the call
+/// while the call host's other readers of [`Player`] read on.
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StandPending(pub(super) Option<u8>);
+
+impl StandPending {
+    /// `CGPlayer_C::GetStandState` (`0x5ed570`) for the active player: the local state
+    /// `[player+0x1d68]`, a committed change ahead of its echo, else `descriptor`, the
+    /// `UNIT_FIELD_BYTES_1` byte 0 it tracks.
+    pub(crate) fn stand_state(&self, descriptor: u8) -> u8 {
+        self.0.unwrap_or(descriptor)
+    }
+}
+
 /// Our avatar: until `active` the camera free-flies, then we drive the body the server placed.
 /// `PartialEq` serves the test that the session end resets the whole of it to `Player::default()`.
 #[derive(Resource, Default, PartialEq)]
@@ -312,11 +336,6 @@ pub(crate) struct Player {
     /// standing. The reference zeroes its mover; vmangos neither roots a charmed player nor refuses
     /// its movement, so nothing else holds the body. Unlike a root, it stops turning too.
     pub(crate) control_lost: bool,
-    /// The local player's own control, the reference's `[0xb4b3e4]` cleared (`0x4958e0`): written
-    /// by `0x5fa600` only when the named unit is our own character (`0x5fa6d0`), so a possessed
-    /// creature's loss ([`Self::control_lost`] on a released guid) never reaches it. The item and
-    /// cursor gates, `HasFullControl` and `PLAYER_CONTROL_LOST` read this one.
-    pub(crate) own_control_lost: bool,
     /// The unit we drive in place of our body (a mind-controlled creature, Eye of Kilrogg), `None`
     /// for our own. Our body must then send nothing: outbound `MSG_MOVE_*` carry no guid, so the
     /// server applies them to whatever we last claimed.
@@ -335,18 +354,14 @@ pub(crate) struct Player {
     /// The movement flags we last streamed; this frame's are diffed against them to emit a
     /// `MSG_MOVE_*` per axis transition.
     pub(super) move_flags: u32,
-    /// Last frame's facing: any change off the turn axis streams `MSG_MOVE_SET_FACING`, moving or
-    /// not (the reference's detector `0x617170`, exact equality).
+    /// Last frame's facing: a change off the turn axis is a mouse turn's facing set (`0x619860`,
+    /// drained at `0x615fae`-`0x615fc6`), which offers `MSG_MOVE_SET_FACING` to the throttled send.
     pub(super) last_facing: f32,
     /// The exact position floats we last sent (WoW coords). vmangos interrupts a cast on any change
     /// to its stored position (`Player.cpp:6092`), so the resolver's tiny settle after a reported
     /// rest is sent on its own ([`super::movement_net::stream_self_movement`]) before the next
     /// facing change can carry it as a move.
     pub(super) last_pos: [f32; 3],
-    /// A stand state committed locally, sent or from `SMSG_STANDSTATE_UPDATE`, whose echo into
-    /// `UNIT_FIELD_BYTES_1` has not landed: the reference's predicted cache `[player+0x1d68]`
-    /// (`0x6127b0`).
-    pub(super) stand_pending: Option<u8>,
     /// Holding the body still, gravity off, after a teleport, summon or login until the
     /// destination's colliders stream in. Released by the terrain streamer on residency or at
     /// [`SETTLE_TIMEOUT`], never by ground contact, which a flyer or a swimmer never makes.
@@ -360,6 +375,13 @@ pub(crate) struct Player {
     /// before the streamer swaps maps. Set at every snap, cleared once the destination is resident;
     /// while set, the streamer judges no release and pushes [`Player::settle_deadline`] on.
     pub(crate) world_stale: bool,
+    /// The snap moved the body the camera follows more than 30 yards, which the reference answers
+    /// by reloading the destination before the frame goes on (`0x617e90` calls `0x630bd0` for
+    /// `d² > 900`): the frame is held until the settle hold ends ([`Self::holds_the_frame`]).
+    pub(crate) world_reload: bool,
+    /// When the reload hold gives up (`Time::elapsed_secs`): the stall budget from its snap, never
+    /// extended, as the reference's wait-all ends once every read has, failed or not (`0x443d30`).
+    pub(crate) reload_ceiling: f32,
     /// The camera pitch the login seize seats: the saved pose's `cameraPitch` when
     /// [`super::camera_saved`] restored one, else the stock opening pitch.
     pub(super) login_pitch: Option<f32>,
@@ -446,10 +468,24 @@ pub(crate) struct Player {
     /// swim test), and it holds when unsteered; only stop-swim and teleport zero it (`0x7c6e80`).
     /// Swimming reads it for travel, pose and the wire; on land, water walking does (`0x63161e`).
     pub(super) mover_pitch: f32,
-    /// The camera pitch the last pitch push carried: the reference pushes only on mouse motion
-    /// (`0x514400`), so a push here needs the aim to differ, and a still mouse leaves the drunk
-    /// wobble and the stop-swim levelling (`0x7c6e80`) in place.
-    pub(super) aim_pitch_seen: f32,
+    /// A mouse-look hand-off set the pitch this frame ([`super::swim::hand_off_pitch`]): the
+    /// drained set (`0x615bc0`) offers `MSG_MOVE_SET_PITCH` to the send, which takes it only
+    /// under its throttle ([`super::movement_net::stream_self_movement`]).
+    pub(super) set_pitch_due: bool,
+    /// The facing and pitch the last built move message carried, `[unit+0xc70]` and
+    /// `[unit+0xc74]`: `0x600a30` copies the facing on every build and the pitch only while
+    /// swimming (`0x600a5d`-`0x600a72`), for the facing and pitch sends' throttle (`0x60e1f0`).
+    pub(super) sent_facing: f32,
+    pub(super) sent_pitch: f32,
+    /// The mover's pitch-key bits, `CMovement+0x40` `0x40` (up, `true`) or `0x80`: set by the
+    /// pitch starts only while swimming (`0x7c6df0`), cleared by the stop (`0x7c6e30`), StopSwim
+    /// (`0x7c6e80`), `SetPitch` (`0x7c6f70`), `SetRoot` (`0x7c7340`) and a teleport (`0x7c69a0`).
+    /// [`super::swim::integrate_pitch_keys`] turns them into pitch.
+    pub(super) pitch_keys: Option<bool>,
+    /// `[InputControl+4] & 0x80000`, the pitch emitter's latch (`0x515059`, `0x515078`).
+    pub(super) pitch_latch: bool,
+    /// The pitch send the emitter queued this frame (tags 0xb, 0xc, 0xd), for the move stream.
+    pub(super) pitch_send: Option<crate::net::MoveKind>,
     /// This frame's flag-derived swim speed (yd/s), 0 without swim input: the stroke's playback
     /// numerator, as `0x5fe2f0` divides `GetCurrentSpeed` by the clip's speed. Stale on land.
     pub(super) swim_stroke_speed: f32,
@@ -484,6 +520,10 @@ pub(super) struct PlayerRide {
     /// The transport's yaw at the snapshot: the carry turns `face_yaw` by its per-frame delta, and
     /// the wire's local orientation is `face_yaw − boat_yaw`.
     pub(super) boat_yaw: f32,
+    /// The transport has been placed since the ride began. A ride seated from our own create
+    /// (`0x618b30`) can name a transport whose path is not built yet; the carry holds it until
+    /// the transport ticks, where it drops a ride whose transport has gone.
+    pub(super) placed: bool,
 }
 
 /// A knockback aimed at our mover (`SMSG_MOVE_KNOCK_BACK`), latched until the mover flies it. The
@@ -502,6 +542,21 @@ pub(super) struct PendingKnockback {
 
 impl Player {
     /// A player whose last streamed movement word is `flags`, for the gates that read it.
+    /// Riding `entity`, placed on its deck at its origin, for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn riding_for_test(entity: Entity, guid: u64) -> Self {
+        Self {
+            ride: Some(PlayerRide {
+                entity,
+                guid,
+                local_pos: Vec3::ZERO,
+                boat_yaw: 0.0,
+                placed: true,
+            }),
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_move_flags(flags: u32) -> Self {
         Self {
@@ -531,13 +586,11 @@ impl Player {
         self.face_yaw += radians;
     }
 
-    /// Set the mover pitch, the scripted dive (`capture::probe_pitch`), under `SetPitch`'s ±89°
-    /// clamp (`0x7c6f70`) but without its 2^-20 deadband (`[0x8026bc]`); returns the value stored.
+    /// Set the mover pitch, the scripted dive (`capture::probe_pitch`), under the mouse-look
+    /// hand-off's ±89° clamp (`0x5103e0`) but without `SetPitch`'s 2^-20 deadband (`[0x8026bc]`);
+    /// returns the value stored.
     pub(crate) fn aim_pitch(&mut self, radians: f32) -> f32 {
         self.mover_pitch = radians.clamp(-MOUSELOOK_PITCH_CLAMP, MOUSELOOK_PITCH_CLAMP);
-        // Mouse-look pushes on a camera-pitch edge; parking the edge here keeps a still camera
-        // from overwriting the script next frame.
-        self.aim_pitch_seen = self.mover_pitch;
         self.mover_pitch
     }
 
@@ -551,8 +604,15 @@ impl Player {
     /// [`SETTLE_TIMEOUT`] fired first, which the `sett` trace records.
     pub(crate) fn end_settle(&mut self, resident: bool, now: f32) {
         self.settling = false;
+        self.world_reload = false;
         let waited = now - self.settle_since;
         super::move_trace::settle(resident, waited, self.pos);
+    }
+
+    /// The window keeps its last presented frame: a reloading snap's settle hold is up, as the
+    /// reference's reload holds its frame until the destination is in (`0x694920`).
+    pub(crate) fn holds_the_frame(&self) -> bool {
+        self.active && self.settling && self.world_reload
     }
 
     /// The movement flags as last streamed; the water foam tests `& 0xf` (translating) and `& 0x30`
@@ -637,16 +697,33 @@ pub(super) fn autorun_cancelled(
     fwd_down || back_down || both_engaged || lost_mover
 }
 
+/// What `SetStandState` (`0x5ed430`) reads of the unit ahead of the movement word: each refuses
+/// any change, standing up included, with no packet, no apply and no message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct StandGates {
+    /// `UNIT_FIELD_MOUNTDISPLAYID` above 0 (`0x5ed487`).
+    pub(super) mounted: bool,
+    /// [`super::UNIT_FLAG_TAXI_FLIGHT`] (`0x5ed497`).
+    pub(super) on_taxi: bool,
+    /// Health at or below 0 (`0x5ed4a9`) or `UNIT_DYNAMIC_FLAGS & 0x20`, a feigner (`0x5ed4b2`).
+    pub(super) reads_dead: bool,
+    /// `UNIT_CHANNEL_SPELL` set (`0x5ed440`).
+    pub(super) channelling: bool,
+    /// A precast spell: `[+0xd58] & 0x400` (`0x5ed44b`) and `[+0xc8c]` (`0x5ed4cc`), which
+    /// `0x60d020` sets together.
+    pub(super) precast: bool,
+}
+
 /// Whether the reference's `SetStandState` (`0x5ed430`) refuses this change, returning before the
-/// packet is built. A body that reads dead is refused either way; otherwise standing up never is,
-/// and any other state is refused while translating or swimming (`0x20000f`, `0x5ed4f8`), SLEEP
-/// also while turning (`0x5ed4e6`, which falls through into that test). FALLING is in neither
-/// mask. It is the one setter, so the X key, the posture emotes and the AFK sit all go through it.
-pub(super) fn stand_state_refused(reads_dead: bool, move_flags: u32, new_state: u8) -> bool {
+/// packet is built. A unit [`StandGates`] names is refused either way; otherwise standing up never
+/// is, and any other state is refused while translating or swimming (`0x20000f`, `0x5ed4f8`),
+/// SLEEP also while turning (`0x5ed4e6`, which falls through into that test). FALLING is in
+/// neither mask. It is the one setter, so the X key, the posture emotes and the AFK sit all go
+/// through it.
+pub(super) fn stand_state_refused(unit: StandGates, move_flags: u32, new_state: u8) -> bool {
     use crate::creature_anim::move_flags as f;
-    // Health <= 0 (`0x5ed4ac`) or `UNIT_DYNAMIC_FLAGS & 0x20`, a feigner (`0x5ed4b2`), refuses in
-    // both directions, so it comes before the stand-up exit.
-    if reads_dead {
+    // The unit's tests refuse in both directions, so they come before the stand-up exit.
+    if unit.mounted || unit.on_taxi || unit.reads_dead || unit.channelling || unit.precast {
         return true;
     }
     // Standing up skips the movement word (`0x5ed4f0`).
@@ -662,71 +739,127 @@ pub(super) fn stand_state_refused(reads_dead: bool, move_flags: u32, new_state: 
 
 #[cfg(test)]
 mod stand_state_tests {
-    use super::stand_state_refused;
+    use super::{stand_state_refused, StandGates};
     use crate::creature_anim::move_flags as f;
+
+    const ALIVE: StandGates = StandGates {
+        mounted: false,
+        on_taxi: false,
+        reads_dead: false,
+        channelling: false,
+        precast: false,
+    };
+    const DEAD: StandGates = StandGates {
+        reads_dead: true,
+        ..ALIVE
+    };
 
     #[test]
     fn a_body_that_reads_dead_can_neither_sit_nor_stand() {
         for state in [0u8, 1, 2, 3, 8] {
             assert!(
-                stand_state_refused(true, 0, state),
+                stand_state_refused(DEAD, 0, state),
                 "stand state {state} refused on a body that reads dead — standing up included, \
                  which is the one case the movement-word gate below would have let through"
             );
         }
         assert!(
-            !stand_state_refused(false, 0, 1),
+            !stand_state_refused(ALIVE, 0, 1),
             "and the same still body, alive, is granted its sit — the guard is the death, not the \
              standing still"
         );
+    }
+
+    /// `0x5ed430`'s other unit tests ahead of the movement word: mounted (`0x5ed487`), on a taxi
+    /// (`0x5ed497`), channelling (`0x5ed440`) and a precast spell (`0x5ed44b`, `0x5ed4cc`) each
+    /// refuse a sit and a stand alike, on a still body.
+    #[test]
+    fn a_mounted_flying_or_casting_body_can_neither_sit_nor_stand() {
+        for (what, unit) in [
+            (
+                "mounted",
+                StandGates {
+                    mounted: true,
+                    ..ALIVE
+                },
+            ),
+            (
+                "on a taxi",
+                StandGates {
+                    on_taxi: true,
+                    ..ALIVE
+                },
+            ),
+            (
+                "channelling",
+                StandGates {
+                    channelling: true,
+                    ..ALIVE
+                },
+            ),
+            (
+                "holding a precast spell",
+                StandGates {
+                    precast: true,
+                    ..ALIVE
+                },
+            ),
+        ] {
+            for state in [0u8, 1, 3, 8] {
+                assert!(
+                    stand_state_refused(unit, 0, state),
+                    "stand state {state} refused while {what}"
+                );
+            }
+        }
     }
 
     #[test]
     fn a_swimmer_cannot_sit_but_can_always_stand() {
         // Floating still: SWIMMING alone refuses.
         assert!(
-            stand_state_refused(false, f::SWIMMING, 1),
+            stand_state_refused(ALIVE, f::SWIMMING, 1),
             "sit refused mid-swim"
         );
         assert!(
-            stand_state_refused(false, f::SWIMMING | f::FORWARD, 1),
+            stand_state_refused(ALIVE, f::SWIMMING | f::FORWARD, 1),
             "swimming forward too"
         );
         // SIT, SIT_CHAIR and KNEEL.
         for state in [1u8, 2, 8] {
             assert!(
-                stand_state_refused(false, f::SWIMMING, state),
+                stand_state_refused(ALIVE, f::SWIMMING, state),
                 "state {state} refused mid-swim"
             );
         }
         // Standing up (0) skips the word.
-        assert!(!stand_state_refused(false, f::SWIMMING | f::FORWARD, 0));
-        assert!(!stand_state_refused(false, f::ANY_MOVE | f::SWIMMING, 0));
+        assert!(!stand_state_refused(ALIVE, f::SWIMMING | f::FORWARD, 0));
+        assert!(!stand_state_refused(ALIVE, f::ANY_MOVE | f::SWIMMING, 0));
     }
 
     /// The turn bits are outside `0x20000f`.
     #[test]
     fn sitting_is_refused_while_translating_and_allowed_while_merely_turning() {
         assert!(
-            !stand_state_refused(false, 0, 1),
+            !stand_state_refused(ALIVE, 0, 1),
             "standing still: sit granted"
         );
         for bit in [f::FORWARD, f::BACKWARD, f::STRAFE_LEFT, f::STRAFE_RIGHT] {
             assert!(
-                stand_state_refused(false, bit, 1),
+                stand_state_refused(ALIVE, bit, 1),
                 "translating: sit refused"
             );
         }
         for bit in [f::TURN_LEFT, f::TURN_RIGHT] {
             assert!(
-                !stand_state_refused(false, bit, 1),
+                !stand_state_refused(ALIVE, bit, 1),
                 "turning in place: sit granted"
             );
         }
         // Mode bits are not movement.
         for bit in [f::ROOT, f::WATER_WALKING, f::FALLING, f::WALK_MODE] {
             assert!(
-                !stand_state_refused(false, bit, 1),
+                !stand_state_refused(ALIVE, bit, 1),
                 "mode bit {bit:#x} is not a move"
             );
         }
@@ -737,21 +870,21 @@ mod stand_state_tests {
     fn sleep_takes_both_tests_so_it_is_the_strictest_posture() {
         // The turn test is SLEEP's alone.
         assert!(
-            stand_state_refused(false, f::TURN_LEFT, 3),
+            stand_state_refused(ALIVE, f::TURN_LEFT, 3),
             "turning: /sleep refused"
         );
-        assert!(stand_state_refused(false, f::TURN_RIGHT, 3));
+        assert!(stand_state_refused(ALIVE, f::TURN_RIGHT, 3));
         assert!(
-            !stand_state_refused(false, f::TURN_LEFT, 1),
+            !stand_state_refused(ALIVE, f::TURN_LEFT, 1),
             "turning blocks ONLY the sleep — a sit is granted"
         );
         // The shared test it falls into.
         assert!(
-            stand_state_refused(false, f::SWIMMING, 3),
+            stand_state_refused(ALIVE, f::SWIMMING, 3),
             "swimming: /sleep refused"
         );
         assert!(
-            stand_state_refused(false, f::FORWARD, 3),
+            stand_state_refused(ALIVE, f::FORWARD, 3),
             "walking: /sleep refused"
         );
         // SLEEP's effective mask is the one-shot route's `0x20003f`.
@@ -761,10 +894,10 @@ mod stand_state_tests {
             "`0x20003f`, byte-verified at 0x5fe6dc as well as 0x5ed4e6+0x5ed4f8"
         );
         // Standing up from SLEEP is still ungated.
-        assert!(!stand_state_refused(false, f::ROUTE_COMMITTED_MOVE, 0));
+        assert!(!stand_state_refused(ALIVE, f::ROUTE_COMMITTED_MOVE, 0));
         // FALLING is in neither mask.
         assert!(
-            !stand_state_refused(false, f::FALLING, 3),
+            !stand_state_refused(ALIVE, f::FALLING, 3),
             "falling: /sleep granted"
         );
     }

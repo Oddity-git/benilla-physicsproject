@@ -64,9 +64,11 @@ fn merchant_compare_renders_the_compare_shape_and_no_hover_seats_a_plate() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,
@@ -92,12 +94,13 @@ fn merchant_compare_renders_the_compare_shape_and_no_hover_seats_a_plate() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 4,
             slots,
         }),
@@ -253,7 +256,12 @@ fn set_inventory_item_name_only_is_the_trimmed_build() {
             armor: 100,
             max_durability: 90,
             required_level: 40,
-            spell_triggers: vec![(1, 100, "Zap".into())],
+            spell_lines: vec![ItemSpellLine {
+                trigger: 1,
+                spell_id: 100,
+                text: "Zap".into(),
+                ..Default::default()
+            }],
             description: "Sealed.".into(),
             ..Default::default()
         },
@@ -437,6 +445,8 @@ fn ts_recipe(spell_id: u32, name: &str, group: (u32, u32, &str)) -> TradeSkillRe
             have: 1,
         }],
         tools: vec![],
+        icon_pending: None,
+        tools_pending: Vec::new(),
     }
 }
 
@@ -695,11 +705,20 @@ fn item_bindings_return_the_pushed_repair_cost() {
         ..Default::default()
     });
     s.set_inventory_slots(inv.clone());
-    s.set_inspect(Some(InspectView {
-        unit: "target".into(),
-        guid: 0x42,
-        slots: inv,
-    }));
+    // A cooperative player 4 yards off, whose visible items `"target"` reads (`0x53306a`).
+    s.set_visible_equipment(0x42, Some(inv));
+    s.set_unit_guids(&UnitGuids {
+        target: 0x42,
+        held: HashMap::from([(0x42, 0)]),
+        ..Default::default()
+    });
+    s.set_unit_reach(HashMap::from([(
+        0x42,
+        UnitReach {
+            dist_sq: 16.0,
+            inspectable: true,
+        },
+    )]));
     let mut slots = HashMap::new();
     for (slot, id, name) in [(1, 8201, "Worn Helm"), (2, 8202, "Whole Helm")] {
         slots.insert(
@@ -752,6 +771,19 @@ fn item_bindings_return_the_pushed_repair_cost() {
     costs.bags.insert((0, 1), 567);
     costs.bags.insert((-1, 3), 89);
     s.set_repair_costs(costs);
+    // The vault's slots read empty with no banker open (`0x53314e`, `0x5347ae` into `0x6228a0`).
+    s.run(
+        r#"
+        local tt = CreateFrame("GameTooltip", "TT0", nil, "TestTooltipTemplate")
+        tt:SetOwner(UIParent or CreateFrame("Frame"), "ANCHOR_NONE")
+        local _, _, vault = tt:SetInventoryItem("player", 42)
+        assert(vault == 0, "no banker: vault slot 3 by live id 42 costs nothing: " .. tostring(vault))
+        local _, vault_bag = tt:SetBagItem(-1, 3)
+        assert(vault_bag == nil, "no banker: vault slot 3 as a bag: " .. tostring(vault_bag))
+    "#,
+    )
+    .unwrap();
+    s.set_bank(Some(crate::script::BankState::default()));
     s.run(
         r#"
         local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0)
@@ -799,7 +831,7 @@ fn locked_is_drawn_for_a_locked_object_and_sets_the_builder_flag() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 24,
             slots: HashMap::from([(1, slot(0)), (2, slot(0x4))]),
         }),
@@ -846,6 +878,8 @@ fn locked_is_drawn_for_a_locked_object_and_sets_the_builder_flag() {
 #[test]
 fn bank_vault_items_keep_their_flags_and_expiry() {
     let mut s = script();
+    // The bank bands read through `GetItemInSlot`, open only at a banker.
+    s.set_bank(Some(crate::script::BankState::default()));
     s.set_screen_size(800.0, 600.0);
     s.run("ITEM_DURATION_HOURS = '[DURATION %d h]' LOCKED = '[LOCKED]'")
         .unwrap();
@@ -941,7 +975,7 @@ fn item_bindings_push_has_cooldown_as_one_or_nil() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 24,
             slots: HashMap::from([
                 (1, slot(Some((1000, 30_000, true)), None)),

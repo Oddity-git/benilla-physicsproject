@@ -286,6 +286,7 @@ fn run_effects(
                 entity: unit,
                 spell_id: BURN_KEY,
                 class: FxClass::AuraState,
+                force: true,
             });
         }
         if over || !on {

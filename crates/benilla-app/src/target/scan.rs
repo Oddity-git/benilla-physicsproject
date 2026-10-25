@@ -6,24 +6,24 @@
 //! press skips recently tabbed guids; a fighting-me bonus, not Classic's hard combat lock, ranks
 //! attackers first without pinning TAB to them.
 //!
-//! Kept from 1.12: the validity filters (`0x493e40`, [`can_attack`] `0x606980`, critters), the
-//! [`commit`] through `SetSelection` (`0x493540`), the attack acquire (`0x612df0` at `0x6130b5`),
-//! the ATTACKERSTATEUPDATE acquire (`0x6259c9`–`0x6259fe`) and the 41 yd range.
+//! Kept from 1.12: the validity filters (`0x493e40`, `CanAttack 0x606980`, critters), the
+//! [`commit_owing`] through `SetSelection` (`0x493540`), the attack acquire (`0x612df0` at `0x6130b5`),
+//! the ATTACKERSTATEUPDATE and spell start acquires (`0x6259c9`–`0x6259fe`, `0x6e7963`-`0x6e799c`)
+//! and the 41 yd range.
 
 use benilla_formats::CreatureTypeTable;
 use benilla_protocol::{guid, EntityKind};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
-use crate::creature_anim::{Engaged, SwingMessage};
+use crate::creature_anim::{StartTarget, SwingMessage};
 use crate::names::NameCache;
-use crate::net::{ClientCommand, Guid, GuidIndex, NetEntity, ObjectStore, Reputations, SelfPlayer};
+use crate::net::{ClientCommand, Guid, GuidIndex, NetEntity, ObjectStore, SelfPlayer};
 use crate::query_cache::Ask;
 use benilla_assets::{LockRecover, WorldAssets};
 
-use super::relations::{can_assist, can_attack, Assist};
-use super::ring::reaction_from_player;
-use super::{Factions, Selection};
+use super::relations::{RelUnit, RelationWorld, Relations};
+use super::Selection;
 
 // == The Classic-priority dials ==
 // Each names the Classic Era cvar it stands in for; the values are tuned.
@@ -226,8 +226,8 @@ pub(crate) struct TargetScan<'w, 's> {
         (&'static Camera, &'static Transform),
         (With<benilla_world::view::WorldCamera>, Without<SelfPlayer>),
     >,
-    factions: Option<Res<'w, Factions>>,
-    reputations: Res<'w, Reputations>,
+    /// The relation functions' inputs, `CanAttack`'s and `CanAssist`'s.
+    relations: RelationWorld<'w, 's>,
     names: Res<'w, NameCache>,
     creature_types: Option<Res<'w, CreatureTypes>>,
     /// Every store, ours included: `CanAssist`'s owner chase must reach our body.
@@ -240,36 +240,21 @@ pub(crate) struct TargetScan<'w, 's> {
 
 impl TargetScan<'_, '_> {
     /// The per-candidate filter (`0x493e40`), the one place [`ScanSide`] forks.
-    fn is_valid(
-        &self,
-        side: ScanSide,
-        guid: u64,
-        store: Option<&ObjectStore>,
-        self_store: Option<&ObjectStore>,
-    ) -> bool {
+    fn is_valid(&self, side: ScanSide, guid: u64, store: Option<&ObjectStore>) -> bool {
+        let rel = self.relations.get();
+        let pair = self.pair(guid, store);
         match side {
             // Mode 1 (`0x493e73`): the reads-dead triple `0x605f90`, then `CanAttack`.
             ScanSide::Enemy => {
                 if store.is_some_and(|s| s.0.unit_reads_dead()) {
                     return false;
                 }
-                can_attack(
-                    store,
-                    self.factions.as_deref(),
-                    &self.reputations,
-                    self_store,
-                )
+                pair.is_some_and(|(me, unit)| rel.can_attack(&me, &unit))
             }
             // Mode 2 (`0x493eca`): `CanAssist 0x6066f0`, then raw health (no reads-dead triple).
             ScanSide::Friend => {
-                can_assist(
-                    store,
-                    self.factions.as_deref(),
-                    &self.reputations,
-                    self_store,
-                    |owner| self.store_of(owner).cloned(),
-                    Assist::PlayerToUnit,
-                ) && !store.is_some_and(|s| s.0.unit_is_dead())
+                pair.is_some_and(|(me, unit)| rel.can_assist(&me, &unit))
+                    && !store.is_some_and(|s| s.0.unit_is_dead())
             }
             // Modes 3 and 4 open on `cmp esi,ecx`, the candidate is not us, which our own body's
             // absence from [`Self::units`] already gives.
@@ -284,7 +269,12 @@ impl TargetScan<'_, '_> {
         }
     }
 
-    /// A guid's descriptor, whichever entity holds it: `CanAssist`'s owner chase.
+    /// The active player and the unit `guid` names off `store`, the scan's two relation sides.
+    fn pair(&self, guid: u64, store: Option<&ObjectStore>) -> Option<(RelUnit, RelUnit)> {
+        Some((self.relations.me()?, self.relations.unit_of(guid, store?)))
+    }
+
+    /// A guid's descriptor, whichever entity holds it.
     fn store_of(&self, guid: u64) -> Option<&ObjectStore> {
         let entity = *self.index.as_ref()?.0.get(&guid)?;
         self.stores.get(entity).ok()
@@ -308,7 +298,7 @@ impl TargetScan<'_, '_> {
 
     /// Filter, project, score and sort every known unit, fresh each press.
     fn build(&self, side: ScanSide) -> Vec<Candidate> {
-        let Ok((self_tf, self_store, self_guid)) = self.self_q.single() else {
+        let Ok((self_tf, _, self_guid)) = self.self_q.single() else {
             return Vec::new();
         };
         let me = self_guid.map(|g| g.0);
@@ -347,7 +337,7 @@ impl TargetScan<'_, '_> {
             if !matches!(net.kind, EntityKind::Unit | EntityKind::Player) {
                 continue;
             }
-            if !self.is_valid(side, guid_c.0, store, self_store) {
+            if !self.is_valid(side, guid_c.0, store) {
                 trace_unit(
                     guid_c.0,
                     tf,
@@ -453,72 +443,227 @@ impl TabHistory {
     }
 }
 
-/// What one [`commit`] did; `swung` means it already sent `CMSG_ATTACKSWING`, so a caller must not.
+/// What one [`commit_owing`] did; `swung` means it ran the re-swing (`0x4938c8`), so a caller must not ask
+/// again. StartAttack's own gate may have refused it ([`crate::creature_anim::StartGate`]), and the
+/// caller's would refuse alike: `swung` says it was asked, not that `CMSG_ATTACKSWING` went out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct CommitOutcome {
     pub(super) changed: bool,
     pub(super) swung: bool,
 }
 
+/// The `CMSG_SET_SELECTION` a selection's teardown owes when it called a possessed unit off
+/// (`0x493a18`): `PetStopAttack` signals `PET_BAR_UPDATE` (`0x4bd6b4`) with the pair zeroed
+/// (`0x4939d3`), and its listeners run before the store (`0x4936e2`) and the send (`0x493871`), or
+/// a clear's send (`0x493a2a`).
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwedSend {
+    /// A switch to `guid`, whose object is `entity`.
+    Select { entity: Option<Entity>, guid: u64 },
+    /// A clear, whose send names the selection as the listeners left it.
+    Deselect,
+}
+
+impl OwedSend {
+    /// The store and the light (`0x4936e2`, `0x493701`), over whatever a listener selected, the
+    /// lit unit's tutorial ladder (`0x493789`-`0x49383c`, [`crate::tutorial::select_tutorial`]),
+    /// and the send.
+    pub(crate) fn pay(self, selection: &mut Selection, seam: &crate::creature_anim::AttackSeam) {
+        let guid = match self {
+            OwedSend::Select { entity, guid } => {
+                selection.target = entity;
+                selection.guid = Some(guid);
+                selection.lit = entity;
+                if let (Some(entity), Some(tutorials)) = (entity, seam.slots.tutorials()) {
+                    tutorials.selected(entity, guid);
+                }
+                guid
+            }
+            // The clear's send reads the selection as it stands (`0x493a49`-`0x493a4f`): a
+            // listener's pick, or none.
+            OwedSend::Deselect => selection.guid.unwrap_or(0),
+        };
+        let _ = seam.net.0.send(ClientCommand::SetSelection { guid });
+    }
+}
+
+/// What a [`commit_owing`] owes after its signals, for a caller that runs their listeners in place
+/// first: the send after the teardown's `PET_BAR_UPDATE`, then the re-swing after
+/// `PLAYER_TARGET_CHANGED`.
+#[must_use]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Owed {
+    pub(crate) send: Option<OwedSend>,
+    pub(crate) swing: Option<OwedSwing>,
+}
+
+impl Owed {
+    /// Pay both now, for a writer whose signals have no listeners to run first.
+    pub(crate) fn pay(
+        self,
+        selection: &mut Selection,
+        seam: &mut crate::creature_anim::AttackSeam,
+    ) {
+        if let Some(send) = self.send {
+            send.pay(selection, seam);
+        }
+        if let Some(swing) = self.swing {
+            // Nothing ran since the commit, so the selection is the guid it stored.
+            swing.pay(selection, seam, StartTarget::Unheld);
+        }
+    }
+}
+
+/// The re-swing a [`commit_owing`] owes (`0x4938a1`-`0x4938c8`), paid after `SetSelection`'s
+/// `PLAYER_TARGET_CHANGED` (`0x49389c`), whose listeners run first.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwedSwing {
+    /// The guid the commit selected.
+    guid: u64,
+    /// What `StartAttack`'s target checks find of it (`0x5ecbe6`-`0x5ecc35`).
+    verdict: StartTarget,
+    self_guid: Option<u64>,
+}
+
+impl OwedSwing {
+    /// The re-swing: `StartAttack` at the selection as it stands now, since `0x4938c3` pushes the
+    /// selection's address, `0xb4e2d8`, which a listener of the signal may have moved. Our own
+    /// guid gets none (`0x4938ae`-`0x4938c1`), nothing selected finds no unit (`0x5ecbef`), and a
+    /// unit a listener selected is judged `now`. The swing goes out despite the lock, the stop
+    /// just set `[+0xc54]` (`0x5eccda`); a refused target stops again (`0x5ecc48`).
+    pub(crate) fn pay(
+        self,
+        selection: &Selection,
+        seam: &mut crate::creature_anim::AttackSeam,
+        now: StartTarget,
+    ) {
+        let Some(guid) = selection.guid else {
+            return;
+        };
+        if self.self_guid == Some(guid) {
+            return;
+        }
+        let verdict = if guid == self.guid { self.verdict } else { now };
+        seam.start(guid, verdict);
+    }
+}
+
 /// Commit a target through `SetSelection` (`0x493540`). A switch while attacking is stop, select,
 /// re-swing: StopAttack `0x5ecac0` (`0x493a08`) flags a stop in flight (`[player+0xc54]`),
 /// `CMSG_SET_SELECTION` goes out (`0x493857`), then unless the new target is us `Attack 0x5ecb70`
-/// swings past its already-attacking gate, or stops if `new_attackable` is false (`0x4938a1`).
-///
-/// The latch (`0x493637`) reduces to `engaged && had_old`: vmangos ends [`Engaged`] when the
-/// victim dies, before a TAB can land, so the old target's own legs change nothing seen.
-/// `engaged` is the server's echo, a round trip behind the reference's local lock, and the
-/// reference's second `CMSG_ATTACKSTOP` for an invalid new target is not sent here.
-pub(super) fn commit(
+/// swings past its already-attacking gate, or stops again if `new_attackable` is false
+/// (`0x4938a1`, `0x5ecc48`).
+/// `entity` is the guid's object, which the select lights (`0x493701`); with none the guid is
+/// stored all the same (`0x4935c8` → `0x493605`), and neither `IsSelectable` nor the light runs.
+/// Whether we are attacking is [`crate::creature_anim::Engaged`] as the queued unit edits leave it
+/// ([`crate::creature_anim::AttackSeam::engaged`]), which StartAttack's send sets locally
+/// (`[+0xc48]`, `[+0xc50]` = 1, `0x5ecd51` → `0x47bf70`) and the stop's echo clears (`0x624e40`).
+/// It owes what follows its signals ([`Owed`]), for a caller that runs their listeners in place
+/// before paying it. `old_latches` is [`latches_on`] the selection as it stands, which a
+/// selection made at another's signal finds to be that one's pick.
+pub(super) fn commit_owing(
     selection: &mut Selection,
     seam: &mut crate::creature_anim::AttackSeam,
-    entity: Entity,
+    entity: Option<Entity>,
     guid: u64,
     target_store: Option<&ObjectStore>,
-    engaged: bool,
     self_guid: Option<u64>,
     new_attackable: bool,
-) -> CommitOutcome {
+    old_latches: bool,
+) -> (CommitOutcome, Owed) {
     // `SelectTarget`'s charmed return (`0x49359c`) is ahead of everything, for every writer.
     if seam.player_is_charmed() {
-        return CommitOutcome::default();
+        return Default::default();
     }
     // `IsSelectable`, before the dedup (`0x4935ec`–`0x4935f3`): a non-selectable unit is a complete
     // no-op that keeps the current target, for every selection writer.
     if !super::relations::is_selectable(target_store, self_guid) {
-        return CommitOutcome::default();
+        return Default::default();
     }
     if selection.guid == Some(guid) {
-        return CommitOutcome::default(); // the setter's dedup
+        return Default::default(); // the setter's dedup
     }
-    let had_old = selection.guid.is_some();
+    let old = selection.guid;
+    let had_old = old.is_some();
     // The last-target stamp (`0x49361d`-`0x493628`), past the two early outs.
     selection.last = selection.guid;
     if let Some(old) = selection.guid {
         // The old target's teardown (`0x4936cc` → `0x493910`) closes its loot first.
         seam.close_loot_on(old);
     }
-    selection.target = Some(entity);
-    selection.guid = Some(guid);
-    let stop_and_repoint = engaged && had_old;
+    // The latch's `0x60ecb0` leg, read before the store (`0x49367d`).
+    let stop_and_repoint = seam.engaged() && had_old;
     if stop_and_repoint {
         // `0x493a08`: the real StopAttack, which also un-queues a next-swing strike (`0x6e6f30`).
-        seam.stop(engaged);
+        seam.stop();
     }
-    let _ = seam.net.0.send(ClientCommand::SetSelection { guid });
-    let swung = stop_and_repoint && new_attackable && self_guid != Some(guid);
-    if swung {
-        // `0x4938c8`: the swing goes out despite the lock, and cancels auto-repeat (`0x6ea080`).
-        seam.start(guid, engaged, true);
-    }
-    CommitOutcome {
-        changed: true,
-        swung,
-    }
+    // `0x493a0f`-`0x493a18`: the release calls a possessed unit off after its StopAttack, with the
+    // pair zeroed (`0x4939d3`); the store and the send wait for its signal's listeners.
+    let called_off = had_old && seam.call_pet_off();
+    let send = OwedSend::Select { entity, guid };
+    let send = if called_off {
+        selection.target = None;
+        selection.guid = None;
+        selection.lit = None;
+        Some(send)
+    } else {
+        send.pay(selection, seam);
+        None
+    };
+    // The latch `[ebp-1]` was read before the store (`0x4936ac`); the rest of the test reads the
+    // selection after the signal (`0x4938ae`).
+    // `CanAttack` refuses the player itself (`0x4936a3`), whatever the writer knows of the rest.
+    let latched = stop_and_repoint && old_latches && old != self_guid;
+    let swung = latched && new_attackable && self_guid != Some(guid);
+    let swing = latched.then_some(OwedSwing {
+        guid,
+        verdict: match (entity, new_attackable) {
+            (None, _) => StartTarget::Unheld,
+            (Some(_), true) => StartTarget::Attackable,
+            (Some(_), false) => StartTarget::Refused,
+        },
+        self_guid,
+    });
+    (
+        CommitOutcome {
+            changed: true,
+            swung,
+        },
+        Owed { send, swing },
+    )
+}
+
+/// [`commit_owing`] paid at once, for a test whose signals have no listeners to run first.
+#[cfg(test)]
+pub(super) fn commit(
+    selection: &mut Selection,
+    seam: &mut crate::creature_anim::AttackSeam,
+    entity: Option<Entity>,
+    guid: u64,
+    target_store: Option<&ObjectStore>,
+    self_guid: Option<u64>,
+    new_attackable: bool,
+    old_latches: bool,
+) -> CommitOutcome {
+    let (out, owed) = commit_owing(
+        selection,
+        seam,
+        entity,
+        guid,
+        target_store,
+        self_guid,
+        new_attackable,
+        old_latches,
+    );
+    owed.pay(selection, seam);
+    out
 }
 
 /// One press on either side, as every `TargetNearest*` shim shares `0x493f60`: score the live
-/// world, pool by tier, walk the history forward or back, and [`commit`].
+/// world, pool by tier, walk the history forward or back, and [`commit_owing`]; what its commit
+/// owes, for the caller to pay once the signals' listeners ran.
 pub(super) fn cycle(
     side: ScanSide,
     reverse: bool,
@@ -528,8 +673,7 @@ pub(super) fn cycle(
     selection: &mut Selection,
     seam: &mut crate::creature_anim::AttackSeam,
     front: &mut super::front::SelectFront,
-    engaged: bool,
-) {
+) -> Owed {
     history.enter(side);
     history.prune(now);
     let trace = tab_trace_on();
@@ -545,7 +689,7 @@ pub(super) fn cycle(
         if trace {
             info!("tab-trace: no candidates — target unchanged");
         }
-        return;
+        return Owed::default();
     }
     let pool = select_pool(&cands);
     if trace {
@@ -569,7 +713,7 @@ pub(super) fn cycle(
         Some(i) => (pool[i].entity, pool[i].guid, false),
         None => {
             let Some((i, wrapped)) = pick_forward(&pool, &visited, selection.guid) else {
-                return;
+                return Owed::default();
             };
             (pool[i].entity, pool[i].guid, wrapped)
         }
@@ -578,12 +722,12 @@ pub(super) fn cycle(
     // instead. The cycle's index was stored before that call (`0x4941d4`), so the next press moves
     // past the pick whatever became of it; the history, which stands in for the index, records it
     // as visited without a selection to push.
-    if front.takes(entity, guid) {
+    if front.takes(entity, guid, seam.slots.targeting()) {
         if wrapped {
             history.visited.clear();
         }
         history.push(guid, now);
-        return;
+        return Owed::default();
     }
     if wrapped {
         history.visited.clear();
@@ -592,19 +736,20 @@ pub(super) fn cycle(
     if let Some(old) = selection.guid {
         history.push(old, now);
     }
-    let out = commit(
+    let old_latches = latches_on(&scan.relations, selection.guid);
+    let (out, owed) = commit_owing(
         selection,
         seam,
-        entity,
+        Some(entity),
         guid,
         scan.store_at(entity),
-        engaged,
         // `IsSelectable`'s `CREATEDBY` clause reads it.
         scan.self_guid(),
         // `Attack 0x5ecb70`'s validation, which a mode-2 pick fails (reaction >= 4 against
         // `CanAttack`'s < 4). A duelling friendly passes `CanAttack`'s duel arm, which reads no
         // reaction, so the reference's `Attack` would re-swing at it; here it gets none.
         side == ScanSide::Enemy,
+        old_latches,
     );
     if out.changed {
         history.push(guid, now);
@@ -623,55 +768,47 @@ pub(super) fn cycle(
             }
         );
     }
+    owed
 }
 
 /// The target half of the attack validator `0x612df0` (`0x61305d`–`0x613198`), shared by the
 /// player's Attack (`0x6131aa`) and the pet bar's (`0x4bd40d`): what it reads beyond the
-/// selection, the cycler it runs as `TargetNearestEnemy` (`0x6130b5`, `0x493f60(0, 1)`), and
-/// whether we are swinging, which that cycle's selection switch reads.
+/// selection and the cycler it runs as `TargetNearestEnemy` (`0x6130b5`, `0x493f60(0, 1)`).
 #[derive(SystemParam)]
 pub(crate) struct AttackPick<'w, 's> {
     scan: TargetScan<'w, 's>,
     history: ResMut<'w, TabHistory>,
     time: Res<'w, Time>,
-    engaged: Query<'w, 's, (), (With<Engaged>, With<SelfPlayer>)>,
     /// The `SelectTarget` returns ahead of the validator's two selecting calls.
     front: super::front::SelectFront<'w, 's>,
 }
 
 impl AttackPick<'_, '_> {
-    /// Whether we are attacking (`0x60ecb0`), as the server last echoed it.
-    pub(crate) fn engaged(&self) -> bool {
-        !self.engaged.is_empty()
-    }
-
     /// Our own descriptor and guid, the actor of the player's Attack.
     pub(crate) fn player(&self) -> (Option<&ObjectStore>, Option<u64>) {
         (self.scan.self_store(), self.scan.self_guid())
     }
 
-    /// The guid the swing, the pet's order or the cast goes at, or `None` once the refusal is
-    /// raised. The candidate is the guid the caller passed, else the selection (`0x61306b`):
-    /// `AttackTarget` passes none (`0x489b50` → `0x6131a0(0,0)`), nor does the pet bar
-    /// (`0x4be42b`); TryCast passes the caster on a self-cast press (`0x4e610e`). An empty
-    /// candidate (`0x61307f`) or a unit the actor is friendly toward (`0x6130a3`, dropped at
-    /// `0x6130a8`), the caster included, runs `TargetNearestEnemy` (`0x6130b5`), which commits its
-    /// pick before this returns, so a call after this one reads it. The target is then the
-    /// selection as it stands (`0x6130c1`): a fruitless scan leaves a friendly unit selected for
-    /// the final gate to refuse, and only an empty selection is `ERR_NO_ATTACK_TARGET`
-    /// (`0x6130d9`). `may_pick` is the protected-action gate's tag 4, which opens the cycle
-    /// (`0x493f9b`): refused, the cycle returns having picked nothing and the target is the
-    /// selection as it stands. A unit kept goes to `SelectTarget` (`0x613100`) and the cycle's pick
-    /// does too (`0x4941e6`), so with the targeting cursor up either is bound to the cast and the
-    /// selection stays ([`super::front`]).
-    pub(crate) fn target(
+    /// The validator's target pick up to the selection's re-read (`0x61305d`-`0x6130bc`), what
+    /// its commit owes after its signals ([`Owed`]), for a caller that runs their listeners in
+    /// place, as `SetSelection` does inside the validator, before it [`Self::settle`]s. The
+    /// candidate is the guid the caller passed, else the selection (`0x61306b`): `AttackTarget`
+    /// passes none (`0x489b50` → `0x6131a0(0,0)`), nor does the pet bar (`0x4be42b`); TryCast
+    /// passes the caster on a self-cast press (`0x4e610e`). An empty candidate (`0x61307f`) or a
+    /// unit the actor is friendly toward (`0x6130a3`, dropped at `0x6130a8`), the caster included,
+    /// runs `TargetNearestEnemy` (`0x6130b5`), which commits its pick inside the validator, so a
+    /// call after this one reads it. `may_pick` is the protected-action gate's tag 4, which opens
+    /// the cycle (`0x493f9b`): refused, the cycle returns having picked nothing. A unit kept goes
+    /// to `SelectTarget` (`0x613100`) and the cycle's pick does too (`0x4941e6`), so with the
+    /// targeting cursor up either is bound to the cast and the selection stays
+    /// ([`super::front`]).
+    pub(crate) fn pick(
         &mut self,
         passed: Option<u64>,
         may_pick: bool,
         selection: &mut Selection,
         seam: &mut crate::creature_anim::AttackSeam,
-        errors: &mut crate::ui_action::UiErrorKeys,
-    ) -> Option<u64> {
+    ) -> Owed {
         let candidate = passed.or(selection.guid);
         if candidate.is_some_and(|g| self.keeps(g)) {
             // `0x613100`: the kept unit is selected again, a no-op unless the cursor is up. Only
@@ -681,11 +818,10 @@ impl AttackPick<'_, '_> {
                 .zip(selection.guid)
                 .filter(|&(_, guid)| Some(guid) == candidate)
             {
-                self.front.takes(entity, guid);
+                self.front.takes(entity, guid, seam.slots.targeting());
             }
         } else if may_pick {
-            let engaged = self.engaged();
-            cycle(
+            return cycle(
                 ScanSide::Enemy,
                 false,
                 self.time.elapsed_secs_f64(),
@@ -694,14 +830,24 @@ impl AttackPick<'_, '_> {
                 selection,
                 seam,
                 &mut self.front,
-                engaged,
             );
         }
+        Owed::default()
+    }
+
+    /// The validator from the selection's re-read on (`0x6130c1`-`0x613198`), once the pick's
+    /// listeners ran: the guid the swing, the pet's order or the cast goes at, or `None` once the
+    /// refusal is raised. The target is the selection as it stands then, a listener's pick
+    /// included: a fruitless scan leaves a friendly unit selected for the final gate to refuse,
+    /// and only an empty selection is `ERR_NO_ATTACK_TARGET` (`0x6130d9`).
+    pub(crate) fn settle(
+        &self,
+        selection: &Selection,
+        errors: &crate::ui_action::UiErrorKeys,
+    ) -> Option<u64> {
         let Some(guid) = selection.guid else {
             debug!("attack: nothing to attack (ERR_NO_ATTACK_TARGET)");
-            errors
-                .0
-                .push(crate::ui_action::UiError::key("ERR_NO_ATTACK_TARGET"));
+            errors.push(crate::ui_action::UiError::key("ERR_NO_ATTACK_TARGET"));
             return None;
         };
         // `0x613118`, the second resolve: a miss refuses with no message (`0x613123`).
@@ -711,16 +857,11 @@ impl AttackPick<'_, '_> {
         };
         // The final gate's target legs; its actor legs (`0x61312e`, `0x613139`) repeat phase A's
         // dead and mounted refusals, which the caller ran.
-        if !attack_target_valid(
-            Some(store),
-            self.scan.factions.as_deref(),
-            &self.scan.reputations,
-            self.scan.self_store(),
-        ) {
+        let me = self.scan.relations.me();
+        let unit = self.scan.relations.unit_of(guid, store);
+        if !attack_target_valid(&self.scan.relations.get(), me.as_ref(), &unit, store) {
             debug!("attack: {guid:#x} fails the final gate (ERR_INVALID_ATTACK_TARGET)");
-            errors
-                .0
-                .push(crate::ui_action::UiError::key("ERR_INVALID_ATTACK_TARGET"));
+            errors.push(crate::ui_action::UiError::key("ERR_INVALID_ATTACK_TARGET"));
             return None;
         }
         Some(guid)
@@ -728,39 +869,47 @@ impl AttackPick<'_, '_> {
 
     /// `0x6130a3`'s keep test: the actor's reaction to the held unit alone (`0x61309b`), not the
     /// final gate's `CanAttack`, so a neutral mob is kept. A guid that does not resolve
-    /// (`0x613099`) is kept as well, for the second resolve to refuse. Actor → target is
-    /// [`reaction_from_player`] (the at-war bit), never `ring_reaction`. The reference's actor is
-    /// the caller, a pet on the pet arm (`0x4bd40d`), which vmangos gives its owner's faction
-    /// (`Pet.cpp:248`). The reaction to oneself is 4 before any faction rung (`0x606200`), so a
-    /// passed caster is never kept, FFA flag or not.
+    /// (`0x613099`) is kept as well, for the second resolve to refuse. The reaction is the
+    /// actor's toward the target, the player's here; the reference's actor is the caller, a pet
+    /// on the pet arm (`0x4bd40d`), which vmangos gives its owner's faction (`Pet.cpp:248`). The
+    /// reaction to oneself is 4 before any faction rung (`0x606200`), so a passed caster is never
+    /// kept, FFA flag or not.
     fn keeps(&self, guid: u64) -> bool {
         if self.scan.self_guid() == Some(guid) {
             return false;
         }
+        let rel = self.scan.relations.get();
         self.scan.store_of(guid).is_none_or(|store| {
-            reaction_from_player(
-                self.scan.factions.as_deref(),
-                &self.scan.reputations,
-                Some(store),
-                self.scan.self_store(),
-            ) < 4
+            self.scan
+                .pair(guid, Some(store))
+                .is_none_or(|(me, unit)| rel.reaction(&me, &unit) < 4)
         })
     }
 }
 
+/// The re-swing latch's legs on the outgoing selection `old` (`0x49365f`-`0x4936a3`), read before
+/// the new guid is stored: it resolves as a unit (`0x468460`, typemask 8), it has health or dynamic
+/// flag 0x20 (`0x49368d`-`0x4936a0`), and `CanAttack` (`0x606980`) allows it. The player's own legs
+/// (`0x60ecb0`, `0x605f30`, `0x49367d`) are [`commit_owing`]'s.
+pub(super) fn latches_on(relations: &RelationWorld, old: Option<u64>) -> bool {
+    old.and_then(|guid| relations.unit_and_store(guid))
+        .is_some_and(|(unit, store)| {
+            attack_target_valid(&relations.get(), relations.me().as_ref(), &unit, store)
+        })
+}
+
 /// The final gate's target legs (`0x613152`–`0x613169`): alive, where a zero-health target passes
-/// iff `UNIT_DYNAMIC_FLAGS` bit 5 is set (`0x613159`), and the full `CanAttack 0x606980`. A target
-/// with no descriptor fails [`can_attack`]; the reference always holds a live unit here.
+/// iff `UNIT_DYNAMIC_FLAGS` bit 5 is set (`0x613159`), and the full `CanAttack 0x606980` from the
+/// player. No player fails; the reference always holds one here.
 pub(super) fn attack_target_valid(
-    store: Option<&ObjectStore>,
-    factions: Option<&Factions>,
-    reputations: &Reputations,
-    self_store: Option<&ObjectStore>,
+    rel: &Relations,
+    me: Option<&RelUnit>,
+    unit: &RelUnit,
+    store: &ObjectStore,
 ) -> bool {
-    let alive = store.is_none_or(|s| {
-        s.0.unit_health().is_none_or(|h| h > 0) || s.0.unit_dynamic_flags() & (1 << 5) != 0
-    });
-    alive && can_attack(store, factions, reputations, self_store)
+    let alive =
+        store.0.unit_health().is_none_or(|h| h > 0) || store.0.unit_dynamic_flags() & (1 << 5) != 0;
+    alive && me.is_some_and(|me| rel.can_attack(me, unit))
 }
 
 /// The melee probe's press with nothing selected: the player's Attack, which acquires.
@@ -773,8 +922,11 @@ pub(crate) struct AttackNearestRequest;
 #[derive(Resource, Default)]
 pub(crate) struct LastEnemy(pub(crate) Option<u64>);
 
-/// Stamp [`LastEnemy`] behind the five-conjunct gate `0x49372f`–`0x493778`. Runs before
-/// `ring::update_ring`'s death-clear: a hostile that dies while selected stays remembered.
+/// Stamp [`LastEnemy`] behind the five-conjunct gate `0x49372f`–`0x493778`, on the object
+/// `SetSelection` found and lit (`0x4936f3`-`0x493701`, [`Selection::lit`]): one that streams in
+/// later under the selected guid was never selected, so it is never stamped. A hostile selected
+/// alive was stamped the frame it was selected, so its death's deselect (`super::died`, in a later
+/// frame's packet) leaves it remembered.
 ///
 /// Deviation: sampled each frame, not stamped in `SetSelection`, so every selection writer is
 /// covered; a selected unit that turns hostile is remembered, where the reference's is not.
@@ -782,11 +934,10 @@ pub(super) fn remember_last_enemy(
     selection: Res<Selection>,
     stores: Query<&ObjectStore>,
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
-    factions: Option<Res<Factions>>,
-    reputations: Res<Reputations>,
+    world: RelationWorld,
     mut last: ResMut<LastEnemy>,
 ) {
-    let Some((entity, guid)) = selection.target.zip(selection.guid) else {
+    let Some((entity, guid)) = selection.lit.zip(selection.guid) else {
         return;
     };
     // Conjunct 1: the player object resolves.
@@ -804,56 +955,122 @@ pub(super) fn remember_last_enemy(
         return;
     }
     // Conjunct 5: `CanAttack(player, new)`.
-    if can_attack(store, factions.as_deref(), &reputations, Some(me)) {
+    let attackable = (|| {
+        let (me, unit) = (world.me()?, world.unit_of(guid, store?));
+        Some(world.get().can_attack(&me, &unit))
+    })();
+    if attackable == Some(true) {
         last.0 = Some(guid);
     }
 }
 
-/// The ATTACKERSTATEUPDATE self-defence acquire (`0x6259c9`–`0x6259fe`): when we are the victim
-/// and hold no selection, select the attacker, with no counter-attack.
-pub(super) fn auto_acquire_attacker(
+/// What asked [`auto_acquire`] for a unit.
+#[derive(Clone, Copy, Debug)]
+enum Acquire {
+    /// A swing at us (`SMSG_ATTACKERSTATEUPDATE`).
+    Attacker,
+    /// A spell start aimed at us (`SMSG_SPELL_START`).
+    Caster,
+}
+
+/// The two packet acquires, in packet order by their [`crate::creature_anim::PlaySeq`] stamps:
+/// - the ATTACKERSTATEUPDATE self-defence acquire (`0x6259c9`–`0x6259fe`): when we are the victim
+///   and hold no selection, select the attacker, with no counter-attack;
+/// - the spell start's (`0x6e7963`-`0x6e799c`): another unit casting at us, which
+///   [`crate::spell::net::CastAtPlayer`] names, is selected when the active player's object is
+///   held (`0x6e796a`), the caster cannot assist it (`CanAssist 0x6066f0` at `0x6e7973`) and
+///   nothing is selected (`[0xb4e2d8]`, `0x6e7980`). The caster is looked up as a unit
+///   (`0x468460` with mask 8, `0x6e7892`).
+///
+/// Each is `SelectTarget` (`0x6259fe`, `0x6e799c`), whose front may bind the unit to a standing
+/// cursor's cast instead; a packet handler runs in no script, whose gate context passes tag 2.
+/// Each selection signals in place, its listeners running before the next ask is judged
+/// ([`crate::script_calls::ScriptCallHost::engine_select`]).
+pub(super) fn auto_acquire(
     mut swings: MessageReader<SwingMessage>,
-    self_player: Query<(Entity, &Guid), With<SelfPlayer>>,
-    guids: Query<&Guid>,
-    // For `IsSelectable`: a `NOT_SELECTABLE` attacker is not acquired.
-    stores: Query<&ObjectStore>,
-    mut selection: ResMut<Selection>,
-    mut seam: crate::creature_anim::AttackSeam,
-    mut front: super::front::SelectFront,
+    mut casts: MessageReader<crate::spell::net::CastAtPlayer>,
+    mut vm: crate::script_calls::VmWith<AcquireSelect<'static, 'static>>,
 ) {
-    for s in swings.read() {
-        if selection.target.is_some() {
-            continue;
+    let Some((me, my_guid)) = vm.own().self_player.single().ok().map(|(e, g)| (e, g.0)) else {
+        return;
+    };
+    let mut asks: Vec<(u64, Entity, Acquire)> = swings
+        .read()
+        .filter(|s| s.victim == Some(me))
+        .map(|s| (s.seq, s.attacker, Acquire::Attacker))
+        .chain(casts.read().map(|c| (c.seq, c.caster, Acquire::Caster)))
+        .collect();
+    asks.sort_by_key(|&(seq, ..)| seq);
+    for (_, unit, why) in asks {
+        let select = vm.own().select(unit, why, my_guid);
+        if let Some(select) = select {
+            vm.engine_select(select, |mut c, owed| {
+                owed.pay(&mut c.selection, &mut c.seam);
+            });
         }
-        let Ok((me, my_guid)) = self_player.single() else {
-            continue;
-        };
-        if s.victim != Some(me) {
-            continue;
+    }
+}
+
+/// What [`auto_acquire`]'s selects read and write.
+#[derive(SystemParam)]
+pub(super) struct AcquireSelect<'w, 's> {
+    self_player: Query<'w, 's, (Entity, &'static Guid), With<SelfPlayer>>,
+    guids: Query<'w, 's, &'static Guid>,
+    // For `IsSelectable`: a `NOT_SELECTABLE` attacker is not acquired.
+    stores: Query<'w, 's, &'static ObjectStore>,
+    relations: RelationWorld<'w, 's>,
+    selection: ResMut<'w, Selection>,
+    seam: crate::creature_anim::AttackSeam<'w, 's>,
+    front: super::front::SelectFront<'w, 's>,
+}
+
+impl AcquireSelect<'_, '_> {
+    /// One ask's select of `unit`, owing what follows its signals, or `None` when it selects
+    /// nothing.
+    fn select(
+        &mut self,
+        unit: Entity,
+        why: Acquire,
+        my_guid: u64,
+    ) -> Option<crate::script_calls::EngineSelect> {
+        let guid = self.guids.get(unit).ok()?.0;
+        match why {
+            Acquire::Attacker => {
+                // `0x6259e6` tests the selected guid, so a party member selected out of range
+                // keeps the selection.
+                if self.selection.guid.is_some() {
+                    return None;
+                }
+                debug!("auto-target: attacker {guid:#x} (victim = me, no target)");
+            }
+            Acquire::Caster => {
+                let rel = self.relations.get();
+                let assists = match (self.relations.unit(guid), self.relations.me()) {
+                    (Some(caster), Some(player)) => rel.can_assist(&caster, &player),
+                    _ => return None,
+                };
+                if assists || self.selection.guid.is_some() {
+                    return None;
+                }
+                debug!("auto-target: caster {guid:#x} (casting at me, no target)");
+            }
         }
-        let Ok(guid) = guids.get(s.attacker) else {
-            continue;
-        };
-        debug!(
-            "auto-target: attacker {:#x} (victim = me, no target)",
-            guid.0
-        );
-        // `0x6259fe` is `SelectTarget`, whose front may bind the attacker to a standing cursor's
-        // cast instead; the packet handler runs in no script, whose gate context passes tag 2.
-        if front.takes(s.attacker, guid.0) {
-            continue;
+        if self.front.takes(unit, guid, self.seam.slots.targeting()) {
+            return None;
         }
+        let before = super::click::Standing::of(&self.selection, &self.seam);
         // The selection was empty, so no switch law: selection only.
-        commit(
-            &mut selection,
-            &mut seam,
-            s.attacker,
-            guid.0,
-            stores.get(s.attacker).ok(),
+        let (_, owed) = commit_owing(
+            &mut self.selection,
+            &mut self.seam,
+            Some(unit),
+            guid,
+            self.stores.get(unit).ok(),
+            Some(my_guid),
             false,
-            Some(my_guid.0),
             false,
         );
+        Some(before.owing(owed))
     }
 }
 
@@ -861,6 +1078,7 @@ pub(super) fn auto_acquire_attacker(
 mod tests {
     use super::*;
     use crate::net::NetCommands;
+    use crate::net::Reputations;
 
     /// One `commit` through a one-shot system, returning its outcome.
     fn go(
@@ -884,6 +1102,7 @@ mod tests {
         attackable: bool,
     ) -> CommitOutcome {
         use bevy::ecs::system::RunSystemOnce;
+        engage(world, engaged);
         world
             .run_system_once(
                 move |mut selection: ResMut<Selection>,
@@ -891,16 +1110,34 @@ mod tests {
                     commit(
                         &mut selection,
                         &mut seam,
-                        Entity::PLACEHOLDER,
+                        Some(Entity::PLACEHOLDER),
                         guid,
                         store.as_ref(),
-                        engaged,
                         self_guid,
                         attackable,
+                        true,
                     )
                 },
             )
             .expect("commit runs as a one-shot system")
+    }
+
+    /// Our attack target set (`[+0xc48]`) or clear, with whatever the last commit queued applied.
+    pub(super) fn engage(world: &mut World, engaged: bool) {
+        crate::creature_anim::apply_unit_edits(world);
+        let me = world
+            .query_filtered::<Entity, With<SelfPlayer>>()
+            .single(world)
+            .expect("our own player");
+        if engaged {
+            world
+                .entity_mut(me)
+                .insert(crate::creature_anim::Engaged(0));
+        } else {
+            world
+                .entity_mut(me)
+                .remove::<crate::creature_anim::Engaged>();
+        }
     }
 
     /// A world with just what the seams need.
@@ -909,7 +1146,12 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(NetCommands(tx));
         world.init_resource::<crate::spell::QueuedMeleeSpell>();
+        world.init_resource::<crate::spell::PendingCast>();
+        world.init_resource::<crate::spell::SpellTargeting>();
+        world.init_resource::<crate::ui_cast::CastReports>();
         world.init_resource::<crate::spell::AutoRepeatActive>();
+        world.init_resource::<crate::creature_anim::AttackStopInFlight>();
+        world.init_resource::<crate::creature_anim::UnitEdits>();
         world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
         world.init_resource::<Messages<crate::player::StandStateRequest>>();
         world.init_resource::<Selection>();
@@ -969,7 +1211,7 @@ mod tests {
         world
             .run_system_once(
                 |mut selection: ResMut<Selection>, mut seam: crate::creature_anim::AttackSeam| {
-                    super::super::click::clear(&mut selection, &mut seam, false);
+                    super::super::click::clear(&mut selection, &mut seam);
                 },
             )
             .expect("clear runs as a one-shot system");
@@ -1012,10 +1254,16 @@ mod tests {
         assert!(out.changed && !out.swung);
         assert_eq!(drain(&rx), ["stop", "select"]);
 
-        // Engaged switch onto an unattackable unit (vendor/corpse): stop, no swing at it.
-        let out = go(&mut world, 0xD, true, Some(1), false);
+        // Off ourselves the latch is off (`CanAttack` refuses us, `0x4936a3`): stop, select.
+        let out = go(&mut world, 0xC, true, Some(1), true);
         assert!(out.changed && !out.swung);
         assert_eq!(drain(&rx), ["stop", "select"]);
+
+        // Engaged switch onto an unattackable unit (vendor/corpse): stop, select, and StartAttack's
+        // refusal arm stops again (`0x5ecc37` → `0x5ecc48`), no swing at it.
+        let out = go(&mut world, 0xD, true, Some(1), false);
+        assert!(out.changed && !out.swung);
+        assert_eq!(drain(&rx), ["stop", "select", "stop"]);
 
         // Engaged first select, no old target: the latch is off, selection only.
         *world.resource_mut::<Selection>() = Selection::default();
@@ -1027,6 +1275,9 @@ mod tests {
         world
             .resource_mut::<crate::spell::QueuedMeleeSpell>()
             .arm(78);
+        world
+            .resource_mut::<crate::spell::PendingCast>()
+            .fill_record();
         world.resource_mut::<crate::spell::AutoRepeatActive>().0 = Some(75);
         let out = go(&mut world, 0xF, true, Some(1), true);
         assert!(out.changed && out.swung);
@@ -1039,6 +1290,16 @@ mod tests {
             None,
             "the switch un-queued Heroic Strike"
         );
+        // `CancelQueuedCast`'s cancel (`0x6e6f68`): the pop's signal, then `SPELLCAST_STOP`; the
+        // re-swing's repeat stop signals `STOP_AUTOREPEAT_SPELL` as the key clears (`0x6ea16a`).
+        assert!(matches!(
+            world.resource::<crate::ui_cast::CastReports>().reports()[..],
+            [
+                crate::ui_cast::CastReport::Changed,
+                crate::ui_cast::CastReport::Bar(crate::ui_cast::CastBarEdge::Stop),
+                crate::ui_cast::CastReport::AutoRepeat(false)
+            ]
+        ));
         assert_eq!(
             world.resource::<crate::spell::AutoRepeatActive>().0,
             None,
@@ -1192,8 +1453,15 @@ mod tests {
         let unit = |pairs: &[(u16, u32)]| ObjectStore(ObjectFields::from_pairs(pairs));
         // With no catalog both reactions are neutral, which `CanAttack`'s mixed arm (< 4) admits,
         // so the legs below decide.
-        let me = unit(&[(TPL, 1), (FLAGS, 1 << 3)]);
-        let valid = |s: &ObjectStore| attack_target_valid(Some(s), None, &reps, Some(&me));
+        let me = RelUnit::of(1, &unit(&[(TPL, 1), (FLAGS, 1 << 3)]));
+        let rel = Relations {
+            factions: None,
+            reputations: &reps,
+            me: Some(1),
+            roster: None,
+            units: &crate::target::relations::NoUnits,
+        };
+        let valid = |s: &ObjectStore| attack_target_valid(&rel, Some(&me), &RelUnit::of(2, s), s);
 
         assert!(valid(&unit(&[(HEALTH, 120)])), "a live mob");
         assert!(!valid(&unit(&[(HEALTH, 0)])), "a corpse");
@@ -1205,13 +1473,13 @@ mod tests {
             !valid(&unit(&[(HEALTH, 120), (FLAGS, 1 << 25)])),
             "NOT_SELECTABLE is one of CanAttack's disqualifiers"
         );
-        // No descriptor on either side is refused.
-        assert!(!attack_target_valid(None, None, &reps, Some(&me)));
+        // No player is refused.
+        let mob = unit(&[(HEALTH, 120)]);
         assert!(!attack_target_valid(
-            Some(&unit(&[(HEALTH, 120)])),
+            &rel,
             None,
-            &reps,
-            None
+            &RelUnit::of(2, &mob),
+            &mob
         ));
     }
 
@@ -1472,6 +1740,7 @@ mod tests {
         world.init_resource::<LastEnemy>();
         world.spawn((
             SelfPlayer,
+            crate::net::Guid(0x1),
             store(&[
                 (F_TYPE, TYPE_PLAYER),
                 (F_FLAGS, CONTROLLED),
@@ -1500,10 +1769,12 @@ mod tests {
             ]))
             .id();
 
+        // As `SetSelection` stores the guid and lights the object it found (`0x493701`).
         let select = |world: &mut World, target: Option<(Entity, u64)>| {
             let mut sel = world.resource_mut::<Selection>();
             sel.target = target.map(|(e, _)| e);
             sel.guid = target.map(|(_, g)| g);
+            sel.lit = sel.target;
             world
                 .run_system_once(remember_last_enemy)
                 .expect("the sampler runs as a one-shot system");

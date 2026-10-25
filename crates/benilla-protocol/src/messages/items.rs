@@ -434,7 +434,29 @@ pub(super) fn read_item_query_response(r: &mut &[u8]) -> io::Result<(u32, Option
     ))
 }
 
-/// Body of `CMSG_ITEM_QUERY_SINGLE`: entry, then a full item guid (0 with no instance in hand).
+/// Body of `CMSG_ITEM_NAME_QUERY`: the item entry, then the asker's guid, which the 1.12 client
+/// puts because the store's owner flag is set (`0x559fe0`; its query send matches `0x558648`) and
+/// vmangos skips (`ItemNameQuery::ReadFromWorldPacket`).
+pub fn item_name_query(entry: u32, guid: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&entry.to_le_bytes());
+    body.extend_from_slice(&guid.to_le_bytes());
+    body
+}
+
+/// Read `SMSG_ITEM_NAME_QUERY_RESPONSE`: the entry, then the name, the one string the store's
+/// reader takes (`0x7c8dc0`); vmangos writes the same pair (`ItemNameQueryResponse::AppendBodyTo`).
+/// A top-bit entry is the store's refusal (`0x556e67`), with nothing after it.
+pub(super) fn read_item_name_query_response(r: &mut &[u8]) -> io::Result<(u32, Option<String>)> {
+    let entry = read_u32_le(r)?;
+    if entry & 0x8000_0000 != 0 {
+        return Ok((entry & 0x7FFF_FFFF, None));
+    }
+    Ok((entry, Some(read_cstring(r)?)))
+}
+
+/// Body of `CMSG_ITEM_QUERY_SINGLE`: entry, then the lookup's owner id (`PutGuid`, `0x558648`
+/// to `0x558698`): an instance's or a unit's guid, a spell's `0xb0000000` id, or 0 for none.
 pub fn item_query(entry: u32, guid: u64) -> Vec<u8> {
     let mut body = Vec::with_capacity(12);
     body.extend_from_slice(&entry.to_le_bytes());
@@ -452,6 +474,7 @@ pub const SLOT_BAG_FIRST: u8 = 19;
 
 /// `SpellCastTargets` mask bits, vmangos `SpellDefines.h`.
 const TARGET_FLAG_GAMEOBJECT: u16 = 0x0800;
+const TARGET_FLAG_TRADE_ITEM: u16 = 0x1000;
 
 const TARGET_FLAG_UNIT: u16 = 0x0002;
 const TARGET_FLAG_DEST_LOCATION: u16 = 0x0040;
@@ -475,6 +498,11 @@ pub enum UseItemTarget {
     Dest([f32; 3]),
     /// `TARGET_FLAG_ITEM` and a packed guid: a poison, oil or stone applied to a clicked item.
     Item(u64),
+    /// `TARGET_FLAG_TRADE_ITEM` (`0x1000`) and a trade slot as the packed guid: the non-traded
+    /// slot of the partner's window, which the trade bind `0x6e6900` writes as guid `{6, 0}`
+    /// (`0x6e6915`-`0x6e6925`); vmangos resolves it to the item the partner has there
+    /// (`SpellCastTargetsInfo.cpp:131-135`).
+    TradeItem(u8),
     /// `TARGET_FLAG_SOURCE_LOCATION` and three `f32` coords (`BindLocation`, `0x6e60f0`); only
     /// items carrying spell 265, such as Martin Fury, use it. vmangos reads it before the dest.
     Source([f32; 3]),
@@ -490,10 +518,17 @@ pub fn use_item(bag_index: u8, slot: u8, spell_slot: u8, target: UseItemTarget) 
     body.push(bag_index);
     body.push(slot);
     body.push(spell_slot);
+    write_cast_targets(&mut body, target);
+    body
+}
+
+/// The targets block every cast request ends in (`0x7e4e10`, called from `SendCast 0x6e54f0`):
+/// the `u16` mask, then the packed guid or the three coords its bit asks for.
+pub(super) fn write_cast_targets(body: &mut Vec<u8>, target: UseItemTarget) {
     let guid = match target {
         UseItemTarget::SelfImplicit => {
             body.extend_from_slice(&0u16.to_le_bytes());
-            return body;
+            return;
         }
         UseItemTarget::Unit(guid) => {
             body.extend_from_slice(&TARGET_FLAG_UNIT.to_le_bytes());
@@ -507,6 +542,10 @@ pub fn use_item(bag_index: u8, slot: u8, spell_slot: u8, target: UseItemTarget) 
             body.extend_from_slice(&TARGET_FLAG_ITEM.to_le_bytes());
             guid
         }
+        UseItemTarget::TradeItem(slot) => {
+            body.extend_from_slice(&TARGET_FLAG_TRADE_ITEM.to_le_bytes());
+            u64::from(slot)
+        }
         UseItemTarget::Corpse(corpse, guid) => {
             body.extend_from_slice(&corpse.target_flag().to_le_bytes());
             guid
@@ -516,18 +555,17 @@ pub fn use_item(bag_index: u8, slot: u8, spell_slot: u8, target: UseItemTarget) 
             for c in dest {
                 body.extend_from_slice(&c.to_le_bytes());
             }
-            return body;
+            return;
         }
         UseItemTarget::Source(src) => {
             body.extend_from_slice(&TARGET_FLAG_SOURCE_LOCATION.to_le_bytes());
             for c in src {
                 body.extend_from_slice(&c.to_le_bytes());
             }
-            return body;
+            return;
         }
     };
-    crate::wire::write_packed_guid(guid, &mut body).expect("write to Vec cannot fail");
-    body
+    crate::wire::write_packed_guid(guid, body).expect("write to Vec cannot fail");
 }
 
 /// Body of `CMSG_OPEN_ITEM` (opcode 172, `Server/Packets/Spell.h:36-45`): bag index and slot, as
@@ -645,6 +683,25 @@ mod tests {
     // The query-response parse goldens are in `tests/items.rs`; do not duplicate them here.
 
     // Item-move body goldens follow vmangos `Server/Packets/Item.cpp`; every field is a `u8`.
+
+    /// The item query's body: the entry, then the owner id, both little-endian. A profession or
+    /// trainer getter's owner is `0xb0000000` over the row's spell id (`0x4d9078`-`0x4d9093`),
+    /// the ammo and cooldown lookups' the active player (`0x4c83ad`-`0x4c83c4`, `0x6e2eef`).
+    #[test]
+    fn item_query_bodies_are_byte_exact() {
+        assert_eq!(
+            item_query(2589, 0xb000_0000_0000_07e2),
+            [0x1d, 0x0a, 0, 0, 0xe2, 0x07, 0, 0, 0, 0, 0, 0xb0]
+        );
+        assert_eq!(
+            item_query(2512, 0x0000_0000_0000_002a),
+            [0xd0, 0x09, 0, 0, 0x2a, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            item_query(900, 0),
+            [0x84, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
 
     #[test]
     fn open_container_decodes() {

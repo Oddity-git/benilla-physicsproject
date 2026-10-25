@@ -227,6 +227,45 @@ mod loader_tests {
         );
     }
 
+    /// `parent=` looks the name up with the Frame id (`0x6ee3c9` → `0x76c760`), so a global holding
+    /// another object, a Texture or a Font, is a miss: the frame is built parentless and the miss
+    /// logged (`0x8710f0`), never a `CreateFrame` raise.
+    #[test]
+    fn a_parent_attribute_naming_a_region_or_a_font_is_a_miss() {
+        let s = UiScript::new().unwrap();
+        s.run(
+            r#"
+            ParentOwner = CreateFrame("Frame", "ParentOwner")
+            ParentTexture = ParentOwner:CreateTexture("ParentTexture")
+            CreateFont("ParentFont")
+        "#,
+        )
+        .unwrap();
+        let doc = parse(
+            r#"<Ui>
+                <Frame name="OnTexture" parent="ParentTexture"/>
+                <Frame name="OnFont" parent="ParentFont"/>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        for (frame, global) in [("OnTexture", "ParentTexture"), ("OnFont", "ParentFont")] {
+            assert!(
+                s.eval::<bool>(&format!(
+                    "return {frame} ~= nil and {frame}:GetParent() == nil"
+                ))
+                .unwrap(),
+                "{frame} is built parentless"
+            );
+            let want = format!("Couldn't find frame parent: {global}");
+            assert!(
+                report.warnings.contains(&want),
+                "{want}: {:?}",
+                report.warnings
+            );
+        }
+    }
+
     /// A miss stores 0 over the default parent (`0x6ee3ef`), so the frame is built parentless; an
     /// empty `parent=""` keeps the default silently (`0x6ee3c7`).
     #[test]
@@ -1624,7 +1663,7 @@ mod loader_tests {
 
         let base = s.font_object("Base").expect("Base registered");
         assert_eq!(base.font.as_deref(), Some("Fonts\\FRIZQT__.TTF"));
-        assert_eq!(base.height, Some(12.0));
+        assert_eq!(base.height, Some(crate::layout::Len::Script(12.0)));
         assert_eq!(
             base.color,
             Some(crate::color::Rgba8::from_f32([1.0, 0.82, 0.0, 1.0]))
@@ -1634,7 +1673,7 @@ mod loader_tests {
         // no `font=` beside it, so it is never read (`0x783cf1`).
         let leaf = s.font_object("Leaf").expect("Leaf registered");
         assert_eq!(leaf.font.as_deref(), Some("Fonts\\FRIZQT__.TTF"));
-        assert_eq!(leaf.height, Some(12.0));
+        assert_eq!(leaf.height, Some(crate::layout::Len::Script(12.0)));
         assert_eq!(
             leaf.color,
             Some(crate::color::Rgba8::from_f32([1.0, 1.0, 1.0, 1.0]))
@@ -1940,7 +1979,8 @@ mod loader_tests {
         let (l, r, t, b) = s
             .eval::<(f64, f64, f64, f64)>("return Micro:GetHitRectInsets()")
             .unwrap();
-        assert_eq!((l, r, t, b), (0.0, 0.0, 18.0, 0.0));
+        let law = crate::test_support::law43;
+        assert_eq!((l, r, t, b), (law(0.0), law(0.0), law(18.0), law(0.0)));
         crate::assert_near!(s.eval::<f64>("return Micro:GetHeight()").unwrap(), 58.0);
         // A button is mouse-enabled by construction, so the hit test is live.
         assert!(
@@ -2443,7 +2483,7 @@ mod loader_tests {
                     .collect::<Vec<_>>(),
                 blocks
                     .iter()
-                    .map(|rh| model.region_data[rh].size)
+                    .map(|rh| model.region_data[rh].size.map(|(w, h)| (w.raw(), h.raw())))
                     .collect::<Vec<_>>(),
             )
         };

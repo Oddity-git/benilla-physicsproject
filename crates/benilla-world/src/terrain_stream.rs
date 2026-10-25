@@ -163,6 +163,17 @@ struct TileState {
     gave_up: bool,
 }
 
+/// Whether the load counts the tile as in: furnished, or its ADT read failed, as the reference's
+/// wait-all completes on a failed read (`0x443d30`) and loads on without the tile.
+fn tile_done(t: &TileState, server: &AssetServer) -> bool {
+    t.furnished
+        || (t.entity.is_none()
+            && matches!(
+                server.load_state(&t.handle),
+                bevy::asset::LoadState::Failed(_)
+            ))
+}
+
 impl TileState {
     /// A tile whose ADT read is in flight, nothing spawned yet.
     fn requested(handle: Handle<AdtTile>) -> Self {
@@ -516,15 +527,26 @@ impl Plugin for TerrainPlugin {
                 release_world
                     .run_if(crate::schedule::world_left)
                     // On the frame the world went away: the session publishes its edge before
-                    // `Net`, and the release lands before the stream stage.
+                    // `Net`, and the release lands ahead of the stream chain. In the stream stage,
+                    // so whatever reads the tiles in a declared order against the stage reads
+                    // them before or after the release, never beside it.
                     .after(crate::schedule::WorldStage::Net)
-                    .before(crate::schedule::WorldStage::Stream),
+                    .in_set(crate::schedule::WorldStage::Stream)
+                    .before(stream_terrain)
+                    // The forms and the stream activity it clears, which the ungated form
+                    // furnisher in the same stage writes.
+                    .before(crate::model_forms::furnish_model_forms),
             )
             // Ungated, so the last world's art drains at character select too.
             .add_systems(Update, scope_placement_art)
             // Ungated, so the density tracker never misses a boot-time config apply; ordered
             // before the residency publish, which reads the tiles whose clutter it rewrites.
-            .add_systems(Update, rescatter_clutter.before(publish_terrain_residency))
+            .add_systems(
+                Update,
+                rescatter_clutter
+                    .in_set(WorldStage::Stream)
+                    .before(publish_terrain_residency),
+            )
             .add_systems(
                 Update,
                 // After the interior claim: the reference resolves leaf, indoor and names from one
@@ -1043,7 +1065,10 @@ fn spawn_streamed_tiles(
         // Judged from the desired set, so a desired tile not yet requested is not there; ground
         // the WDT never authors counts as resident, or the wait would never end.
         p.focus_resident = if desired.contains(&(cx, cy)) {
-            state.tiles.get(&(cx, cy)).is_some_and(|t| t.furnished)
+            state
+                .tiles
+                .get(&(cx, cy))
+                .is_some_and(|t| tile_done(t, &asset_server))
         } else {
             true
         };
@@ -1069,9 +1094,15 @@ fn spawn_streamed_tiles(
             p.complete = false;
         }
         if !p.complete {
-            // Spawned means furnished, root and every cell, so a reveal never shows bare ground;
+            // Spawned means furnished, root and every cell, so a reveal never shows bare ground (or
+            // read and failed, which has nothing to show);
             // it lags the root by a frame, as the furnisher runs after this system.
-            let spawned = |c: &(i32, i32)| state.tiles.get(c).is_some_and(|t| t.furnished);
+            let spawned = |c: &(i32, i32)| {
+                state
+                    .tiles
+                    .get(c)
+                    .is_some_and(|t| tile_done(t, &asset_server))
+            };
             p.total = desired.len();
             p.ready = desired.iter().filter(|c| spawned(c)).count();
             // The focus neighbourhood's placements count too, each up once its model and its WMO
@@ -1085,7 +1116,8 @@ fn spawn_streamed_tiles(
                         continue; // no tile to wait for
                     }
                     match state.tiles.get(&c) {
-                        Some(t) if t.furnished => {
+                        // A failed read has no placements to wait for.
+                        Some(t) if tile_done(t, &asset_server) => {
                             for uid in &t.placements {
                                 if let Some(pl) = placements.by_id.get(uid) {
                                     let up = pl.spawned && pl.doodads.iter().all(|d| d.spawned);

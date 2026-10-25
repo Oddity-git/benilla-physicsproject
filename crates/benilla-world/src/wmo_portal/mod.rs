@@ -34,7 +34,8 @@ pub use interior::{
 pub(crate) use interior::{surface_terrain_sample, WmoAreas, POSITION_PROBE_LIFT};
 use interior::{track_area_interior, track_current_interior, track_unit_interiors};
 pub use interior::{
-    CurrentAreaInterior, CurrentWmoInterior, PlayerWmoRoom, UnitWmoRoom, WmoInteriorKeys,
+    CurrentAreaInterior, CurrentWmoInterior, EntityOutdoors, PlayerWmoRoom, UnitWmoRoom,
+    WmoInteriorKeys,
 };
 use probe::TraceLog;
 pub use probe::WmoCullProbe;
@@ -77,9 +78,10 @@ const PORTAL_NEAR_PARALLEL: f32 = 1.0e-4;
 /// The snap window (yd) for a near-parallel portal (the `0.1` pushed at `0x6a40c0`): a vertical
 /// doorway counts as crossed only while the eye is this close to its plane.
 const PORTAL_PLANE_SNAP: f32 = 0.1;
-/// Nearest-crossing accept eps for the portal leg (`0x80c4f4`, about `1e-4`): a portal crossing
-/// this close to the nearest face hit still wins, so a floor-hole portal flips the room.
-const NEAREST_TIE_EPS: f32 = 1.0e-4;
+/// Nearest-crossing accept for the portal leg (`0x6be421`-`0x6be434`): a crossing whose fraction
+/// is less than `0x80c4f4`'s `1e-4` past the best hit so far still wins, so a floor-hole portal
+/// flips the room. The fraction is of the 1760 yd ray ([`MAX_FLOOR_DROP`]): about 0.176 yd.
+const NEAREST_TIE_YD: f32 = 1.0e-4 * MAX_FLOOR_DROP;
 /// MOGI/MOGP `0x10000`, the callback-pass group: drawn in a third pass (`0x6b3d6f..0x6b3dbc`)
 /// against the full camera frustum, gated on nothing, and skipped by Pass 2 (`0x6b3d0b`). Both
 /// passes read MOGI; [`WmoGroupNav::flags`] is MOGP, which differs only by
@@ -1485,6 +1487,7 @@ mod tests {
             doodad_base: Default::default(),
             doodad_owner: Default::default(),
             doodad_groups: Default::default(),
+            convex_volume: Vec::new(),
         }
     }
 }

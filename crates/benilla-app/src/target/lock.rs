@@ -15,8 +15,6 @@
 //! the player's skill in the spell's own line (`0x6e384d → 0x6e3130 → [vtbl+0xa8] = 0x5ea690`,
 //! [`crate::spell::spell_skill_value`]), not the character level.
 
-use std::collections::BTreeSet;
-
 use benilla_formats::{LockSlot, LOCK_KEY_ITEM, LOCK_KEY_SKILL};
 use bevy::prelude::*;
 
@@ -50,6 +48,18 @@ pub(crate) struct GoFacts {
     /// `GAMEOBJECT_LEVEL`, the zero-`Skill` fallback's base. vmangos sets it only on transports
     /// (`GameObject.cpp:247`), so there the fallback asks nothing and the server gates.
     pub(crate) level: u32,
+}
+
+/// The known spell the resolver last matched to a skill slot by lock type, and what it compared:
+/// the out-params `0x5f84e5`-`0x5f850d` write at each match, before the value test, so after a scan
+/// with no sufficient opener they hold the last one tried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LockMatch {
+    pub(crate) spell: u32,
+    /// The skill the spell provides ([`benilla_formats::SpellDisplay::open_lock_skill`]).
+    pub(crate) points: i32,
+    /// The slot's requirement ([`required_skill`]).
+    pub(crate) required: i32,
 }
 
 /// The resolver's verdict: the reference's return and its spell-id out-param in one.
@@ -97,31 +107,32 @@ pub(crate) fn go_facts(go: Option<(&ObjectStore, u32)>) -> GoFacts {
 pub(crate) const GO_FLAG_LOCKED: u32 = 0x2;
 
 /// The reference's lock resolver `0x5f83d0`. Walks the eight `Lock.dbc` slots in order:
-/// - SKILL (2): past the Action gate, scan the known spells for an `OPEN_LOCK` effect whose
-///   `EffectMiscValue` is the slot's `Index`; a match sets `matched_spell` before the value test
-///   (`0x5f84f8`), then its effect value is compared to the requirement (`0x5f850f`).
+/// - SKILL (2): past the Action gate, scan the opener list for an `OPEN_LOCK` effect whose
+///   `EffectMiscValue` is the slot's `Index`; a match writes `matched` before the value test
+///   (`0x5f84f8`-`0x5f850d`), then its effect value is compared to the requirement (`0x5f850f`).
 /// - KEY (1): past the Action gate, look for the key item in our bags and keyring.
 /// - NONE (0): skipped.
 ///
 /// A SKILL or KEY slot makes the lock real even when the Action gate rejects it (`[ebp-1] = 1`
 /// before `0x5f81d0`), so a door whose only opener is gated out refuses instead of falling through
-/// to `CMSG_GAMEOBJ_USE`. Whether `matched_spell` is set routes the toast (`0xdf` or `0xe0`).
+/// to `CMSG_GAMEOBJ_USE`. Whether `matched` is set routes the toast (`0xdf` or `0xe0`); the
+/// GameObject tooltip colours its lock lines by it (`0x52ab2b`, `0x52abd8`).
 ///
 /// The first sufficient match is cast, so the scan order picks between two sufficient openers,
 /// such as 6478 "Opening" and 22810 "Opening - No Text" on LockType 13, which every character
-/// knows. `known` is a [`BTreeSet`], so ours scans in ascending spell id; the reference scans its
-/// opener list (`0xb700b0`) in the order `SMSG_INITIAL_SPELLS` listed them, later learns at the
-/// tail, and vmangos sends that packet in `std::unordered_map` order (`Player.cpp:3458`,
-/// `Player.h:113`).
+/// knows. `openers` is the opener list `0xb700b0` ([`crate::ui_action::PlayerActions::openers`]),
+/// scanned from the front (`0x5f845d`-`0x5f851f`): the order `SMSG_INITIAL_SPELLS` listed them,
+/// later learns at the tail. vmangos sends that packet in `std::unordered_map` order
+/// (`Player.cpp:3458`, `Player.h:113`), so which of the two is cast varies by character.
 pub(crate) fn resolve_lock(
     slots: &[LockSlot],
-    known: &BTreeSet<u32>,
+    openers: &[u32],
     spells: Option<&crate::ui_action::Spells>,
     skill_lines: Option<&benilla_formats::SkillLineCatalog>,
     me: Option<&ObjectStore>,
     objects: &crate::net::Objects,
     go: GoFacts,
-    matched_spell: &mut Option<u32>,
+    matched: &mut Option<LockMatch>,
 ) -> LockOutcome {
     let mut real = false;
     for slot in slots {
@@ -132,18 +143,22 @@ pub(crate) fn resolve_lock(
                     continue;
                 }
                 let Some(spells) = spells else { continue };
-                for &id in known {
+                for &id in openers {
                     let Some(spell) = spells.catalog.get(id) else {
                         continue;
                     };
                     if spell.open_lock_type() != Some(slot.index) {
                         continue;
                     }
-                    // `0x5f84f8`: set on the LockType match, before the value test.
-                    matched_spell.get_or_insert(id);
+                    // `0x5f84f8`-`0x5f850d`: written on the LockType match, before the value test.
                     let skill = crate::spell::spell_skill_value(me, skill_lines, id);
-                    let provides = spell.open_lock_skill(skill).unwrap_or(0);
-                    if provides >= required_skill(slot, go.level) {
+                    let found = LockMatch {
+                        spell: id,
+                        points: spell.open_lock_skill(skill).unwrap_or(0),
+                        required: required_skill(slot, go.level),
+                    };
+                    *matched = Some(found);
+                    if found.points >= found.required {
                         return LockOutcome::OpenBySpell(id);
                     }
                 }
@@ -167,26 +182,39 @@ pub(crate) fn resolve_lock(
     }
 }
 
+/// `SPELL_EFFECT_OPEN_LOCK` (`0x5f82c0 cmp [ebx],0x21`).
+const SPELL_EFFECT_OPEN_LOCK: u32 = 0x21;
+/// `SPELL_EFFECT_OPEN_LOCK_ITEM` (`0x5f831c cmp [ebx],0x3b`).
+const SPELL_EFFECT_OPEN_LOCK_ITEM: u32 = 0x3b;
+
 /// `0x5f8260`, the targeting cursor's question for the pending spell (`[0xceac58]`) over a
 /// GameObject, from the object dispatcher `0x4828d0` through `0x6e6460`. Unlike [`resolve_lock`]
-/// it matches the spell's own `OPEN_LOCK` effects against each slot's `Index` and compares no skill
-/// values, so the cursor lights on a chest the skill cannot open and the server refuses the click;
-/// no `Lock.dbc` row (`0x5f8180` null) is false, so the cursor greys over a mailbox.
-///
-/// Not built: the `SPELL_EFFECT_OPEN_LOCK_ITEM` (59) arm, which matches the cast item's entry
-/// against a KEY slot; the catalog lacks its per-effect id.
+/// it compares no skill values, so the cursor lights on a chest the skill cannot open and the
+/// server refuses the click; no `Lock.dbc` row (`0x5f8180` null) is false, so the cursor greys over
+/// a mailbox. For each of the spell's three effects (`0x5f83a2`): an `OPEN_LOCK` one passes a SKILL
+/// slot whose `Index` is its `EffectMiscValue` (`0x5f82e0`-`0x5f82ec`), an `OPEN_LOCK_ITEM` one a
+/// KEY slot whose `Index` is the cast item's entry (`0x5f8360`-`0x5f836c`); `cast_item` is that
+/// entry, `None` when the record's guid (`0xceac48`) names no streamed item (`0x5f8344`). Either
+/// slot's Action must hold (`0x5f81d0`).
 pub(crate) fn spell_opens_lock(
     slots: &[LockSlot],
     spell: &benilla_formats::SpellDisplay,
     go: GoFacts,
+    cast_item: Option<u32>,
 ) -> bool {
-    let Some(lock_type) = spell.open_lock_type() else {
-        return false;
+    let opens = |key_type: u32, index: u32| {
+        slots.iter().any(|slot| {
+            slot.key_type == key_type
+                && slot.index == index
+                && slot.available(go.state, go.flag_locked)
+        })
     };
-    slots.iter().any(|slot| {
-        slot.key_type == LOCK_KEY_SKILL
-            && slot.index == lock_type
-            && slot.available(go.state, go.flag_locked)
+    (0..3).any(|i| {
+        let skill = spell.effects[i] == SPELL_EFFECT_OPEN_LOCK
+            && opens(LOCK_KEY_SKILL, spell.effect_misc_value[i] as u32);
+        let key = spell.effects[i] == SPELL_EFFECT_OPEN_LOCK_ITEM
+            && cast_item.is_some_and(|entry| opens(LOCK_KEY_ITEM, entry));
+        skill || key
     })
 }
 
@@ -236,10 +264,8 @@ mod tests {
         use benilla_formats::SpellDisplay;
         // Pick Lock: LockType 1, Lockpicking.
         let pick_lock = SpellDisplay {
-            open_lock: Some(benilla_formats::OpenLock {
-                effect: 0,
-                lock_type: 1,
-            }),
+            effects: [0x21, 0, 0],
+            effect_misc_value: [1, 0, 0],
             ..SpellDisplay::default()
         };
         let unlocked = GoFacts {
@@ -251,26 +277,27 @@ mod tests {
         // A Lockpicking slot demanding 300 skill, Action 1 (applies while flagged locked).
         let matching = [skill_slot(1, 300, 1), LockSlot::default()];
         assert!(
-            spell_opens_lock(&matching, &pick_lock, unlocked),
+            spell_opens_lock(&matching, &pick_lock, unlocked, None),
             "the right LockType through an applicable slot lights the cursor"
         );
 
         // No skill compare: a slot far beyond Pick Lock still lights, and the server refuses.
         let brutal = [skill_slot(1, 9999, 1), LockSlot::default()];
         assert!(
-            spell_opens_lock(&brutal, &pick_lock, unlocked),
+            spell_opens_lock(&brutal, &pick_lock, unlocked, None),
             "0x5f8260 compares no skill values — an out-of-reach lock still lights"
         );
 
         // Wrong LockType (3, Mining): a lockpick greys over an ore vein.
         let mining = [skill_slot(3, 0, 1), LockSlot::default()];
-        assert!(!spell_opens_lock(&mining, &pick_lock, unlocked));
+        assert!(!spell_opens_lock(&mining, &pick_lock, unlocked, None));
 
         // The shared Action gate: Action 0 applies only while not flagged locked.
         assert!(!spell_opens_lock(
             &[skill_slot(1, 0, 0)],
             &pick_lock,
-            unlocked
+            unlocked,
+            None
         ));
         assert!(spell_opens_lock(
             &[skill_slot(1, 0, 0)],
@@ -278,32 +305,45 @@ mod tests {
             GoFacts {
                 flag_locked: false,
                 ..unlocked
-            }
+            },
+            None
         ));
 
         // No lock row is false, unlike `resolve_lock`: no Pick Lock on a mailbox.
-        assert!(!spell_opens_lock(&[], &pick_lock, unlocked));
+        assert!(!spell_opens_lock(&[], &pick_lock, unlocked, None));
         assert!(!spell_opens_lock(
             &[LockSlot::default()],
             &pick_lock,
-            unlocked
+            unlocked,
+            None
         ));
 
         // A spell with no OPEN_LOCK effect opens nothing, whatever the lock says.
         assert!(!spell_opens_lock(
             &matching,
             &SpellDisplay::default(),
-            unlocked
+            unlocked,
+            None
         ));
 
-        // A KEY slot belongs to the unbuilt effect-59 arm.
+        // A KEY slot belongs to the effect-59 arm: the cast item's entry, never a skill effect.
         let key = [LockSlot {
             key_type: LOCK_KEY_ITEM,
-            index: 1,
+            index: 5000,
             skill: 0,
             action: 1,
         }];
-        assert!(!spell_opens_lock(&key, &pick_lock, unlocked));
+        assert!(!spell_opens_lock(&key, &pick_lock, unlocked, Some(5000)));
+        let key_spell = SpellDisplay {
+            effects: [0, 0x3b, 0],
+            ..SpellDisplay::default()
+        };
+        assert!(spell_opens_lock(&key, &key_spell, unlocked, Some(5000)));
+        assert!(!spell_opens_lock(&key, &key_spell, unlocked, Some(5001)));
+        assert!(
+            !spell_opens_lock(&key, &key_spell, unlocked, None),
+            "no item streamed"
+        );
     }
 
     #[test]
@@ -338,7 +378,7 @@ mod tests {
         };
         // Spell → line: Mining is SkillLine 186.
         let lines = SkillLineCatalog::from_spell_lines([(2575, 186)]);
-        let known = BTreeSet::from([2575]);
+        let known = [2575];
         let mut objs = crate::ui_items::TestObjects::new();
         let objects = objs.get();
         // A 250-skill vein, available (Action 0, READY, not flagged).
@@ -406,7 +446,7 @@ mod tests {
         let mut matched = None;
         let out = resolve_lock(
             &slots,
-            &BTreeSet::new(),
+            &[],
             None,
             None,
             None,
@@ -489,7 +529,7 @@ mod tests {
         assert_eq!(
             resolve_lock(
                 &scholomance,
-                &BTreeSet::from([6247]),
+                &[6247],
                 Some(&spells),
                 None,
                 None,
@@ -509,7 +549,7 @@ mod tests {
         assert_eq!(
             resolve_lock(
                 &scholomance,
-                &BTreeSet::from([6247]),
+                &[6247],
                 Some(&spells),
                 None,
                 None,
@@ -529,7 +569,7 @@ mod tests {
         assert_eq!(
             resolve_lock(
                 &scholomance,
-                &BTreeSet::from([1804]),
+                &[1804],
                 Some(&spells),
                 None,
                 None,
@@ -541,8 +581,12 @@ mod tests {
         );
         assert_eq!(
             matched,
-            Some(1804),
-            "a LockType match writes the out-param before the value test"
+            Some(LockMatch {
+                spell: 1804,
+                points: 5,
+                required: 280,
+            }),
+            "a LockType match writes the out-params before the value test"
         );
 
         // The Searing Gorge gate, lock 84, has no Action 0 slot.
@@ -557,7 +601,7 @@ mod tests {
         assert_eq!(
             resolve_lock(
                 &searing_gorge,
-                &BTreeSet::from([6247]),
+                &[6247],
                 Some(&spells),
                 None,
                 None,
@@ -589,7 +633,7 @@ mod tests {
         assert_eq!(
             resolve_lock(
                 &vein,
-                &BTreeSet::from([2575]),
+                &[2575],
                 Some(&with_mining),
                 None,
                 None,
@@ -605,12 +649,12 @@ mod tests {
         );
     }
 
-    /// Two sufficient openers on one LockType: the lower spell id wins, `known` being ordered.
-    /// Lock 43 (a Hyacinth Mushroom's) has one SKILL slot, LockType 13 "Open Kneeling", Skill 0,
-    /// Action 0, and `playercreateinfo_spell` grants both 6478 "Opening" and 22810 "Opening - No
-    /// Text" to every race and class.
+    /// Two sufficient openers on one LockType: the first in the opener list wins (`0x5f845d`),
+    /// whatever its id. Lock 43 (a Hyacinth Mushroom's) has one SKILL slot, LockType 13 "Open
+    /// Kneeling", Skill 0, Action 0, and `playercreateinfo_spell` grants both 6478 "Opening" and
+    /// 22810 "Opening - No Text" to every race and class.
     #[test]
-    fn two_sufficient_openers_pick_the_lower_spell_id() {
+    fn two_sufficient_openers_pick_the_first_listed() {
         use benilla_formats::{OpenLock, SpellCatalog, SpellDisplay};
 
         let mut mushroom = [LockSlot::default(); 8];
@@ -647,7 +691,7 @@ mod tests {
         assert_eq!(
             resolve_lock(
                 &mushroom,
-                &BTreeSet::from([6478, 22810]),
+                &[6478, 22810],
                 Some(&spells),
                 None,
                 None,
@@ -656,16 +700,19 @@ mod tests {
                 &mut matched,
             ),
             LockOutcome::OpenBySpell(6478),
-            "6478 \"Opening\", never 22810 \"Opening - No Text\""
         );
-        assert_eq!(matched, Some(6478), "the toast's out-param agrees");
+        assert_eq!(
+            matched.map(|m| m.spell),
+            Some(6478),
+            "the toast's out-param agrees"
+        );
 
-        // Insertion order cannot change it: the set is ordered.
+        // The retail capture's order, 22810 ahead: the untitled bar's spell is cast.
         let mut matched = None;
         assert_eq!(
             resolve_lock(
                 &mushroom,
-                &BTreeSet::from([22810, 6478]),
+                &[22810, 6478],
                 Some(&spells),
                 None,
                 None,
@@ -673,8 +720,9 @@ mod tests {
                 unlocked,
                 &mut matched,
             ),
-            LockOutcome::OpenBySpell(6478),
+            LockOutcome::OpenBySpell(22810),
         );
+        assert_eq!(matched.map(|m| m.spell), Some(22810));
     }
 
     #[test]
@@ -686,7 +734,7 @@ mod tests {
         assert_eq!(
             resolve_lock(
                 &slots,
-                &BTreeSet::new(),
+                &[],
                 None,
                 None,
                 None,

@@ -33,6 +33,8 @@ mod worldmap_arrow;
 mod button;
 mod calls;
 mod camera_view;
+#[cfg(any(test, feature = "test-support"))]
+pub mod census;
 mod channel;
 mod char_stats;
 pub mod chat_bubble;
@@ -52,7 +54,8 @@ pub mod diagnostics;
 mod editbox;
 pub mod instance;
 pub(crate) use editbox::{
-    adopt_text_region, apply_xml_bytes, editbox_text_region_wrapper, set_selection_color,
+    adopt_text_region, apply_xml_bytes, editbox_text_region_wrapper, set_history_lines,
+    set_selection_color,
 };
 pub(crate) use messageframe::set_xml_insets as set_message_xml_insets;
 pub(crate) use tooltip::post_load as tooltip_post_load;
@@ -84,8 +87,8 @@ pub use glue::{glue_events, VmKind};
 pub use glue_core::scanf_d;
 pub use glue_core::{
     glue_status_key, launch_addon_url, launch_addon_url_allowed, launch_url_allowed, GlueCall,
-    GlueCredentials, GlueHost, GlueNotice, GlueRequest, GlueSignal, GlueText, NoticeState,
-    GLUE_STATUS_KEYS,
+    GlueCredentials, GlueHost, GlueNotice, GlueNotices, GluePin, GlueRequest, GlueSignal, GlueText,
+    NoticeState, GLUE_STATUS_KEYS,
 };
 pub use glue_create::{
     GlueCreateCatalog, GlueCreateClass, GlueCreateCounts, GlueCreateLook, GlueCreateRace,
@@ -102,6 +105,7 @@ mod gm_ticket;
 mod gossip;
 mod guild;
 mod handler_prof;
+mod host;
 mod hyperlink;
 mod lfg;
 mod lottery;
@@ -114,6 +118,8 @@ pub use surface::widget_method_census;
 mod input_verbs;
 mod inspect;
 mod inventory_verbs;
+mod item_calls;
+mod item_read;
 mod item_stats;
 mod item_text;
 pub mod keybind;
@@ -141,7 +147,9 @@ mod messageframe;
 mod minimap;
 mod movieframe;
 pub mod nameplate;
-pub use nameplate::{PlateBitWrites, PlateGeometry, PlateState, PLATE_BIT_ENEMY, PLATE_BIT_FRIEND};
+pub use nameplate::{
+    PlateBitWrite, PlateBitWrites, PlateGeometry, PlateState, PLATE_BIT_ENEMY, PLATE_BIT_FRIEND,
+};
 mod model;
 mod modelframe;
 mod mouseover;
@@ -180,13 +188,17 @@ mod taxi;
 mod tick;
 pub use tick::system_chat_args;
 mod tooltip;
+mod tooltip_aura;
 mod tooltip_item;
 mod tooltip_spell;
+mod tooltip_studied;
+mod tooltip_text;
 mod tooltip_unit;
 mod ui_errors;
 mod ui_scale;
 mod update_walk;
-pub use tooltip_unit::TooltipTint;
+pub use tooltip_studied::{PetAbility, StudiedCreature};
+pub use tooltip_unit::{OwnerTitle, OwnerTitleKind, PartyRecord, TooltipTint, UnitTooltipFacts};
 mod trade;
 mod tradeskill;
 mod trainer;
@@ -199,43 +211,57 @@ mod who_sort;
 mod worldmap;
 mod worldstate;
 mod worn_display;
+pub(crate) mod xml_layout;
 mod zone_text;
 
-pub use action::{ActionSlot, ActionState, ActionUse};
+pub use action::{
+    macro_slot_id, macro_slot_word, ActionBarCall, ActionSlot, ActionState, ActionUse, CastView,
+    OpenProfessions, Profession,
+};
 pub use addon::{addon_load_context, AddOnInfo, AddonLoad, AddonReply, AddonSecurity};
 pub use addon_enable::{AddonStateFiles, EnableHash, EnableStore};
 pub use addon_message::{AddonDistribution, AddonSend};
 pub use auction::{
-    AuctionBid, AuctionCategory, AuctionHighBidder, AuctionItemRow, AuctionListState, AuctionQuery,
-    AuctionStartRequest, AuctionState, AuctionSubCategory, BIDDER, LIST, OWNER, SORT_KEYS,
+    cancel_fee, tick_ms as auction_tick_ms, AuctionBid, AuctionCall, AuctionCategory,
+    AuctionHighBidder, AuctionItemRow, AuctionListState, AuctionQuery, AuctionRowBid,
+    AuctionStartRequest, AuctionState, AuctionSubCategory, BidVerdict, BIDDER, LIST, OWNER,
+    SORT_KEYS,
 };
-pub use aura::{AuraState, TrackingState};
+pub use aura::{AuraCall, AuraState, TrackingState, UnitAuraList};
 pub use backdrop::{Backdrop, Insets};
-pub use bank::BankState;
+pub use bank::{BankCall, BankState};
 pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
-pub use battlefield_queue::{BattlefieldListView, BattlefieldMapInfo, BattlefieldQueueSlot};
+pub use battlefield_queue::{
+    BattlefieldCall, BattlefieldListView, BattlefieldMapInfo, BattlefieldQueueSlot,
+};
 pub use battlefield_score::{BattlefieldScoreRow, BattlefieldScores, BattlefieldStatColumn};
 pub use bind_confirm::PendingEquipAnswer;
-pub use binding_abi::{s_str_to_float, s_str_to_int};
-pub use calls::{NearestMode, QueuedCall, ScriptCall};
+pub use binder::BinderCall;
+pub use binding_abi::{ftol, s_str_to_float, s_str_to_int};
+pub use calls::{spell_owner, ItemCallback, NearestMode, QueuedCall, RecordAsk, ScriptCall};
 pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
-pub use channel::{ChannelCommand, RecruitmentPlan, RecruitmentRun, ZoneChannelRow};
+pub use channel::{ChannelCommand, JoinedChannel, RecruitmentPlan, ZoneChannelRow};
 pub use char_stats::{
     weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, UnitCombatStats,
     BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use chat_misc::EmoteRequest;
-pub use chat_send::{ChatGroup, ChatSend, SEND_CHAT_TOKENS};
+pub use chat_send::{
+    expand_target_tokens, validate_escapes, ChatGroup, ChatSend, InvalidEscape, INVALID_ESCAPE,
+    SEND_CHAT_TOKENS,
+};
 pub use chat_types::ChatTypeColor;
 pub use chat_window::{message_group_index, ChatWindowLook, MESSAGE_GROUPS};
+pub use console_exec::s_str_tokenize;
 pub use console_exec::{console_word, cvar_name_arg, no_such_cvar, set_args};
 pub use container::{
     BagAutoStore, ContainerMove, ContainerSlot, ContainerState, ContainerUse, EnchantView,
     PendingWrap, PetitionSlotView, RandomPropertyView, UiCursorMode, UseArm, UseFork,
 };
-pub use craft::{CraftReagent, CraftRecipe, CraftState, CraftTooltip};
+pub use craft::{CraftCall, CraftDifficulty, CraftReagent, CraftRecipe, CraftState, CraftTooltip};
 pub use cursor::equip::{AutoEquip, BIND_WHEN_EQUIPPED};
 pub use cursor::money::coin_icon;
+pub use cursor::swap::Swap;
 pub use cursor::{
     CursorAction, CursorItem, CursorMacro, CursorMerchantItem, CursorMoney, CursorPayload,
     CursorPetAction, CursorSpell, CursorStablePet, EnchantAnswer, EnchantConfirm, HeldCursor,
@@ -248,10 +274,10 @@ pub use cvar_checks::{
     check_small_cull, check_tex_lod_bias, check_triple_buffer, CvarCheck, CvarRows, CvarVerdict,
 };
 pub use cvar_checks::{
-    check_dist_cull, check_error_filter, check_footstep_bias, check_horizon_farclip,
-    check_lod_dist, check_map_obj_light_lod, check_max_lights, check_particle_density,
-    check_shadow_bias, check_target_nearest_distance, check_texture_lod_dist, check_unit_draw_dist,
-    check_water_lod,
+    check_dist_cull, check_error_filter, check_ffx_echo, check_footstep_bias,
+    check_horizon_farclip, check_lod_dist, check_map_obj_light_lod, check_max_lights,
+    check_particle_density, check_shadow_bias, check_target_nearest_distance,
+    check_texture_lod_dist, check_unit_draw_dist, check_water_lod, scanf_f_prefix,
 };
 pub use cvars::small_cull_text;
 pub use cvars::{
@@ -260,27 +286,31 @@ pub use cvars::{
     VIDEO_DEFAULT_CVARS, WORLD_DETAIL_STOPS,
 };
 pub use death::{DeathAction, DeathUiState};
+pub use dialog_verbs::MeetingStoneCall;
 pub use dressup::DressUpIntent;
 pub use duel::DuelRequest;
 pub use follow::FollowRequest;
 pub use gm_survey::{GmSurveyTables, SurveyAnswerSend};
-pub use gm_ticket::{GmTicketIntent, GmTicketWrite};
-pub use gossip::{GossipMenu, GossipOptionView, GossipQuestRow};
+pub use gm_ticket::{GmTicketCall, GmTicketIntent, GmTicketWrite};
+pub use gossip::{GossipCall, GossipMenu, GossipOptionView, GossipQuestRow};
 pub use guild::{
-    GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState, LastOnline, UnitGuild,
-    MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
+    GuildCall, GuildCells, GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildState, LastOnline,
+    UnitGuild, MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
-pub use input_verbs::{BindingInput, FiredInput, HeldInput};
+pub use host::{CallHost, CallTail, Deferring};
+pub use input_verbs::{BindingInput, FiredInput, HeldInput, LookCall, PostureCall, ViewAxis};
+pub use item_calls::ItemCall;
+pub use item_read::{ItemInfoFields, ItemKey, ItemRead, ItemRoll};
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
 pub use modelframe::{CharacterPaneFrame, ModelPaneFrame, ModelWanted};
 pub use petition::{
-    validate_guild_name, PetitionRecordView, PetitionRequest, PetitionState, PETITION_TYPE_CHARTER,
+    validate_guild_name, PetitionCall, PetitionRecordView, PetitionState, PETITION_TYPE_CHARTER,
     PETITION_TYPE_PETITION,
 };
 pub use protected::InputEvents;
 pub use tabard::{
-    emblem_mask_path, TabardHost, TabardIntent, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
+    emblem_mask_path, TabardCall, TabardHost, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
     TABARD_CREATION_COST,
 };
 pub use video_pairs::VIDEO_PAIR_CVARS;
@@ -288,75 +318,97 @@ pub use worldmap_arrow::ARROW_MODEL;
 
 pub(crate) use button::{refresh_label_lua, state_font_lua, LabelFont};
 pub(crate) use font_block::{face_loads, own_font_lua, SAME_FONT_HEIGHT};
-pub use inspect::{InspectView, UnitReach};
-pub use item_stats::{item_usable, ItemSetView, ItemTemplateView, PlayerReqState};
-pub use item_text::ItemTextState;
+pub use inspect::{InspectCall, UnitReach};
+pub use instance::InstanceCall;
+pub use item_stats::{
+    item_usable, ItemRecipe, ItemSetView, ItemSpellLine, ItemTemplateView, PlayerReqState,
+    TaughtSpell,
+};
+pub use item_text::{ItemTextCall, ItemTextState};
 pub use layout_cache::{AnchorLayout, FrameLayout, LayoutPoint};
 pub use lock_check::{check_lock, LockCheck, LockOpener, LockOpeners, LockSlotView};
-pub use loot::{LootRow, LootState, LOOT_PORTRAIT_UNIT};
-pub use loot_roll::{LootRollEntry, LootRollsState};
-pub use macros::{MacroBinding, MacroState, MacroView, MAX_MACROS, MAX_MACRO_BODY, MAX_MACRO_NAME};
+pub use loot::{LootCall, LootRow, LootState, LOOT_PORTRAIT_UNIT};
+pub use loot_roll::{LootRollCall, LootRollEntry, LootRollsState};
+pub use macros::{
+    macro_lines, MacroBinding, MacroDerives, MacroState, MacroView, CHARACTER_ID_BASE, MAX_MACROS,
+    MAX_MACRO_BODY, MAX_MACRO_NAME,
+};
 pub use mail::{
-    MailInboxRow, MailInvoice, MailSendRequest, MailState, PackageView, StationeryView,
+    MailCall, MailInboxRow, MailInvoice, MailRowVerb, MailSendRequest, MailState, PackageView,
+    StationeryView,
 };
 pub use measure::TextMeasure;
-pub use merchant::{ItemStatsHead, MerchantItem, MerchantState, RepairCosts};
+pub use merchant::{ItemStatsHead, MerchantCall, MerchantItem, MerchantState, RepairCosts};
 pub(crate) use minimap::apply_model_attrs as apply_minimap_model_attrs;
 pub use minimap::{
-    MinimapRimArrow, CORPSE_ARROW as MINIMAP_CORPSE_ARROW, GROUP_ARROW as MINIMAP_GROUP_ARROW,
-    GUIDE_ARROW as MINIMAP_GUIDE_ARROW, LANDMARK_ARROW as MINIMAP_LANDMARK_ARROW,
+    MinimapCall, MinimapRimArrow, CORPSE_ARROW as MINIMAP_CORPSE_ARROW,
+    GROUP_ARROW as MINIMAP_GROUP_ARROW, GUIDE_ARROW as MINIMAP_GUIDE_ARROW,
+    LANDMARK_ARROW as MINIMAP_LANDMARK_ARROW,
 };
 pub(crate) use model::Model;
 pub use model::{
     FontProbe, MacroIconSource, TextureProbe, TextureSizeFn, TextureSizeProbe, WorldLocFn,
     WorldLocProjector,
 };
-pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, SavedInstanceInfo};
-pub use pet::{PetActionView, PetStats};
-pub use pvp::{decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, RankTitle};
-pub use quest::{
-    QuestAction, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState,
+pub use party::{
+    PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, ReadyCheckState, SavedInstanceInfo,
 };
-pub use quest_log::{QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS};
+pub use pet::{PetActionView, PetCall, PetStats, PET_DISMISS_WORD};
+pub use pvp::{
+    decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, PvpCall, RankTitle,
+};
+pub use quest::{QuestCall, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState};
+pub use quest_log::{
+    QuestLogCarry, QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS,
+};
 pub(crate) use region::{
     apply_texture_name, apply_wrap_attrs, implicit_creation_anchor_lua, install_loaded_texture,
     load_blend_mode, load_texture_file, load_texture_name, load_xml_font_file,
     texture_name_verdict, FileLoad,
 };
-pub use reputation::{FactionEntry, ReputationSend, ReputationState};
+pub use reputation::{FactionEntry, ReputationCall, ReputationListOp, ReputationState};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
 pub(crate) use simplehtml::{
     element_fonts_lua as simplehtml_element_fonts_lua,
     element_of_xml_tag as simplehtml_element_of_xml_tag,
 };
-pub use skills::{SkillEntry, SkillsState};
-pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo};
+pub use skills::{SkillCall, SkillEntry, SkillsState};
+pub use social::{FriendInfo, IgnoreInfo, SocialCall, SocialState, WhoInfo};
 pub use sound::{MusicRequest, SoundRequest};
 pub use spellbook::{
-    resolve_spell_by_name, PetBookState, SpellBookState, SpellSlotView, SpellTabView,
+    resolve_spell_in_books, NamedSpell, PetBookState, SpellBookState, SpellSlotView, SpellTabName,
+    SpellTabView,
 };
-pub use stable::{StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
-pub use summon::SummonConfirmUiState;
-pub use talent::{TalentPrereqView, TalentTabView, TalentUiState, TalentView};
-pub use taxi::{TaxiNodeType, TaxiUiNode, TaxiUiState};
-pub use tooltip_spell::SpellTooltipView;
-pub use trade::{TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
-pub use tradeskill::{TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState};
+pub use stable::{StableCall, StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
+pub use summon::{SummonCall, SummonConfirmUiState};
+pub use talent::{
+    TalentCall, TalentPrereqView, TalentReq, TalentTabView, TalentUiState, TalentView,
+};
+pub use taxi::{TaxiCall, TaxiNodeType, TaxiUiNode, TaxiUiState};
+pub use tooltip_aura::{AuraKey, AuraTooltipView};
+pub use tooltip_spell::{ReputationRequirement, SpellTooltipView};
+pub use tooltip_text::{KeyedArg, TextPart, TooltipText};
+pub use trade::{TradeCall, TradeOpenItem, TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
+pub use tradeskill::{
+    TradeSkillCall, TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState,
+};
 pub use trainer::{
-    TrainerAbilityReq, TrainerGroup, TrainerService, TrainerServiceCategory, TrainerSkillReq,
-    TrainerState, TrainerTooltip, TRAINER_GROUP_KNOWN,
+    ProductWait, TrainerAbilityReq, TrainerCall, TrainerGroup, TrainerService,
+    TrainerServiceCategory, TrainerSkillReq, TrainerState, TrainerTooltip, TRAINER_GROUP_KNOWN,
 };
+pub use tutorial::TutorialCall;
 pub(crate) use types::{monochrome_flag, FontMask, MeasuredText, RegionData};
 pub use types::{
     BlendMode, EditAction, EditBoxAdvanceRequest, EditBoxTextUi, EditOutcome, EditUnit,
     ExtractedQuad, FontObject, FontShadow, Gradient, JustifyH, JustifyV, LineMeasureRequest,
-    MeasureRequest, Outline, QuadContent, ScriptValue, TexCoords,
+    MeasureRequest, Outline, QuadContent, ScriptValue, TexCoords, TextShadow,
 };
-pub use unit::by_name::{self, NameCandidate};
+pub use unit::by_name::{self, NameCandidate, SeatedSelection};
 pub use unit::{
     grey_band, level_reads_unknown, parse_unit_token, power_token, unit_is_grey, PlayerRecord,
-    SelectionRequest, UnitBase, UnitGuids, UnitState, UnitTokenParse,
+    SelectionRequest, UnitBase, UnitGuids, UnitObject, UnitObjectRead, UnitRelations, UnitState,
+    UnitTokenParse,
 };
 pub use weapon_enchant::WeaponEnchant;
 pub use who_sort::{WhoSortChain, WhoSortKey};
@@ -366,7 +418,7 @@ pub use worldmap::{
 };
 pub use worldstate::WorldStateUiView;
 pub use worn_display::WornDisplay;
-pub use zone_text::ZoneTexts;
+pub use zone_text::{ZonePvp, ZoneTexts};
 
 use mlua::Lua;
 
@@ -612,9 +664,10 @@ fn open_state(vm: VmKind) -> mlua::Result<Lua> {
     let mut model = Model::new();
     model.vm = vm;
     lua.set_app_data(model);
-    // Before anything can fire a handler and while no app-data borrow is held, as the
-    // profiler's slot requires.
+    // Before anything can fire a handler: every VM carries the profiler's slot and the call
+    // host's.
     handler_prof::install(&lua);
+    host::install(&lua);
 
     // `0x7039e0`: the base array `0x811e28`, the four libraries and the compat chunk `0x8722e8`.
     stdlib::sandbox(&lua)?;
@@ -759,6 +812,7 @@ impl UiScript {
     pub fn new() -> mlua::Result<UiScript> {
         let lua = install_framescript(VmKind::InGame)?;
         install_in_game(&lua)?;
+        object::guard_receivers(&lua)?;
         Ok(Self::host(lua))
     }
 
@@ -770,14 +824,31 @@ impl UiScript {
     pub fn new_glue() -> mlua::Result<UiScript> {
         let lua = install_framescript(VmKind::Glue)?;
         glue::install(&lua)?;
+        object::guard_receivers(&lua)?;
         Ok(Self::host(lua))
     }
 
     fn host(lua: Lua) -> UiScript {
+        let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(mut model) = lua.app_data_mut::<Model>() {
+            model.session = session;
+        }
         UiScript {
             lua,
             instructions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            session: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            session,
+        }
+    }
+
+    /// A handle on the VM `lua` belongs to, for engine code a verb reaches while the entry that
+    /// ran the script holds the VM ([`host::CallHost::apply`]). It is the same session; an
+    /// instruction budget is the entry's own.
+    pub(crate) fn reentrant(lua: &Lua) -> UiScript {
+        let session = lua.app_data_ref::<Model>().expect("model app_data").session;
+        UiScript {
+            lua: lua.clone(),
+            instructions: Default::default(),
+            session,
         }
     }
 
@@ -808,12 +879,19 @@ impl UiScript {
     pub fn fork(&self) -> UiScript {
         let lua = self.lua.fork();
         lua.remove_hook();
-        lua.set_app_data(self.model_ref().clone());
+        let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut model = self.model_ref().clone();
+        model.session = session;
+        // What waits is the original's host's, and its handlers' values its VM's.
+        model.script_calls.clear();
+        lua.set_app_data(model);
+        // A fork is a VM of its own, so it carries the profiler's slot and the call host's.
         handler_prof::install(&lua);
+        host::install(&lua);
         UiScript {
             lua,
             instructions: Default::default(),
-            session: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            session,
         }
     }
 
@@ -881,7 +959,9 @@ impl UiScript {
     /// take the aspect from `gxResolution` (`0x46ab40`, `0x4901e0`; 4/3 while `widescreen` is
     /// off), never the live window. Here every resize sets the cells from the window, because the
     /// UI is kept live across a resize, and `widescreen` off keeps the window's aspect, as a 4:3
-    /// root over a wider window would take a seam stretched on one axis.
+    /// root over a wider window would take a seam stretched on one axis. A dragged frame with no
+    /// layout-cache row (unnamed, or `SetUserPlaced(false)`) keeps its drag pin in layout units,
+    /// where the rebuild would put it back where its script places it.
     pub fn set_window_size(&mut self, width: f32, height: f32) -> bool {
         let a = if width > 0.0 && height > 0.0 {
             width / height
@@ -892,11 +972,21 @@ impl UiScript {
     }
 
     fn set_root(&mut self, new: Rect, aspect: Option<f32>) -> bool {
-        let mut model = self.model_mut();
-        if model.screen == new && model.aspect.map(f32::to_bits) == aspect.map(f32::to_bits) {
+        let (same, before) = {
+            let model = self.model_ref();
+            let same =
+                model.screen == new && model.aspect.map(f32::to_bits) == aspect.map(f32::to_bits);
+            (same, model.layout_units())
+        };
+        if same {
             return false;
         }
-        let before = model.layout_units();
+        // New cells are a reload, whose teardown writes the layout cache under the cells in force
+        // (`0x490e60`) and whose build seats the user-placed frames from it under the new
+        // (`0x4905e0`): the rows are taken before anything moves.
+        let next = crate::layout::LayoutUnits::from_aspect(Model::aspect_of(new, aspect));
+        let reseat = (next != before).then(|| self.user_placed_layouts());
+        let mut model = self.model_mut();
         model.screen = new;
         model.aspect = aspect;
         let units = crate::layout::LayoutUnits::from_aspect(model.screen_aspect());
@@ -910,11 +1000,15 @@ impl UiScript {
                 minimap::seat_engine_children(&mut model, h);
             }
             worldmap_arrow::rescale(&mut model);
+            backdrop::cells_changed(&mut model);
         }
         model.touch_layout();
         drop(model);
         // The implicit rects are in layout units, which follow the aspect.
         self.reapply_implicit_rects();
+        if let Some(rows) = reseat {
+            self.reseat_user_placed(rows);
+        }
         true
     }
 
@@ -950,10 +1044,10 @@ impl UiScript {
             })
             .collect();
         for h in arrows {
-            let size = model
-                .layout_inputs
-                .get(&h)
-                .map_or((0.0, 0.0), |i| (i.width, i.height));
+            let size = model.layout_inputs.get(&h).map_or((0.0, 0.0), |i| {
+                let u = model.layout_units();
+                (i.width.script(u), i.height.script(u))
+            });
             let loaded = match model.arena.frame(h).map(|f| &f.kind_state) {
                 Some(KindState::Model(m)) => m
                     .path
@@ -998,9 +1092,13 @@ impl UiScript {
         }
     }
 
-    /// Drain the world points our own `Minimap:PingLocation` pinged since the last call.
+    /// The world points our own `Minimap:PingLocation` calls pinged, which a harness's VM kept
+    /// ([`Self::keep_calls`]).
     pub fn take_minimap_pings_sent(&mut self) -> Vec<(f32, f32)> {
-        std::mem::take(&mut self.model_mut().minimap_pings_sent)
+        self.take_calls_where(|c| match c {
+            ScriptCall::Minimap(MinimapCall::Ping { x, y }) => Some((*x, *y)),
+            _ => None,
+        })
     }
 
     /// What this VM's texture setter for `slot` last stored, with the call's stamp; `None` while
@@ -1054,16 +1152,20 @@ impl UiScript {
 
     /// Run a chunk under the name the 1.12 client gives it ([`addon_chunk_name`] for addon files).
     pub fn run_chunk_named(&self, chunk: &[u8], name: &str) -> mlua::Result<()> {
-        self.lua
-            .load(crate::source::chunk(chunk))
-            .set_name(name)
-            .set_mode(mlua::ChunkMode::Text)
-            .exec()
+        host::unheld(&self.lua, || {
+            self.lua
+                .load(crate::source::chunk(chunk))
+                .set_name(name)
+                .set_mode(mlua::ChunkMode::Text)
+                .exec()
+        })
     }
 
     /// Load and evaluate a Lua chunk, returning its result: for tests and one-shot queries.
     pub fn eval<T: mlua::FromLuaMulti>(&self, chunk: &str) -> mlua::Result<T> {
-        self.lua.load(chunk).set_mode(mlua::ChunkMode::Text).eval()
+        host::unheld(&self.lua, || {
+            self.lua.load(chunk).set_mode(mlua::ChunkMode::Text).eval()
+        })
     }
 
     /// How many values the Lua expression `expr` returns (`"GetItemInfo(1)"`, not a chunk), zero
@@ -1555,7 +1657,10 @@ impl UiScript {
             return;
         };
         for arg in pending {
-            if let Err(e) = arg.value(&self.lua).and_then(|v| handler.call::<()>(v)) {
+            let ran = host::unheld(&self.lua, || {
+                arg.value(&self.lua).and_then(|v| handler.call::<()>(v))
+            });
+            if let Err(e) = ran {
                 self.model_mut()
                     .errors
                     .push(format!("error handler itself failed: {e}"));

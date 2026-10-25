@@ -99,6 +99,19 @@ pub(crate) fn build_engine_children(lua: &Lua, minimap: FrameHandle) {
     }
 }
 
+/// A minimap verb the host applies inside its call ([`super::ScriptCall::Minimap`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MinimapCall {
+    /// `Minimap:PingLocation` at the world point `(x, y)` it computed (`0x4eee48`): the process's
+    /// ping there and, in a party or raid, `MSG_MINIMAP_PING` (`0x4eef72`).
+    Ping { x: f32, y: f32 },
+    /// The same click with the targeting cursor wanting a location (`0x6e48a0`, `0x6e6320` at
+    /// `0x4eee67`, `0x4eee74`): the terrain trace down the point's column (`0x672170`, flags
+    /// `0x100`), its hit raised 8 (`[0x807b10]`, `0x4eeee9`) and bound as the spell's location
+    /// (`0x6e60f0`); a miss does nothing (`0x4eeedd`). No ping either way.
+    Ground { x: f32, y: f32 },
+}
+
 /// What the `CMinimap` ctor takes from the screen-scale cells: `base = G48 · 5/3` (`0x4edc42`,
 /// `0x4edc47`), about 1 at 4:3; the eight arrow frames' width and height, the disc ([`disc`],
 /// through slots 5 and 6 at `0x4ede9e`, `0x4edeaf`); the player arrow's offset of
@@ -125,9 +138,9 @@ pub(crate) fn seat_engine_children(model: &mut Model, minimap: FrameHandle) {
     let side = disc * unit;
     for h in arrows {
         let input = model.layout_inputs.entry(h).or_default();
-        let changed = input.width.to_bits() != side.to_bits();
-        input.width = side;
-        input.height = side;
+        let changed = input.width.bits() != crate::layout::Len::Script(side).bits();
+        input.width = crate::layout::Len::Script(side);
+        input.height = crate::layout::Len::Script(side);
         model.invalidate_frame(h, changed);
     }
     if let Some(h) = player {
@@ -430,8 +443,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         // first is negated (`0x4eedeb`) and divided by the frame's given height (slot 0x20,
         // `0x4eee31`), the second by its width (slot 0x1c, `0x4eee21`): fractions of its own size,
         // whatever its scale. Each times the zoom diameter (`0x4eecf8`) offsets the player's point,
-        // world X by the second and world Y by the first (`0x4eee48`), with no disc test. The
-        // party send (`0x4eef72`) goes to the host; the ping then applies at once (`0x4eefb5`).
+        // world X by the second and world Y by the first (`0x4eee48`), with no disc test. With the
+        // targeting cursor wanting a location the point goes to the host as a ground cast, and
+        // nothing pings (`0x4eee67`-`0x4eef14`); otherwise the party's packet (`0x4eef72`) goes
+        // out through the host inside the call, and the ping applies at once (`0x4eefb5`).
         lua.create_function(|lua, args: mlua::MultiValue| {
             let player = lua
                 .app_data_ref::<Model>()
@@ -446,23 +461,51 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let (mut first, mut second) = (0.0_f64, 0.0_f64);
             if let (Some(x), Some(y)) = (x, y) {
                 let h = this_minimap(lua, &arg(0))?;
-                let (w, ht) = {
-                    let model = lua.app_data_ref::<Model>().expect("model app_data");
-                    model
-                        .layout_inputs
-                        .get(&h)
-                        .map_or((0.0, 0.0), |i| (i.width, i.height))
-                };
-                first = -x / f64::from(ht);
-                second = y / f64::from(w);
+                // Both arguments are stored by `S` (`0x4eede6`, `0x4eee11`) and divided by the
+                // frame's stored height and width, the layout slots 0x20 and 0x1c.
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                let u = model.layout_units();
+                let (w, ht) = model
+                    .layout_inputs
+                    .get(&h)
+                    .map_or((0.0, 0.0), |i| (i.width.layout(u), i.height.layout(u)));
+                let stored = |v: f32| f64::from(u.store(v));
+                first = -stored(x as f32) / f64::from(ht);
+                second = stored(y as f32) / f64::from(w);
             }
-            super::tick::verb(lua, |model| {
+            let (world, ground) = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                let ground = model.spell_targeting && model.location_pick_armed;
                 let d = 2.0 * f64::from(model.minimap.radius_yd());
-                let world = (
-                    (f64::from(player.0) + second * d) as f32,
-                    (f64::from(player.1) + first * d) as f32,
+                // Each fraction times the diameter is stored as a float (`0x4eee2e`, `0x4eee3d`).
+                let (second, first) = (
+                    f64::from((second * d) as f32),
+                    f64::from((first * d) as f32),
                 );
-                model.minimap_pings_sent.push(world);
+                let world = (
+                    (f64::from(player.0) + second) as f32,
+                    (f64::from(player.1) + first) as f32,
+                );
+                (world, ground)
+            };
+            if ground {
+                return super::calls::submit(
+                    lua,
+                    super::ScriptCall::Minimap(MinimapCall::Ground {
+                        x: world.0,
+                        y: world.1,
+                    }),
+                );
+            }
+            // The host's half: the group's packet (`0x4eef72`).
+            super::calls::submit(
+                lua,
+                super::ScriptCall::Minimap(MinimapCall::Ping {
+                    x: world.0,
+                    y: world.1,
+                }),
+            )?;
+            super::tick::verb(lua, |model| {
                 if let Some((a, b)) = model.minimap.apply_ping(world) {
                     model.raise("MINIMAP_PING", super::ping_args("player", a, b));
                 }

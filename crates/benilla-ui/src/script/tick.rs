@@ -12,8 +12,7 @@ impl UiScript {
     /// that tick's `OnUpdate` pass: the host's lane ([`Model::pending_events`]), for a producer
     /// outside any Lua verb. A drain runs a step behind its input, so firing at once would
     /// overtake events the host already queued. A Lua verb's own events never wait here: they
-    /// fire inside it ([`verb`]), so the soulbind confirm for an item placed into a worn slot
-    /// follows that placement's `CURSOR_UPDATE`, whose handler hides it (`UIParent.lua:357-361`).
+    /// fire inside it ([`verb`]).
     pub fn queue_event(&mut self, event: &str, args: Vec<ScriptValue>) {
         self.model_mut()
             .pending_events
@@ -57,18 +56,30 @@ impl Model {
         }
     }
 
-    /// Set or clear the client's lock on item `guid` ([`Model::item_locks`]). Inside a [`verb`]
-    /// segment the change is also recorded, so the segment's handlers see each lock as it stood
-    /// when their event was raised, as `LockItem` and `UnlockItem` set the bit before they signal
-    /// (`0x495409`, `0x495449`).
+    /// Set or clear the client's lock on item `guid` ([`Model::item_locks`]): every write but a
+    /// fresh VM's seat comes this way. `LockItem` and `UnlockItem` set the bit before they signal
+    /// (`0x495409`, `0x495449`), so each handler reads the locks as its event left them: inside a
+    /// [`verb`] segment the change is recorded with the segment's events, and outside one, made
+    /// while something waits for the host, it waits behind them ([`super::calls::Waiting::Lock`]).
     pub(crate) fn set_item_lock(&mut self, guid: u64, locked: bool) {
-        let was = if locked {
-            !self.item_locks.insert(guid)
-        } else {
-            self.item_locks.remove(&guid)
-        };
-        if let Some(segment) = &mut self.verb_events {
-            segment.push(Raised::Lock { guid, locked, was });
+        let was = set_lock_bit(self, guid, locked);
+        match &mut self.verb_events {
+            Some(segment) => segment.push(Raised::Lock { guid, locked, was }),
+            None if !self.script_calls.is_empty() => {
+                self.push_waiting(super::calls::Waiting::Lock { guid, locked, was });
+            }
+            None => {}
+        }
+    }
+
+    /// Inside a [`verb`] segment, hand `call` to the host in its place among the segment's
+    /// signals, as engine code a verb shares makes it there: `0x4e58e0`'s send ahead of the
+    /// `ACTIONBAR_SLOT_CHANGED` it signals (`0x4e5998`). Engine code reaches this only inside a
+    /// verb.
+    pub(crate) fn call_in_verb(&mut self, call: super::ScriptCall) {
+        match &mut self.verb_events {
+            Some(segment) => segment.push(Raised::Call(Box::new(call))),
+            None => debug_assert!(false, "a call outside a verb segment: {call:?}"),
         }
     }
 
@@ -91,6 +102,55 @@ pub(crate) enum Raised {
     Lock { guid: u64, locked: bool, was: bool },
     /// Put back the cursor the segment left.
     EndCursorView,
+    /// A cursor write, its own records inside it ([`super::cursor::write`]).
+    CursorWrite(Box<super::cursor::CursorWrite>),
+    /// A call the engine code made in its place among the segment's signals
+    /// ([`Model::call_in_verb`]), handed to the host there.
+    Call(Box<super::ScriptCall>),
+}
+
+/// Undo `raised`'s writes, last first: each lock bit as it was, and each cursor write
+/// ([`super::cursor::CursorWrite::rewind`]).
+pub(crate) fn rewind(model: &mut Model, raised: &[Raised]) {
+    for raised in raised.iter().rev() {
+        match raised {
+            Raised::Lock { guid, was, .. } => {
+                set_lock_bit(model, *guid, *was);
+            }
+            Raised::CursorWrite(write) => write.rewind(model),
+            Raised::Event(..) | Raised::CursorView(_) | Raised::EndCursorView | Raised::Call(_) => {
+            }
+        }
+    }
+}
+
+/// Put `raised`'s lock bits back as they were, last first, a cursor write's own included; the
+/// cursor stays as the writes left it.
+fn roll_back_locks(model: &mut Model, raised: &[Raised]) {
+    for raised in raised.iter().rev() {
+        match raised {
+            Raised::Lock { guid, was, .. } => {
+                set_lock_bit(model, *guid, *was);
+            }
+            Raised::CursorWrite(write) => roll_back_locks(model, &write.raised),
+            Raised::Event(..) | Raised::CursorView(_) | Raised::EndCursorView | Raised::Call(_) => {
+            }
+        }
+    }
+}
+
+/// How [`fan_out`] makes a segment's records.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fan {
+    /// As made: each record shown; a cursor write made while something waits for the host is
+    /// shown, then waits behind it to be made again ([`super::calls::Waiting::Cursor`]).
+    Now,
+    /// For the host, a held segment run late: each cursor write made again against the cursor
+    /// as it is now, in a segment of its own, its recorded result and records dropped.
+    Again,
+    /// A cursor write's own records, shown in place while it waits: its lock writes are made
+    /// bare, as they are the write's and wait with it.
+    Bare,
 }
 
 /// Run one segment of a Lua verb with the model borrowed, then fire every event it raised, in
@@ -99,6 +159,11 @@ pub(crate) enum Raised {
 /// and then changes state a getter reads runs one segment per such step, so each handler sees
 /// the state the reference's sees. A handler that calls another verb runs that verb's segments
 /// inside this fan-out, the reference's synchronous nesting.
+///
+/// An engine step that cannot lend the host ([`super::host::holding`]) holds the fan-out instead,
+/// its events, cursor views, lock writes and cursor writes, for the host
+/// ([`super::calls::Held::Segment`]); the writes stand meanwhile, and the take puts them back to
+/// make them again in their places, a cursor write as its operation ([`Fan::Again`]).
 pub(crate) fn verb<R>(lua: &Lua, body: impl FnOnce(&mut Model) -> R) -> R {
     let (out, raised) = {
         let mut model = lua.app_data_mut::<Model>().expect("model app_data set");
@@ -107,24 +172,73 @@ pub(crate) fn verb<R>(lua: &Lua, body: impl FnOnce(&mut Model) -> R) -> R {
         let out = body(&mut model);
         (out, model.verb_events.take().unwrap_or_default())
     };
+    if super::host::holding(lua) {
+        if raised.iter().any(|r| {
+            matches!(
+                r,
+                Raised::Event(..) | Raised::Lock { .. } | Raised::CursorWrite(_) | Raised::Call(_)
+            )
+        }) {
+            super::calls::hold(lua, super::calls::Held::Segment(raised));
+        }
+        return out;
+    }
     // The body's lock changes are rolled back, then replayed in place as the absolute writes they
     // were, in the reference's order against the handlers: a nested verb's change to the same item
     // between two of them is overwritten by the later write, as the reference's later `LockItem`
     // or `UnlockItem` would overwrite it. What the body cannot match is a read: it ran before any
     // handler, so it never sees a handler's change.
-    {
-        let mut model = lua.app_data_mut::<Model>().expect("model app_data set");
-        for raised in raised.iter().rev() {
-            if let Raised::Lock { guid, was, .. } = *raised {
-                set_lock_bit(&mut model, guid, was);
-            }
-        }
-    }
+    roll_back_locks(
+        &mut lua.app_data_mut::<Model>().expect("model app_data set"),
+        &raised,
+    );
+    fan_out(lua, raised, Fan::Now);
+    out
+}
+
+/// A verb segment's fan-out: each event fired, each cursor view shown to the handlers between it
+/// and its end, each lock write made and each cursor write shown or made again ([`Fan`]), in the
+/// order raised.
+pub(crate) fn fan_out(lua: &Lua, raised: Vec<Raised>, how: Fan) {
     // The cursors a view replaced, innermost last.
     let mut hidden = Vec::new();
     for raised in raised {
         match raised {
+            Raised::CursorWrite(write) if how == Fan::Again => {
+                verb(lua, |model| super::cursor::write(model, write.op));
+            }
+            Raised::CursorWrite(write) => {
+                let waits = !lua
+                    .app_data_ref::<Model>()
+                    .expect("model app_data set")
+                    .script_calls
+                    .is_empty();
+                if waits {
+                    // Queued ahead of what its handlers leave waiting, as it was made before them.
+                    let raised = write.raised.clone();
+                    lua.app_data_mut::<Model>()
+                        .expect("model app_data set")
+                        .push_waiting(super::calls::Waiting::Cursor { write, shown: true });
+                    fan_out(lua, raised, Fan::Bare);
+                } else {
+                    fan_out(lua, write.raised, how);
+                }
+            }
+            Raised::Lock { guid, locked, .. } if how == Fan::Bare => {
+                set_lock_bit(
+                    &mut lua.app_data_mut::<Model>().expect("model app_data set"),
+                    guid,
+                    locked,
+                );
+            }
             Raised::Event(event, args) => fire_event_into(lua, &event, args),
+            Raised::Call(call) => {
+                if let Err(e) = super::calls::submit(lua, *call) {
+                    lua.app_data_mut::<Model>()
+                        .expect("model app_data set")
+                        .record_lua_error(&e);
+                }
+            }
             Raised::CursorView(payload) => {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data set");
                 hidden.push(std::mem::replace(&mut model.cursor, payload));
@@ -137,20 +251,20 @@ pub(crate) fn verb<R>(lua: &Lua, body: impl FnOnce(&mut Model) -> R) -> R {
                 }
             }
             Raised::Lock { guid, locked, .. } => {
-                let mut model = lua.app_data_mut::<Model>().expect("model app_data set");
-                set_lock_bit(&mut model, guid, locked);
+                lua.app_data_mut::<Model>()
+                    .expect("model app_data set")
+                    .set_item_lock(guid, locked);
             }
         }
     }
-    out
 }
 
-/// Set item `guid`'s lock bit to `locked`, recording nothing.
-fn set_lock_bit(model: &mut Model, guid: u64, locked: bool) {
+/// Set item `guid`'s lock bit to `locked`, recording nothing; whether it was set before.
+pub(crate) fn set_lock_bit(model: &mut Model, guid: u64, locked: bool) -> bool {
     if locked {
-        model.item_locks.insert(guid);
+        !model.item_locks.insert(guid)
     } else {
-        model.item_locks.remove(&guid);
+        model.item_locks.remove(&guid)
     }
 }
 
@@ -189,6 +303,7 @@ pub(crate) fn show_chat_line_into(lua: &Lua, key: &'static str, text: String) {
 /// the walk (`0x703ea4`) and the earlier value put back after it (`0x703f04`), so a handler's
 /// assignment to it reaches the next listener. The walk takes each listener's successor before
 /// its call (`0x703ee8`): one appended meanwhile is reached unless the running one was the tail.
+/// An engine step that cannot lend the host holds the walk for it ([`super::host::holding`]).
 pub(crate) fn fire_event_into(lua: &Lua, event: &str, args: Vec<ScriptValue>) {
     let model_mut = || lua.app_data_mut::<Model>().expect("model app_data set");
     let mut at = {
@@ -199,6 +314,10 @@ pub(crate) fn fire_event_into(lua: &Lua, event: &str, args: Vec<ScriptValue>) {
             .and_then(|l| l.first().copied())
     };
     if at.is_none() {
+        return;
+    }
+    if super::host::holding(lua) {
+        super::calls::hold(lua, super::calls::Held::Event(event.to_string(), args));
         return;
     }
     let globals = lua.globals();
@@ -248,17 +367,7 @@ impl super::UiScript {
     /// range); drains the layout again (`0x765799`); then re-picks the hover against those rects
     /// (`0x7657be`). The draw pass fires `OnUpdateModel`.
     pub fn tick(&mut self, elapsed: f32) {
-        self.model_mut().nameplates.begin_update();
-        self.model_mut().now += f64::from(elapsed);
-        // Events queued since the last tick fire before this tick's OnUpdate.
-        let pending = std::mem::take(&mut self.model_mut().pending_events);
-        for (event, args) in pending {
-            self.fire_event(&event, args);
-        }
-        // The item tooltips the caches answered since the last tick rebuild (`0x52e530`).
-        for e in super::tooltip_item::build::answer_item_caches(&self.lua) {
-            self.push_error(e);
-        }
+        self.advance_clock_and_events(elapsed);
         self.resolve();
         self.update_walk(elapsed);
         self.resolve();
@@ -277,6 +386,30 @@ impl super::UiScript {
         self.paint_model_panes();
         // `WOW_UI_HANDLERS=<secs>`: last, so its report covers everything this tick fired.
         self.report_handler_profile(elapsed);
+    }
+
+    /// A frame whose pass skips the interface's layer, as under the loading screen: its layer
+    /// takes the unit square out of what the layers below see (`0x442431`-`0x442437`), and the
+    /// pass calls no layer left empty (`0x4424b9`/`0x4424ca`). So neither the pump nor the draw
+    /// pass of [`Self::tick`] runs (`0x764330`), and the frame's elapsed time is cleared unread
+    /// (`0x4426c3`): the next walk gets its own frame's. The clock and the queued events still
+    /// advance, being no part of the layer.
+    pub fn tick_covered(&mut self, elapsed: f32) {
+        self.advance_clock_and_events(elapsed);
+    }
+
+    /// The `GetTime()` clock, then the events queued since the last tick and the item tooltips the
+    /// caches answered (`0x52e530`), all ahead of the tick's `OnUpdate`.
+    fn advance_clock_and_events(&mut self, elapsed: f32) {
+        self.model_mut().nameplates.begin_update();
+        self.model_mut().now += f64::from(elapsed);
+        let pending = std::mem::take(&mut self.model_mut().pending_events);
+        for (event, args) in pending {
+            self.fire_event(&event, args);
+        }
+        for e in super::tooltip_item::build::answer_item_caches(&self.lua) {
+            self.push_error(e);
+        }
     }
 }
 

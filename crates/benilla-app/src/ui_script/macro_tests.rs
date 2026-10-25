@@ -20,6 +20,7 @@ fn harness() -> UiScript {
 
 fn harness_with(player: &str) -> UiScript {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // The global strings this window formats.
     s.run(
@@ -289,11 +290,11 @@ fn dragging_a_macro_button_loads_the_cursor_with_the_macro_payload() {
     no_errors(&s, "drag");
     let payload = s.cursor_payload();
     assert!(
-        matches!(&payload, Some(CursorPayload::Macro(m)) if m.index == 1),
-        "the macro payload, carrying its index: {payload:?}"
+        matches!(&payload, Some(CursorPayload::Macro(m)) if m.id == 1),
+        "the macro payload, carrying its id: {payload:?}"
     );
 
-    // A bar slot packs the MACRO tag (0x40 << 24) with the macro index.
+    // A bar slot packs the MACRO tag (0x40 << 24) with the macro id.
     let mut s = s;
     s.run("PlaceAction(1)").unwrap();
     assert_eq!(s.take_action_sets(), vec![(1, 0x4000_0000 | 1)]);

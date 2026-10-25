@@ -70,6 +70,9 @@ pub(crate) mod move_flags {
     /// The keyboard turn keys (with `TURN_RIGHT`), which rotate the facing (`0x7c4f30`).
     pub const TURN_LEFT: u32 = 0x10;
     pub const TURN_RIGHT: u32 = 0x20;
+    /// The pitch keys while swimming (`0x7c6df0`), which pitch the mover (`0x7c5c90`).
+    pub const PITCH_UP: u32 = 0x40;
+    pub const PITCH_DOWN: u32 = 0x80;
     /// Walk mode: it scales only the rate numerator, never the id choice.
     pub const WALK_MODE: u32 = 0x100;
     /// `MOVEFLAG_LEVITATING`: the swim decision `0x6030c0` bails on it first (`0x6030d2`), so
@@ -469,8 +472,8 @@ pub(super) fn ranged_hold_anim(load: u16) -> u16 {
 
 /// Whether the drawn ranged idle owns the standing pose: `0x5fd460` claims on sheath CUR == 2
 /// (`0x5fd463`) and the auto-repeat bit `[+0xd58] & 0x200` (`0x5fd476`) alone, a bit only the
-/// local cast-send sets (`0x6e593b`). `0x400` ([`super::RangedHold`]) is not tested here, only by
-/// `0x5fc3f0`'s Hold sustain.
+/// local cast-send sets (`0x6e593b`). The precast bit `0x400` ([`super::Precast`]) is not tested
+/// here, only by `0x5fc3f0`'s Hold sustain (`0x5fc61f`, `0x5fc664`).
 pub(super) fn ranged_idle_gate(auto_repeat: bool, sheath_cur: Option<u8>) -> bool {
     sheath_cur == Some(2) && auto_repeat
 }

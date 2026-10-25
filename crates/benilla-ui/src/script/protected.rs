@@ -265,46 +265,55 @@ fn refuse(lua: &Lua, context: &Context) {
 }
 
 impl UiScript {
-    /// Note that the call applied under `events` moved the selection to `guid`. The reference
-    /// signals `PLAYER_TARGET_CHANGED` inside `SetSelection`, so inside the key or click that made
-    /// the call; the app's unit feed signals it when it sees the change, so it asks for these
-    /// ([`Self::take_selection_cause`]) and raises them around that event.
-    pub fn note_selection_cause(&mut self, guid: Option<u64>, events: InputEvents) {
-        self.model_mut().selection_cause = Some((guid, events));
-    }
-
-    /// The events the selection change to `guid` was made under, if a call noted one; none
-    /// otherwise (a click, the server). Spent by the asking.
-    pub fn take_selection_cause(&mut self, guid: Option<u64>) -> InputEvents {
-        match self.model_mut().selection_cause.take() {
-            Some((cause, events)) if cause == guid => events,
-            _ => InputEvents::default(),
-        }
-    }
-
     /// The input events running now, for a call the app applies after they end.
     pub fn input_events(&self) -> InputEvents {
         events(self.lua())
     }
 
-    /// Run `f` with `events` raised again: the app runs a macro's lines inside `UseAction`, after
-    /// the key or click that pressed it has returned, where the reference runs them inside it.
+    /// Run `f` with exactly `events` raised, those running now lowered meanwhile: a call applied
+    /// after its verb returned, its macro lines and what it signals run under the events the verb
+    /// ran under, as in the reference, which does the call inside the verb; never under those of
+    /// the entry that applies it.
     pub fn with_input_events<R>(
         &mut self,
         events: InputEvents,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let guards: Vec<Raised> = [
-            (events.binding, Event::Binding),
-            (events.enter, Event::Enter),
-            (events.click, Event::Click),
-        ]
-        .into_iter()
-        .filter(|(on, _)| *on)
-        .map(|(_, event)| raise(self.lua(), event))
-        .collect();
-        let result = f(self);
-        drop(guards);
-        result
+        let _exactly = Exactly::raise(self.lua(), events);
+        f(self)
+    }
+}
+
+/// The input events set to exactly a call's until the guard drops, then put back as they were, so
+/// they end on every path out of the code it wraps.
+#[must_use]
+struct Exactly {
+    lua: Lua,
+    before: (u32, u32, u32),
+}
+
+impl Exactly {
+    fn raise(lua: &Lua, events: InputEvents) -> Exactly {
+        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+        let flags = &mut model.protected;
+        let before = (flags.binding, flags.enter, flags.click);
+        (flags.binding, flags.enter, flags.click) = (
+            u32::from(events.binding),
+            u32::from(events.enter),
+            u32::from(events.click),
+        );
+        Exactly {
+            lua: lua.clone(),
+            before,
+        }
+    }
+}
+
+impl Drop for Exactly {
+    fn drop(&mut self) {
+        if let Some(mut model) = self.lua.app_data_mut::<Model>() {
+            let flags = &mut model.protected;
+            (flags.binding, flags.enter, flags.click) = self.before;
+        }
     }
 }

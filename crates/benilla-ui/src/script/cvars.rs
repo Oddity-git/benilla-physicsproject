@@ -239,6 +239,26 @@ impl super::UiScript {
             .collect()
     }
 
+    /// Every row of the mirror as `(name, value, default, reset)`, in its list order (each row's
+    /// insertion), for the console's prints inside a `ConsoleExec` call: the mirror holds what
+    /// the chunk's own writes left, as the reference's one record does.
+    pub fn cvar_rows(&self) -> Vec<(String, String, String, Option<String>)> {
+        let model = self.model_mut();
+        let mut slots: Vec<&CvarSlot> = model.cvars.values().collect();
+        slots.sort_by_key(|s| s.seq);
+        slots
+            .into_iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    s.value.clone(),
+                    s.default.clone(),
+                    s.reset.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Drain the lines CVar change callbacks printed since the last call, for the console.
     pub fn take_cvar_console_lines(&mut self) -> Vec<String> {
         std::mem::take(&mut self.model_mut().cvar_console)
@@ -675,7 +695,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     lua.globals().set(
         "SetMultisampleFormat",
-        lua.create_function(|lua, id: Option<f64>| {
+        lua.create_function(|lua, id: Value| {
+            // `lua_isnumber` (`0x48c659`): a non-number is a missing id, which the deviation below
+            // ignores.
+            let id = crate::script::binding_abi::is_number(lua, id);
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             // 1-based from `UIDropDownMenu_GetSelectedID`. Deviation: an id out of range is
             // ignored, because the reference reads one entry past the last (`0x48c67c`) and a
@@ -803,8 +826,10 @@ fn install_video_verbs(lua: &Lua) -> mlua::Result<()> {
     // (`0x48bf88`), so a 1 does not prove a match.
     //
     // Deviation: the index is of the live window size, not of the `gxResolution` CVar the
-    // reference parses (`0x48bf20`), because without an exclusive mode-set `gxResolution` is the
-    // windowed size, not the live one in borderless fullscreen, which `CT_Viewport` scales by.
+    // reference parses (`0x48bf20`), because the window here can be dragged to any size, where the
+    // reference's backbuffer stays at `gxResolution`'s, and `CT_Viewport` scales by the live one.
+    // The list and the window are logical pixels and the fullscreen `gxResolution` device pixels,
+    // so on a scaled display the entry this picks is not the size `GetCVar` answers.
     lua.globals().set(
         "GetCurrentResolution",
         lua.create_function(|lua, ()| {
@@ -1208,6 +1233,7 @@ mod tests {
     #[test]
     fn console_exec_writes_a_valued_cvar_and_hands_a_bare_name_to_the_host() {
         let mut s = script_with_volume();
+        s.keep_calls();
         s.run(r#"ConsoleExec("MusicVolume 0.2")"#).unwrap();
         assert_eq!(
             s.eval::<String>(r#"return GetCVar("MusicVolume")"#)

@@ -14,7 +14,7 @@ use crate::messages::{
     QuestGiverList, QuestOfferReward, QuestRequestItems, QuestShareMsg, QuestTemplate,
     SpellDamageLog, SpellDispelLog, SpellEnergizeLog, SpellHealLog, SpellInstaKillLog,
     SpellLogExecute, SpellLogMiss, SpellOutcomeLog, StabledPet, TaxiMask, TradeStatus,
-    TradeStatusExtended, TrainerSpell, TransportPose, VendorItem, WhoResults, XpGain,
+    TradeStatusExtended, TrainerSpell, TransportPose, VendorItem, WhoResults, WowTime, XpGain,
 };
 
 /// Coarse entity classification, free of wire types, carried on [`SessionEvent::ObjectCreate`].
@@ -67,9 +67,22 @@ impl MoveSpeeds {
 pub enum LoginStage {
     /// Dialing the auth server (`LOGIN_STATE_CONNECTING`).
     Connecting,
-    /// SRP6 challenge/proof in flight (`LOGIN_STATE_AUTHENTICATING`).
+    /// The dial connected and the challenge goes out (`LOGIN_STATE_AUTHENTICATING`, logon state 3,
+    /// `0x5b2196`).
     Authenticating,
-    /// Realm picked; the world-socket handshake and char enum (`LOGIN_STATE_HANDSHAKING`).
+    /// The challenge's reply came and asked for no PIN (`LOGIN_STATE_CHECKINGVERSIONS`, logon
+    /// state 9, `0x5b1cd7`). With a PIN the reply's state is [`Self::Pin`]'s 7, and the 9 comes
+    /// when the keys are in (`0x5b31cc`), which the glue's `PINEntered` reports itself.
+    CheckingVersions,
+    /// The proof went out (`LOGIN_STATE_HANDSHAKING`, logon state 2, `0x5b1f93`): the reference's
+    /// name for the wait on the proof's reply, not the world's handshake ([`Self::Handshaking`]).
+    ProofSent,
+    /// The challenge asked for a PIN (`LOGIN_STATE_PIN`, logon state 7, `0x5b1cd7`): the logon
+    /// waits for the keys pressed on the keypad this grid lays out ([`crate::auth::pin::grid`]),
+    /// taking only keys that answer `prompt`, this prompt's number.
+    Pin { grid: [u8; 10], prompt: u64 },
+    /// Realm picked: the world dial begins, which ends the logon on the screen (the glue's
+    /// `LOGIN_STATE_AUTHENTICATED`, logon state 4).
     Handshaking,
     /// The world socket connected, before its authentication (`RESPONSE_CONNECTED`, `0x5aaa90`).
     WorldConnected,
@@ -110,15 +123,43 @@ pub enum LoginRefusal {
     LogonProof(u8),
     /// The world server's `SMSG_AUTH_RESPONSE` code (`crate::WorldAuthReject`).
     World(u8),
+    /// The challenge asked for a PIN and no screen stood to enter it: refused here, before any
+    /// proof, so no server counts it.
+    NoPinEntry,
 }
 
 impl LoginRefusal {
-    /// The raw byte, for logging only: without its server it is ambiguous.
-    pub fn byte(self) -> u8 {
+    /// The raw byte, for logging only: without its server it is ambiguous. The client's own
+    /// refusal has none.
+    pub fn byte(self) -> Option<u8> {
         match self {
-            LoginRefusal::Logon(b) | LoginRefusal::LogonProof(b) | LoginRefusal::World(b) => b,
+            LoginRefusal::Logon(b) | LoginRefusal::LogonProof(b) | LoginRefusal::World(b) => {
+                Some(b)
+            }
+            LoginRefusal::NoPinEntry => None,
         }
     }
+}
+
+/// A transport create's clock: `UPDATE_FLAG_TRANSPORT`'s u32, the path progress in ms, and when
+/// its packet arrived, the time the reference's create runs with (the queue node's stamp
+/// `0x538851`, which `0x5f7080` subtracts).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransportClock {
+    pub progress_ms: u32,
+    /// Stamped by [`crate::WorldReader::poll`] as it reads the packet; `None` from a bare decode.
+    pub arrived: Option<std::time::Instant>,
+}
+
+/// The block an [`SessionEvent::ObjectNotify`] stands for in the notify pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotifyBlock {
+    /// A values block: the fields its mask sent, ascending (`0x465330`).
+    Values(Vec<u16>),
+    /// An item's or a container's create block (`0x465c50`).
+    ItemCreate,
+    /// A placed object's create block (`0x465c50`).
+    Create(EntityKind),
 }
 
 /// One decoded world-stream event; its fieldless twin [`SessionEventKind`] keys the handler table.
@@ -213,9 +254,16 @@ pub enum SessionEvent {
     LogoutResponse { reason: u32, instant: bool },
     /// The server dropped a pending logout at our `CMSG_LOGOUT_CANCEL` (`SMSG_LOGOUT_CANCEL_ACK`).
     LogoutCancelled,
+    /// `SMSG_CLEAR_FAR_SIGHT_IMMEDIATE`: end far sight now (`0x5e43f8` runs `EndFarSight`
+    /// `0x5ee590` on the active player).
+    FarSightCleared,
     /// The world session ended, and with [`SessionEnd::Lost`] the link with it; `reason` is
     /// human-readable.
     Disconnected { reason: String, end: SessionEnd },
+    /// The body of an answer whose record the 1.12 client saves to disk, as it came off the wire,
+    /// its key the first dword (`0x556e5b`): emitted by the IO thread ahead of the answer's
+    /// decoded events, never wire-decoded, for the app's on-disk template caches.
+    SavedAnswer { opcode: u16, body: Vec<u8> },
     /// A placed object entered view, its spawn identity decoded per object type.
     ObjectCreate {
         guid: u64,
@@ -231,9 +279,10 @@ pub enum SessionEvent {
         /// Flags and swim pitch the unit streams in with, applied by the reference before its model
         /// exists: the flags via the relay's `0x75a07dff` merge, the pitch via `0x7c6420`.
         mover: Option<MoverState>,
-        /// `UPDATE_FLAG_TRANSPORT`'s path progress in ms, only on a type-11/15 transport create;
-        /// progress is this plus elapsed ms; position is `timetable(progress % period)`.
-        transport_progress: Option<u32>,
+        /// `UPDATE_FLAG_TRANSPORT`'s path progress and its packet's arrival, only on a type-11/15
+        /// transport create; progress is this plus the ms since; position is
+        /// `timetable(progress % period)`.
+        transport_progress: Option<TransportClock>,
         /// Its rider pose, local to the transport, when created with `MOVEFLAG_ON_TRANSPORT`.
         transport: Option<TransportPose>,
         /// The path it was already walking (`MOVEFLAG_SPLINE_ENABLED`), with the ms already ridden.
@@ -274,10 +323,25 @@ pub enum SessionEvent {
         jump: Option<JumpInfo>,
         transport: Option<TransportPose>,
     },
-    /// A descriptor `Values` delta, only the changed fields; never empty (the codec drops those).
+    /// A descriptor `Values` block: the fields it sends, possibly none.
     ObjectValues { guid: u64, fields: ObjectFields },
-    /// Left view range (`OutOfRange`); the reference keeps them in a staging table for re-create.
+    /// Left view range (`OutOfRange`), only as a packet's first block (`0x4651e1`); the reference
+    /// keeps them in a released table, fields and all, for a later block to bring back
+    /// (`0x464920`).
     ObjectsRemoved(Vec<u64>),
+    /// A near-objects block's guids of one pass: names the server sends as near, which brings a
+    /// released one back (`0x467230`).
+    ObjectsNear(Vec<u64>),
+    /// A first-pass block's place in the notify pass, which reads every block in packet order
+    /// (`0x46522d`): the values or create block of a top-nibble 6 or 8 guid
+    /// ([`crate::guid::first_pass`]), which the first pass wrote ahead of the packet's other
+    /// blocks, or no pass wrote, with the header byte clear.
+    ObjectNotify { guid: u64, block: NotifyBlock },
+    /// The end of one `SMSG_UPDATE_OBJECT`, plain or compressed: the object events since the last
+    /// one are its blocks, in the order its passes write them (`0x4651a0`): an out-of-range list
+    /// that comes first, the first pass's blocks, then the rest. The reference writes every block
+    /// of a packet before it notifies any.
+    ObjectUpdateEnd,
     /// `SMSG_DESTROY_OBJECT`: the reference frees it at once, no fade; a respawn is a fresh create.
     ObjectDestroyed(u64),
     /// `SMSG_TRIGGER_CINEMATIC`. Until `CMSG_COMPLETE_CINEMATIC` vmangos anchors visibility to the
@@ -322,20 +386,24 @@ pub enum SessionEvent {
         needs_ack: bool,
     },
     /// `SMSG_TRANSFER_PENDING`: a worldport follows, boat-local when `transport_entry` is set.
+    /// `from_map` is the map left, sent with the entry; the screen draws that leg's route
+    /// (`0x401900`, `0x4072c0`).
     TransferPending {
         map_id: u32,
         transport_entry: Option<u32>,
+        from_map: Option<u32>,
     },
     /// `SMSG_TRANSFER_ABORTED`: the announced transfer is off (map full, no instance).
     TransferAborted { reason: u8 },
-    /// The server in-game clock (`SMSG_LOGIN_SETTIMESPEED`): drives time-of-day lighting.
-    TimeSpeed {
-        hours: u8,
-        minutes: u8,
-        /// `year·372 + month·31 + day` of the packed server date; the moon phase's input.
-        day_serial: u32,
-        timescale: f32,
-    },
+    /// The login clock (`SMSG_LOGIN_SETTIMESPEED`): the date the clock is set to and its rate,
+    /// as sent.
+    TimeSpeed { time: WowTime, speed: f32 },
+    /// `SMSG_GAMESPEED_SET`: the clock's rate, as sent.
+    GameSpeedSet { speed: f32 },
+    /// `SMSG_GAMETIME_UPDATE`: the date the clock syncs to.
+    GameTimeUpdate { time: WowTime },
+    /// `SMSG_GAMETIME_SET`: the date the clock is set to.
+    GameTimeSet { time: WowTime },
     /// The server's wall clock in unix seconds (`SMSG_QUERY_TIME_RESPONSE`), the base of absolute
     /// descriptor stamps: a timed quest's deadline is `time(nullptr) + limitTime`.
     ServerUnixTime { unix_time: u32 },
@@ -411,6 +479,8 @@ pub enum SessionEvent {
     ForcedReactions { reactions: Vec<(u32, u32)> },
     /// `SMSG_SET_FACTION_VISIBLE`: sets the slot's visible flag, which decides if it is listed.
     ReputationVisible { list_id: u32 },
+    /// `SMSG_SET_FACTION_ATWAR`: the slot's at-war bit becomes bit `0x02` of `flags`.
+    ReputationAtWar { list_id: u32, flags: u8 },
     /// `SMSG_NAME_QUERY_RESPONSE`: names are never descriptor fields in 1.12, only query answers.
     /// An unknown guid answers with an empty `name`.
     PlayerName {
@@ -437,6 +507,8 @@ pub enum SessionEvent {
         rank: u32,
         /// Bit `0x10` hides the tooltip's faction-name line.
         type_flags: u32,
+        /// `CreatureSpellData.dbc` id of a tamed one's abilities, `0` for none.
+        pet_spell_list: u32,
         /// `CreatureDisplayInfo.dbc` id, to draw a creature with no world object (a stabled pet).
         display_id: u32,
         /// The tooltip's green CIVILIAN line.
@@ -462,6 +534,9 @@ pub enum SessionEvent {
     /// `SMSG_GAMEOBJECT_DESPAWN_ANIM`: the reference arms substate 12 (AnimationData 157 Despawn)
     /// and keeps the object alive through the same-tick `SMSG_DESTROY_OBJECT` while it plays.
     GameObjectDespawnAnim { guid: u64 },
+    /// `SMSG_GAMEOBJECT_PAGETEXT`: the reference resolves the GameObject and opens the item-text
+    /// reader on it (`0x5f88c0` → `0x4e32e0(guid, 0)`), as a right-click on a TEXT object does.
+    GameObjectPageText { guid: u64 },
     /// `SMSG_OPEN_CONTAINER`: the reference fires `BAG_OPEN` with 0 for our own guid (the
     /// backpack), 1..10 for a bag-cache slot, and nothing for a miss.
     OpenContainer { item: u64 },
@@ -536,6 +611,8 @@ pub enum SessionEvent {
     PetActionSound { pet_guid: u64, talk: u32 },
     /// A dismissed pet's sound (`SMSG_PET_DISMISS_SOUND`): the `CreatureModelData` column-29 kit.
     PetDismissSound { model_id: u32, position: [f32; 3] },
+    /// `SMSG_ITEM_NAME_QUERY_RESPONSE`, by entry; `None` is unknown.
+    ItemName { entry: u32, name: Option<String> },
     /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE`, by entry; `None` is unknown. Boxed, being wide.
     ItemTemplate {
         entry: u32,
@@ -623,16 +700,24 @@ pub enum SessionEvent {
         spell_id: u32,
         cast_flags: u16,
         hits: Vec<u64>,
-        misses: Vec<(u64, u8)>,
+        misses: Vec<crate::messages::SpellGoMiss>,
         target: Option<u64>,
         /// The GameObject an open-lock cast targets (`TARGET_FLAG_GAMEOBJECT`), a chest or door.
         go_target: Option<u64>,
+        /// The target block's mask (`SpellCastTargets::mask`), which the missile launcher gates on.
+        target_mask: u16,
+        /// The `TARGET_FLAG_SOURCE_LOCATION` point, raw WoW.
+        source: Option<[f32; 3]>,
         /// The ground point (`TARGET_FLAG_DEST_LOCATION`, raw WoW); the lasting effect is a
         /// DynamicObject.
         dest: Option<[f32; 3]>,
         ammo_display_id: Option<u32>,
         /// The cast item when the first guid is not the caster; the item cooldown keys on it.
         item_caster: Option<u64>,
+        /// The packet's second guid as written, the caster unit (`m_casterUnit`): 0 for a
+        /// GameObject's cast (vmangos `Spell.cpp:4491`), where `caster` falls back to the first.
+        /// The miss list's reflect leg names it (`0x6e7dfd`).
+        unit_caster: u64,
     },
     /// A channeled beam's hops (`SMSG_SPELL_UPDATE_CHAIN_TARGETS`), consumed once by the next chain
     /// `CharProc`; the reference fills that `unit+0xd44` array from spell-go hits too (`0x6e800d`).
@@ -906,6 +991,9 @@ pub enum SessionEvent {
     },
     /// Corpse reclaim delay (`SMSG_CORPSE_RECLAIM_DELAY`): 30 s, 60 or 120 s on repeated deaths.
     CorpseReclaimDelay { delay_ms: u32 },
+    /// An enemy took our insignia (`SMSG_PLAYER_SKINNED`): `PLAYER_SKINNED` with the byte's truth
+    /// (`0x5e7d40` → `0x48f400`).
+    PlayerSkinned { free_repop: bool },
     /// The 10% death durability loss (`SMSG_DURABILITY_DAMAGE_DEATH`, empty body): the red line.
     DurabilityDamageDeath,
     /// A resurrect offer (`SMSG_RESURRECT_REQUEST`), answered by `CMSG_RESURRECT_RESPONSE`.
@@ -1085,6 +1173,9 @@ pub enum SessionEvent {
         nearest_node: u32,
         known_mask: TaxiMask,
     },
+    /// `SMSG_SHOWTAXINODES` in mode 0, which names no flight master: the known nodes for the
+    /// console, and no map (`0x5ecf7f`).
+    TaxiNodesListed { known_mask: TaxiMask },
     /// Whether the flight master's nearest node is known (`SMSG_TAXINODE_STATUS`); also sent with
     /// [`Self::NewTaxiPath`] on a first visit (vmangos `SendLearnNewTaxiNode`).
     TaxiNodeStatus { guid: u64, known: bool },

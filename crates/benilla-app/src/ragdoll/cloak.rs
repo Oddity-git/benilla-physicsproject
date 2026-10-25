@@ -619,7 +619,7 @@ fn simulate_cloths(
     rigs: Query<(
         &RigSkin,
         &RigPose,
-        Option<&crate::creature_anim::AnimDriver>,
+        Option<&crate::creature_anim::CommittedSheath>,
         Option<&crate::net::ObjectStore>,
     )>,
     skins: Query<&RigSkin>,
@@ -655,12 +655,12 @@ fn simulate_cloths(
         return;
     };
     for (rig_entity, cloth) in cloths.live.iter_mut() {
-        let Ok((skin, rig, driver, store)) = rigs.get(*rig_entity) else {
+        let Ok((skin, rig, sheath, store)) = rigs.get(*rig_entity) else {
             continue;
         };
         // 0 is sheathed; 1 melee and 2 ranged are drawn.
-        let sheath = driver
-            .and_then(|d| d.sheath_state())
+        let sheath = sheath
+            .and_then(|s| s.state())
             .or_else(|| store.and_then(|s| s.0.unit_sheath_state()));
         let want = if loose_drawn && sheath.is_some_and(|s| s != 0) {
             1.0

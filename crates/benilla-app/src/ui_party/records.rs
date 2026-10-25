@@ -56,8 +56,8 @@ fn record_changes(old: &PartyMemberStatsInfo, new: &PartyMemberStatsInfo) -> u32
 /// and the power and drops their own bits (`0x5e572f`-`0x5e574a`); then the level, health, maximum,
 /// display power, power and maximum power, `UNIT_FACTION` for the PvP and free-for-all status bits
 /// (`0x5e57c8`), `UNIT_AURA` for either aura block and `UNIT_PET` for a new pet (`0x5e584f`).
-/// With a pet the record names, its own: the name, health, maximum, display power, power, maximum
-/// power and auras (`0x5e586c`-`0x5e5900`). The power events add the new record's power type.
+/// With a pet the record names, its own: the name, a mark of its portrait for the display, then
+/// health, maximum, display power, power, maximum power and auras (`0x5e586c`-`0x5e5900`). The power events add the new record's power type.
 pub(crate) fn record_notices(
     member: u64,
     old: &PartyMemberStatsInfo,
@@ -96,9 +96,15 @@ pub(crate) fn record_notices(
     let pet = new.pet_guid.unwrap_or(0);
     if pet != 0 {
         let power = u16::from(new.pet_power_type.unwrap_or(0));
-        // 0x2000, the display, refreshes the portrait alone (`0x5e587f`).
+        if mask & 0x1000 != 0 {
+            signal(pet, id::UNIT_NAME_UPDATE);
+        }
+        // 0x2000, the display, marks the pet's portrait (`0x5e587f`).
+        if mask & 0x2000 != 0 {
+            out.push(FieldNotice::PortraitMark { guid: pet });
+        }
+        let mut signal = |guid: u64, id: u16| out.push(FieldNotice::Signal { guid, id });
         for (bit, event) in [
-            (0x1000, id::UNIT_NAME_UPDATE),
             (0x4000, id::UNIT_HEALTH),
             (0x8000, id::UNIT_MAXHEALTH),
             (0x10000, id::UNIT_DISPLAYPOWER),
@@ -139,6 +145,39 @@ impl GroupState {
             || self
                 .member_record(member)
                 .is_some_and(PartyMemberStatsInfo::is_online)
+    }
+
+    /// `IsRaidMemberOrPet` (`0x491900`): a nonzero `guid` that is the active player's, `me`, its
+    /// pet's, a party slot's or its pet's (`0x4e80a0`), or a raid row's or its pet's (`0x4bafd0`).
+    /// The player is matched by guid before any object (`0x4e80b0`), its pet only while its object
+    /// is held (`0x4e80e1`). A member whose object `live` holds names its pet by `CHARM`, else
+    /// `SUMMON` (`0x4e814d`, `0x4bb022`); one with none by its record's pet guid while the record
+    /// reads online (`0x4e816b`, `0x4bb040`). No object of `guid` itself is needed.
+    pub(crate) fn member_or_pet<'a>(
+        &self,
+        guid: u64,
+        me: Option<(u64, Option<&ObjectFields>)>,
+        live: impl Fn(u64) -> Option<&'a ObjectFields>,
+    ) -> bool {
+        if guid == 0 {
+            return false;
+        }
+        if let Some((me, fields)) = me {
+            if me == guid || fields.and_then(ObjectFields::unit_pet_guid) == Some(guid) {
+                return true;
+            }
+        }
+        let names = |member: u64| {
+            member == guid || self.pet_guid_of(member, live(member), true) == Some(guid)
+        };
+        self.party_slots().any(|m| names(m.guid)) || self.raid_rows().any(names)
+    }
+
+    /// `IsPartyOrRaidMember` (`0x4918e0`) past its active-player test: a nonzero guid in a party
+    /// slot (`0x4e7f96`) or a raid row (`0x4baee0`).
+    pub(crate) fn party_or_raid_member(&self, guid: u64) -> bool {
+        guid != 0
+            && (self.party_slots().any(|m| m.guid == guid) || self.raid_rows().any(|g| g == guid))
     }
 
     /// `partypetN`'s guid for the member `member` (`0x4e81d0`): `CHARM`, else `SUMMON`, off the
@@ -431,7 +470,8 @@ mod tests {
     }
 
     /// Either aura block raises one `UNIT_AURA`; a new pet guid `UNIT_PET` for the member; the
-    /// pet's own fields their events for the pet, the display none.
+    /// pet's own fields their events for the pet, and the display a mark of its portrait
+    /// (`0x5e587f`) at its place among them.
     #[test]
     fn the_auras_the_pet_and_its_fields_raise_theirs() {
         let old = record(member_status::ONLINE);
@@ -459,10 +499,10 @@ mod tests {
             ..old.clone()
         };
         // Focus, power type 2: `UNIT_FOCUS` 19.
-        assert_eq!(
-            record_notices(MEMBER, &old, &pet_moved),
-            signals(&[(PET, 183), (PET, 16), (PET, 30), (PET, 19), (PET, 41)])
-        );
+        let mut want = signals(&[(PET, 183)]);
+        want.push(FieldNotice::PortraitMark { guid: PET });
+        want.extend(signals(&[(PET, 16), (PET, 30), (PET, 19), (PET, 41)]));
+        assert_eq!(record_notices(MEMBER, &old, &pet_moved), want);
         // With no pet the record names, the pet's bits raise nothing.
         let petless = PartyMemberStatsInfo {
             pet_guid: None,

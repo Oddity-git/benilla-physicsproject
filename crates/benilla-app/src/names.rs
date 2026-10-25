@@ -8,9 +8,9 @@
 //! a reader that runs every frame uses: the reference's per-frame readers read the unit's cached
 //! record (`[unit+0xb30]`, `0x60934b`), which only a lookup with a callback fills (`0x604660`).
 //!
-//! Creature templates persist, as the reference's `creaturecache.wdb` does, and a refusal never
-//! does; player and pet names are never written to disk and are cleared at world-session start, as
-//! the reference does.
+//! Creature templates are kept on disk, as the reference's `creaturecache.wdb` is ([`crate::wdb`]);
+//! player and pet names are never written to disk and are cleared at world entry, as the
+//! reference's stores, built with persistence off, are (`0x554cd0`, `0x555740`).
 
 use std::collections::HashMap;
 
@@ -85,6 +85,9 @@ pub(crate) struct CreatureRecord {
     pub(crate) rank: u32,
     /// Read bit by bit through [`type_flags`].
     pub(crate) type_flags: u32,
+    /// `CreatureSpellData.dbc` id of the abilities a tamed one brings (`[record+0x28]`), 0 for
+    /// none: the studied-creature block's ability line (`0x529d56`).
+    pub(crate) pet_spell_list: u32,
     pub(crate) civilian: bool,
     /// The tooltip's LEADER line (`0x6125c0`).
     pub(crate) racial_leader: bool,
@@ -126,8 +129,13 @@ impl NameKey {
     /// 24-47 (`guid::entry`), and a `HIGHGUID_PET` guid's slot is taken as the pet number, right
     /// only for a permanent pet.
     ///
-    /// Deviation: the combat-log namer keys an unstreamed creature by guid bits 32-47
-    /// (`0x6265c4`), which on the servers in use (entry at bits 24-47) names it wrongly.
+    /// Deviation: for a guid it does not hold, the reference's combat-log namer (`0x6264e0`) asks
+    /// the creature cache under guid bits 32-47 (`0x6265c4`-`0x6265e0`) for every guid whose top
+    /// nibble is 0xf and whose bits 32-47 are nonzero, a game object's and a pet's included, and
+    /// never the pet-name cache (only a held unit reaches it, `0x6092c7`). Here an unstreamed
+    /// creature is keyed by its entry, a pet guid by its pet number in the pet-name cache and a
+    /// game object's asks nothing, because on the servers in use (entry at bits 24-47) the
+    /// reference's key names each after an unrelated creature.
     fn of(guid_val: u64, unit: Option<&ObjectFields>) -> Option<Self> {
         if guid::is_player(guid_val) {
             return Some(Self::Player(guid_val));
@@ -209,16 +217,31 @@ impl NameCache {
     }
 
     /// A unit's create (`0x5fb880`): every cache its name comes from looked up with a callback,
-    /// the creature record by the descriptor's entry (`0x60b15b`) whatever the name key, and a
-    /// player's name by `GetUnitName` right after `PostInit` (`0x5dec09`, `0x5dec12`). A refusal
-    /// is asked again at once, as the reference's next lookup does.
+    /// a player's name by `GetUnitName` right after `PostInit` (`0x5dec09`, `0x5dec12`), and the
+    /// display resolve's creature record ([`Self::ask_creature_record`]). A refusal is asked again
+    /// at once, as the reference's next lookup does.
     pub(crate) fn lookup_fields(&self, guid_val: u64, unit: &ObjectFields, commands: &NetCommands) {
-        let ask = Ask::Event(commands);
         if let Some(NameKey::Player(_) | NameKey::Pet(_)) = NameKey::of(guid_val, Some(unit)) {
-            self.resolve_fields(guid_val, Some(unit), ask);
+            self.resolve_fields(guid_val, Some(unit), Ask::Event(commands));
+        }
+        self.ask_creature_record(guid_val, unit, commands);
+    }
+
+    /// The display resolve's ask (`0x60afb0`, at `0x60b15b`): the creature record by the
+    /// descriptor's entry, for a creature or a pet alone, type mask 9 (`0x60b134`), so never for a
+    /// player.
+    pub(crate) fn ask_creature_record(
+        &self,
+        guid_val: u64,
+        unit: &ObjectFields,
+        commands: &NetCommands,
+    ) {
+        // A descriptor with no mask reads 0, which is not 9: no ask.
+        if unit.object_type_mask() != Some(9) {
+            return;
         }
         if let Some(entry) = unit.object_entry() {
-            self.resolve_creature(entry, guid_val, ask);
+            self.resolve_creature(entry, guid_val, Ask::Event(commands));
         }
     }
 
@@ -288,14 +311,13 @@ impl NameCache {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Install the creature templates read off disk, replacing (not merging) the current ones and
-    /// touching nothing else: the load can land after the login has seeded our own name, which
-    /// must survive it.
-    pub(crate) fn install_persisted(&mut self, loaded: NameCache) {
-        self.creatures = loaded.creatures;
-        let entries: Vec<u32> = self.creatures.iter().map(|(&e, _)| e).collect();
-        self.creature_landings.extend(entries);
-        self.generation = self.generation.wrapping_add(1);
+    /// The creature-template store, the one [`crate::wdb`] saves.
+    pub(crate) fn creature_store(&self) -> &QueryCache<u32, CreatureRecord> {
+        &self.creatures
+    }
+
+    pub(crate) fn creature_store_mut(&mut self) -> &mut QueryCache<u32, CreatureRecord> {
+        &mut self.creatures
     }
 
     /// The landed-answer counter.
@@ -349,6 +371,12 @@ impl NameCache {
         self.creatures.iter().map(|(&e, r)| (e, r.name.as_str()))
     }
 
+    /// Whether the server refused the player's name, an empty name answered for the guid, and
+    /// nothing has asked for it since.
+    pub(crate) fn player_answered_unknown(&self, guid: u64) -> bool {
+        self.players.answered_unknown(guid)
+    }
+
     /// Whether the server refused `entry` and nothing has asked for it since.
     pub(crate) fn creature_answered_unknown(&self, entry: u32) -> bool {
         self.creatures.answered_unknown(entry)
@@ -387,116 +415,13 @@ impl crate::query_cache::AskOnce for NameCache {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Persistence
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-
-/// The file's first line; any field that differs on load discards the whole file, the
-/// reference's rule for its `.wdb` header (`[FourCC | build 0x16f3 | locale | recordSize |
-/// version 1]`, no checksum, no timestamp, no TTL).
-const CACHE_MAGIC: &str = "benilla-namecache";
-/// Our record-layout version; bump it when a column changes. Version 2 holds creature records
-/// only.
-const CACHE_FORMAT: u32 = 2;
-/// The client build, the reference's `0x16f3`.
-const CACHE_BUILD: u32 = 5875;
-/// The header's locale, the client's locale tag as each `.wdb` header carries it (`[0xc2a2a4]`,
-/// written at `0x5567d9` and compared at `0x5573c6`): the server names creatures in the locale the
-/// logon challenge sent, so a cache from another locale is discarded. Its four bytes as text,
-/// `enGB`; empty for tag 0, an install with no `Wow.ini` locale.
-fn cache_locale() -> String {
-    let tag = crate::ui_script::client_locale().tag().to_be_bytes();
-    String::from_utf8_lossy(&tag)
-        .trim_start_matches('\0')
-        .to_string()
-}
-
 impl NameCache {
-    /// Serialize as TSV: the header line, then one line per creature record. In-flight asks and
-    /// refusals are not written: the reference saves no freed node.
-    pub(crate) fn to_tsv(&self, realm: &str) -> String {
-        let locale = cache_locale();
-        let mut out = format!("{CACHE_MAGIC}\t{CACHE_FORMAT}\t{CACHE_BUILD}\t{locale}\t{realm}\n");
-        for (entry, r) in self.creatures.iter() {
-            out.push_str(&format!(
-                "C\t{entry}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                r.creature_type,
-                r.pet_family,
-                r.rank,
-                r.type_flags,
-                u8::from(r.civilian),
-                u8::from(r.racial_leader),
-                r.display_id,
-                r.name,
-                r.subname.as_deref().unwrap_or("")
-            ));
-        }
-        out
-    }
-
-    /// Rebuild a cache from [`Self::to_tsv`]'s output, `None` when the header differs; a
-    /// malformed line is skipped, and so is a `c` line, the negative an earlier build wrote.
-    pub(crate) fn from_tsv(text: &str, realm: &str) -> Option<Self> {
-        let mut lines = text.lines();
-        let header: Vec<&str> = lines.next()?.split('\t').collect();
-        if header.len() != 5
-            || header[0] != CACHE_MAGIC
-            || header[1] != CACHE_FORMAT.to_string()
-            || header[2] != CACHE_BUILD.to_string()
-            || header[3] != cache_locale()
-            || header[4] != realm
-        {
-            return None;
-        }
-        let mut cache = NameCache::default();
-        for line in lines {
-            let f: Vec<&str> = line.split('\t').collect();
-            match f.first().copied() {
-                Some("C") if f.len() >= 11 => {
-                    let Ok(entry) = f[1].parse::<u32>() else {
-                        continue;
-                    };
-                    let (Ok(creature_type), Ok(pet_family), Ok(rank), Ok(type_flags)) =
-                        (f[2].parse(), f[3].parse(), f[4].parse(), f[5].parse())
-                    else {
-                        continue;
-                    };
-                    let Ok(display_id) = f[8].parse() else {
-                        continue;
-                    };
-                    cache.creatures.insert(
-                        entry,
-                        CreatureRecord {
-                            name: f[9].to_string(),
-                            // Empty is no subname, as in the wire decode.
-                            subname: (!f[10].is_empty()).then(|| f[10].to_string()),
-                            creature_type,
-                            pet_family,
-                            rank,
-                            type_flags,
-                            civilian: f[6] == "1",
-                            racial_leader: f[7] == "1",
-                            display_id,
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-        Some(cache)
-    }
-
     /// Drop a player's cached name and traits so the next resolve re-asks: the reference's
     /// remove-by-key for `SMSG_INVALIDATE_PLAYER` (`0x555600` into `0x560170`).
     pub(crate) fn invalidate_player(&mut self, guid: u64) {
         self.players.evict(guid);
         self.player_traits.remove(&guid);
         self.generation = self.generation.wrapping_add(1);
-    }
-
-    /// How many records the cache holds.
-    pub(crate) fn len(&self) -> usize {
-        self.players.len() + self.creatures.len() + self.pets.len()
     }
 }
 
@@ -506,14 +431,16 @@ pub(crate) mod net {
     use bevy::prelude::*;
 
     use super::{CreatureRecord, NameCache};
-    use crate::field_watch::{id, FieldNotice};
+    use crate::field_watch::{id, FieldNotice, NoticeLane};
     use crate::net::{GuidIndex, NetHandlerApp, ObjectStore};
 
-    /// Register the four handlers.
+    /// Register the four handlers. A player-name answer's goes ahead of every other subsystem's:
+    /// the cache files the record and its valid byte (`0x55f310`, `0x55f413`) before it runs any
+    /// callback waiting on it (`0x55f426`-`0x55f452`), and those read the record it filed.
     pub(crate) fn register(app: &mut App) {
         use SessionEventKind as K;
-        app.add_message::<FieldNotice>()
-            .net_handler(K::PlayerName, on_player_name)
+        app.init_resource::<NoticeLane>()
+            .net_handler_ahead(K::PlayerName, on_player_name)
             .net_handler(K::PetName, on_pet_name)
             .net_handler(K::CreatureName, on_creature_name)
             .net_handler(K::InvalidatePlayer, on_invalidate_player);
@@ -553,13 +480,17 @@ pub(crate) mod net {
     }
 
     /// The name callback `0x5fb840` of a unit the answer names: for a found name (`0x5fb84b`) of a
-    /// held unit (`0x5fb86a`), `UNIT_NAME_UPDATE` through `0x491a00`. The callbacks are the
-    /// lookups that missed, so an answer for a name the cache already holds runs none.
+    /// held unit (`0x5fb86a`), `UNIT_NAME_UPDATE` through `0x491a00`; and the chat's `0x49ccc0`,
+    /// which shows the lines that waited on the name. The callbacks are the lookups that missed,
+    /// so an answer for a name the cache already holds runs none.
     fn on_player_name(
         In(ev): In<SessionEvent>,
         mut names: ResMut<NameCache>,
         units: HeldUnits,
-        mut notices: MessageWriter<FieldNotice>,
+        mut notices: ResMut<NoticeLane>,
+        chat: Option<Res<crate::ui_chat::ChatLog>>,
+        // The auction lists whose getters missed a name (`0x4cf167`, `0x4cf1c8`).
+        house: Option<ResMut<crate::ui_auction::HouseLane>>,
     ) {
         if let SessionEvent::PlayerName {
             guid,
@@ -572,6 +503,14 @@ pub(crate) mod net {
             // A guid already cached has no lookup waiting, so no callback runs.
             let found = !name.is_empty() && names.players.get(guid).is_none();
             player_name(guid, name, race, class, gender, &mut names);
+            if found {
+                if let Some(chat) = &chat {
+                    chat.answer_landed(crate::ui_chat::Answer::Player(guid));
+                }
+                if let Some(mut house) = house {
+                    house.name_landed(guid);
+                }
+            }
             if found && units.holds(guid) {
                 notices.write(FieldNotice::Signal {
                     guid,
@@ -587,7 +526,7 @@ pub(crate) mod net {
         In(ev): In<SessionEvent>,
         mut names: ResMut<NameCache>,
         units: HeldUnits,
-        mut notices: MessageWriter<FieldNotice>,
+        mut notices: ResMut<NoticeLane>,
     ) {
         if let SessionEvent::PetName { pet_number, name } = ev {
             let found = !name.is_empty() && names.pets.get(pet_number).is_none();
@@ -610,7 +549,7 @@ pub(crate) mod net {
         In(ev): In<SessionEvent>,
         mut names: ResMut<NameCache>,
         units: HeldUnits,
-        mut notices: MessageWriter<FieldNotice>,
+        mut notices: ResMut<NoticeLane>,
     ) {
         if let SessionEvent::CreatureName {
             entry,
@@ -620,6 +559,7 @@ pub(crate) mod net {
             pet_family,
             rank,
             type_flags,
+            pet_spell_list,
             display_id,
             civilian,
             racial_leader,
@@ -634,6 +574,7 @@ pub(crate) mod net {
                 pet_family,
                 rank,
                 type_flags,
+                pet_spell_list,
                 civilian,
                 racial_leader,
                 display_id,
@@ -687,6 +628,40 @@ pub(crate) mod net {
         names.invalidate_player(guid);
     }
 
+    /// Files a `SMSG_CREATURE_QUERY_RESPONSE` read off disk ([`crate::wdb`]), as the handler files a
+    /// live one, with no unit waiting on it.
+    pub(crate) fn file_creature(ev: SessionEvent, names: &mut NameCache) {
+        if let SessionEvent::CreatureName {
+            entry,
+            name,
+            subname,
+            creature_type,
+            pet_family,
+            rank,
+            type_flags,
+            pet_spell_list,
+            display_id,
+            civilian,
+            racial_leader,
+        } = ev
+        {
+            creature_name(
+                entry,
+                name,
+                subname,
+                creature_type,
+                pet_family,
+                rank,
+                type_flags,
+                pet_spell_list,
+                civilian,
+                racial_leader,
+                display_id,
+                names,
+            );
+        }
+    }
+
     /// `SMSG_CREATURE_QUERY_RESPONSE`; a `None` name is the server's "no such entry".
     fn creature_name(
         entry: u32,
@@ -696,6 +671,7 @@ pub(crate) mod net {
         pet_family: u32,
         rank: u32,
         type_flags: u32,
+        pet_spell_list: u32,
         civilian: bool,
         racial_leader: bool,
         display_id: u32,
@@ -710,6 +686,7 @@ pub(crate) mod net {
                 pet_family,
                 rank,
                 type_flags,
+                pet_spell_list,
                 civilian,
                 racial_leader,
                 display_id,
@@ -735,7 +712,7 @@ pub(crate) mod net {
             let mut app = App::new();
             app.init_resource::<NameCache>()
                 .init_resource::<GuidIndex>()
-                .add_message::<FieldNotice>();
+                .init_resource::<crate::field_watch::NoticeLane>();
             for (guid, kind, pairs) in [
                 // `OBJECT_FIELD_TYPE` (2): the unit and player type masks.
                 (WOLF_A, ObjectType::Unit, vec![(2, 0x9), (3, 299)]),
@@ -756,7 +733,7 @@ pub(crate) mod net {
 
         fn notices(app: &mut App) -> Vec<FieldNotice> {
             app.world_mut()
-                .resource_mut::<Messages<FieldNotice>>()
+                .resource_mut::<crate::field_watch::NoticeLane>()
                 .drain()
                 .collect()
         }
@@ -774,6 +751,7 @@ pub(crate) mod net {
                 pet_family: 0,
                 rank: 0,
                 type_flags: 0,
+                pet_spell_list: 0,
                 display_id: 0,
                 civilian: false,
                 racial_leader: false,
@@ -975,106 +953,6 @@ mod tests {
         );
     }
 
-    /// A refusal is not written, so an unknown entry is asked again at the next login.
-    #[test]
-    fn the_cache_round_trips_through_its_file_format() {
-        let mut cache = NameCache::default();
-        cache.insert_creature(
-            69,
-            Some(CreatureRecord {
-                name: "Stable Master Kitrik".into(),
-                subname: Some("Stable Master".into()),
-                creature_type: 7,
-                pet_family: 0,
-                rank: 1,
-                type_flags: 0x10,
-                civilian: true,
-                racial_leader: false,
-                display_id: 533,
-            }),
-        );
-        cache.insert_creature(1234, None); // the server flagged the entry unknown
-
-        let text = cache.to_tsv("Hydraxian Waterlords");
-        assert!(
-            !text.lines().any(|l| l.split('\t').nth(1) == Some("1234")),
-            "a refusal is not a line of the file"
-        );
-        let back = NameCache::from_tsv(&text, "Hydraxian Waterlords").expect("header matches");
-
-        assert!(
-            !back.creatures.answered(1234),
-            "and so it does not come back"
-        );
-        let rec = back.creature_record(69).expect("creature survived");
-        assert_eq!(rec.name, "Stable Master Kitrik");
-        assert_eq!(rec.subname.as_deref(), Some("Stable Master"));
-        assert_eq!((rec.creature_type, rec.rank, rec.type_flags), (7, 1, 0x10));
-        assert_eq!((rec.civilian, rec.racial_leader), (true, false));
-        assert_eq!(rec.display_id, 533, "the model a stabled pet is drawn from");
-        assert!(back.creature_record(1234).is_none());
-        assert_eq!(back.len(), 1);
-
-        // `Some("")` would paint an empty tooltip line.
-        cache.insert_creature(
-            70,
-            Some(CreatureRecord {
-                name: "Boar".into(),
-                subname: None,
-                creature_type: 1,
-                pet_family: 5,
-                rank: 0,
-                type_flags: 0,
-                civilian: false,
-                racial_leader: false,
-                display_id: 1,
-            }),
-        );
-        let back = NameCache::from_tsv(&cache.to_tsv("R"), "R").expect("header");
-        assert_eq!(back.creature_record(70).unwrap().subname, None);
-    }
-
-    /// The reference builds `'WNAM'` (ctor `0x554cd0`) and `'WPNM'` with persistence off; a 1.12
-    /// install's `WDB/` holds `creaturecache.wdb` and no `namecache.wdb`.
-    #[test]
-    fn the_file_keeps_creature_templates_and_no_identities() {
-        let mut cache = NameCache::default();
-        cache.insert_player(0x11, "Moamtester".into(), Some((1, 2, 0)));
-        cache.insert_pet(7, "Rex".into());
-        cache.insert_creature(
-            69,
-            Some(CreatureRecord {
-                name: "Stable Master Kitrik".into(),
-                subname: Some("Stable Master".into()),
-                creature_type: 7,
-                pet_family: 0,
-                rank: 1,
-                type_flags: 0x10,
-                civilian: true,
-                racial_leader: false,
-                display_id: 533,
-            }),
-        );
-
-        let text = cache.to_tsv("R");
-        assert!(
-            !text.contains("Moamtester") && !text.contains("Rex"),
-            "no guid- or spawn-keyed name may reach the disk:\n{text}"
-        );
-        let back = NameCache::from_tsv(&text, "R").expect("header matches");
-        assert_eq!(
-            back.resolve_unit(0x11, None, Ask::Read),
-            None,
-            "a player name never survives the file"
-        );
-        assert_eq!(back.player_traits(0x11), None);
-        assert_eq!(
-            back.creature_record(69).map(|r| r.name.as_str()),
-            Some("Stable Master Kitrik"),
-            "the template entry is the key that keeps meaning what it meant",
-        );
-    }
-
     /// The reference's `0x555740` clears the stores whose `[cache+0x39]` byte is 0
     /// (`0x55579f`-`0x5557ad` for the player cache at `0xc0e228`).
     #[test]
@@ -1107,61 +985,6 @@ mod tests {
         cache.insert_player(0x7, "Moamtester".into(), Some((1, 1, 0)));
         cache.insert_player(0x7, "Corances".into(), None);
         assert_eq!(cache.player_traits(0x7), None);
-    }
-
-    #[test]
-    fn a_header_that_differs_in_any_field_discards_the_whole_file() {
-        let mut cache = NameCache::default();
-        cache.insert_creature(1234, Some(record("Defias Thug")));
-        let good = cache.to_tsv("Hydraxian Waterlords");
-        assert!(NameCache::from_tsv(&good, "Hydraxian Waterlords").is_some());
-
-        // The realm: our field, not the reference's.
-        assert!(NameCache::from_tsv(&good, "Another Realm").is_none());
-
-        // The locale field is the client's tag, as the reference's `.wdb` header holds it.
-        let tag = crate::ui_script::client_locale().tag().to_be_bytes();
-        let spelled = String::from_utf8_lossy(&tag)
-            .trim_start_matches('\0')
-            .to_string();
-        assert_eq!(
-            good.lines().next().unwrap().split('\t').nth(3),
-            Some(&*spelled)
-        );
-
-        let head = good.lines().next().unwrap();
-        for (field, bad) in [
-            (0, "not-benilla"),
-            (1, "999"),  // format version
-            (2, "5876"), // client build
-            (3, "frFR"), // locale
-        ] {
-            let mut parts: Vec<&str> = head.split('\t').collect();
-            parts[field] = bad;
-            let text = format!("{}\n{}", parts.join("\t"), good.lines().nth(1).unwrap());
-            assert!(
-                NameCache::from_tsv(&text, "Hydraxian Waterlords").is_none(),
-                "header field {field} = {bad} must discard the file"
-            );
-        }
-
-        assert!(NameCache::from_tsv("", "R").is_none());
-        assert!(NameCache::from_tsv("nonsense", "R").is_none());
-        let text = format!(
-            "{}\nC\tnotanumber\t1\t2\t0\tX\nc\t1234\nC\t88\t7\t0\t1\t0\t0\t0\t5\tGuard\t\n",
-            head
-        );
-        let back = NameCache::from_tsv(&text, "Hydraxian Waterlords").expect("header still good");
-        assert_eq!(back.len(), 1, "the bad line is skipped, the good one kept");
-        assert!(back.creature_record(88).is_some());
-
-        // A version-1 file, which held player names, is discarded whole.
-        let v1 = format!(
-            "{CACHE_MAGIC}\t1\t{CACHE_BUILD}\t{}\tHydraxian Waterlords\n\
-             P\t7\t1\t1\t0\tMoamtester\n",
-            cache_locale()
-        );
-        assert!(NameCache::from_tsv(&v1, "Hydraxian Waterlords").is_none());
     }
 
     #[test]
@@ -1219,6 +1042,7 @@ mod tests {
                 pet_family: 0,
                 rank: 0,
                 type_flags: 0,
+                pet_spell_list: 0,
                 civilian: false,
                 racial_leader: false,
                 display_id: 0,
@@ -1278,7 +1102,7 @@ mod tests {
         let mut cache = NameCache::default();
         let wolf_a = compose(guid::HIGH_UNIT, 1234, 1);
         let wolf_b = compose(guid::HIGH_UNIT, 1234, 2);
-        let store = unit(&[(ENTRY, 1234)]);
+        let store = unit(&[(TYPE, CREATURE), (ENTRY, 1234)]);
 
         cache.lookup_fields(wolf_a, &store.0, &cmds);
         assert!(matches!(
@@ -1336,30 +1160,6 @@ mod tests {
         assert_ne!(cache.generation(), before);
     }
 
-    /// An earlier build wrote its refusals as `c` lines. They load as nothing, and the records
-    /// around them load.
-    #[test]
-    fn a_file_with_negative_lines_loads_without_them() {
-        let mut cache = NameCache::default();
-        cache.insert_creature(69, Some(record("Stable Master")));
-        let written = cache.to_tsv("R");
-        let (header, rest) = written.split_once('\n').expect("a header line");
-        let old = format!("{header}\nc\t1234\n{rest}c\t77\n");
-
-        let back = NameCache::from_tsv(&old, "R").expect("the header is this build's");
-        assert!(!back.creatures.answered(1234), "a negative line is dropped");
-        assert!(!back.creatures.answered(77));
-        assert_eq!(back.len(), 1);
-        assert_eq!(
-            back.creature_record(69).map(|r| r.name.as_str()),
-            Some("Stable Master")
-        );
-        assert!(
-            !back.to_tsv("R").contains("1234"),
-            "and the next save does not bring it back"
-        );
-    }
-
     #[test]
     fn clear_pending_allows_a_reconnect_reask() {
         let (cmds, rx) = commands();
@@ -1380,6 +1180,10 @@ mod tests {
     /// `OBJECT_FIELD_ENTRY` and `UNIT_FIELD_PETNUMBER`, absolute descriptor indices.
     const ENTRY: u16 = 3;
     const PETNUMBER: u16 = 139;
+    /// `OBJECT_FIELD_TYPE` and a creature's or a pet's mask, which the display resolve's ask
+    /// needs (`0x60b134`).
+    const TYPE: u16 = 2;
+    const CREATURE: u32 = 9;
 
     fn unit(fields: &[(u16, u32)]) -> ObjectStore {
         ObjectStore(benilla_protocol::ObjectFields::from_pairs(fields))
@@ -1393,6 +1197,7 @@ mod tests {
             pet_family: 0,
             rank: 0,
             type_flags: 0,
+            pet_spell_list: 0,
             civilian: false,
             racial_leader: false,
             display_id: 0,
@@ -1431,7 +1236,7 @@ mod tests {
         let (cmds, rx) = commands();
         let mut cache = NameCache::default();
         let wolf = compose(guid::HIGH_UNIT, 299, 4);
-        let store = unit(&[(ENTRY, 2_671)]);
+        let store = unit(&[(TYPE, CREATURE), (ENTRY, 2_671)]);
         cache.insert_creature(299, Some(record("Guid Bits")));
         cache.insert_creature(2_671, Some(record("Field Entry")));
         assert_eq!(
@@ -1510,12 +1315,29 @@ mod tests {
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
+    /// The display resolve asks only for mask 9 (`0x60b134`): a descriptor with no
+    /// `OBJECT_FIELD_TYPE` reads 0 and asks nothing, nor does a player's `0x19`.
+    #[test]
+    fn only_a_creatures_mask_asks_its_record() {
+        let (cmds, rx) = commands();
+        let cache = NameCache::default();
+        let wolf = compose(guid::HIGH_UNIT, 1234, 1);
+        cache.ask_creature_record(wolf, &unit(&[(ENTRY, 1234)]).0, &cmds);
+        cache.ask_creature_record(wolf, &unit(&[(TYPE, 0x19), (ENTRY, 1234)]).0, &cmds);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        cache.ask_creature_record(wolf, &unit(&[(TYPE, CREATURE), (ENTRY, 1234)]).0, &cmds);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientCommand::CreatureQuery { entry: 1234, .. })
+        ));
+    }
+
     #[test]
     fn a_cold_companion_pet_is_asked_by_the_creature_query_at_its_create() {
         let (cmds, rx) = commands();
         let cache = NameCache::default();
         let squirrel = compose(guid::HIGH_PET, 5_021, 3);
-        let store = unit(&[(ENTRY, 2_671)]);
+        let store = unit(&[(TYPE, CREATURE), (ENTRY, 2_671)]);
 
         cache.lookup_fields(squirrel, &store.0, &cmds);
         assert!(matches!(

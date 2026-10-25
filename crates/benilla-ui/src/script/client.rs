@@ -65,15 +65,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     }
 
     // `OpeningCinematic()` (`0x48c8c0`): sends an empty `CMSG_OPENING_CINEMATIC` (`0xf9`,
-    // `0x48c8c9` into `0x5ab630`) and returns nothing; the server may answer with
+    // `0x48c8c9` into `0x5ab630`) inside the call and returns nothing; the server may answer with
     // `SMSG_TRIGGER_CINEMATIC`. Arguments are ignored.
     g.set(
         "OpeningCinematic",
         lua.create_function(|lua, _: MultiValue| {
-            lua.app_data_mut::<Model>()
-                .expect("model app_data")
-                .opening_cinematic_asks += 1;
-            Ok(())
+            super::calls::submit(lua, super::ScriptCall::OpeningCinematic)
         })?,
     )?;
 
@@ -200,15 +197,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // `RequestTimePlayed()` queues a `CMSG_PLAYED_TIME` and returns nothing; the answer is the
-    // `TIME_PLAYED_MSG(total, level)` the app fires when `SMSG_PLAYED_TIME` lands.
+    // `RequestTimePlayed()` (`0x48a900`) sends the empty `CMSG_PLAYED_TIME` (0x1cc, `0x48a936`)
+    // inside the call and returns nothing; the answer is the `TIME_PLAYED_MSG(total, level)` the
+    // app fires when `SMSG_PLAYED_TIME` lands (`0x4018df`).
     g.set(
         "RequestTimePlayed",
         lua.create_function(|lua, ()| {
-            lua.app_data_mut::<Model>()
-                .expect("model app_data")
-                .played_time_asks += 1;
-            Ok(())
+            super::calls::submit(lua, super::ScriptCall::RequestTimePlayed)
         })?,
     )?;
 
@@ -237,15 +232,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 }
 
 impl super::UiScript {
-    /// Drain the `RequestTimePlayed()` asks, each a `CMSG_PLAYED_TIME`: a count, as the request
-    /// body is empty.
+    /// The `RequestTimePlayed()` sends a harness's VM kept ([`Self::keep_calls`]): a count, as the
+    /// request body is empty.
     pub fn take_played_time_asks(&mut self) -> u32 {
-        std::mem::take(&mut self.model_mut().played_time_asks)
+        self.take_calls_where(|call| {
+            matches!(call, super::ScriptCall::RequestTimePlayed).then_some(())
+        })
+        .len() as u32
     }
 
-    /// Drain the `OpeningCinematic()` calls, each an empty `CMSG_OPENING_CINEMATIC`.
+    /// The `OpeningCinematic()` calls a harness's VM kept ([`Self::keep_calls`]).
     pub fn take_opening_cinematic_asks(&mut self) -> u32 {
-        std::mem::take(&mut self.model_mut().opening_cinematic_asks)
+        self.take_calls_like(&super::ScriptCall::OpeningCinematic) as u32
     }
 
     /// Push the bind location's name, resolved from `SMSG_BINDPOINTUPDATE`'s AreaTable id through
@@ -366,6 +364,12 @@ impl UiScript {
     /// word there, and only 1 to 5 picks a charset pair of its own.
     pub fn set_client_region(&mut self, region: i32) {
         self.model_mut().client_region = region;
+    }
+
+    /// Seat the word lists the character and guild name checks search, which start-up compiles
+    /// once for the whole client (`0x6c91a0`).
+    pub fn set_name_lists(&mut self, lists: std::rc::Rc<dyn super::NameLists>) {
+        self.model_mut().name_lists = Some(lists);
     }
 }
 
@@ -551,17 +555,18 @@ mod tests {
         assert_eq!(s.arity("GetDebugStats()").unwrap(), 0);
     }
 
-    /// Each `OpeningCinematic()` queues one send and returns nothing.
+    /// Each `OpeningCinematic()` hands the host one send and returns nothing.
     #[test]
-    fn opening_cinematic_queues_one_send_per_call() {
+    fn opening_cinematic_hands_one_send_per_call() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         assert_eq!(s.arity("OpeningCinematic()").unwrap(), 0);
         s.run("OpeningCinematic(1)").unwrap();
         assert_eq!(s.take_opening_cinematic_asks(), 2);
         assert_eq!(
             s.take_opening_cinematic_asks(),
             0,
-            "the drain empties the queue"
+            "the take empties what was kept"
         );
     }
 

@@ -1,4 +1,4 @@
-//! Every unit's aura list but the player's, one per guid, and the unit-token resolver's inputs
+//! Every unit's aura list, the player's too, one per guid, and the unit-token resolver's inputs
 //! (`0x515970`, [`UnitGuids`]) that `UnitBuff 0x519500` and `UnitDebuff 0x5198f0` read them through:
 //! the guid globals, the group tables, and each held unit a `target` chain can reach. A list is the
 //! live unit's slots, gated as any unit's; a group member or pet with no live object diverts to its
@@ -9,9 +9,9 @@
 use std::collections::hash_map::{Entry, HashMap};
 
 use benilla_formats::SpellCatalog;
-use benilla_ui::script::{AuraState, UiScript, UnitGuids};
+use benilla_ui::script::{UiScript, UnitAuraList, UnitGuids};
 
-use super::{aura_list, other_unit_inputs, record_inputs, AuraInput};
+use super::{aura_list, other_unit_inputs, record_inputs, AuraInput, RaidFilter};
 use crate::net::ObjectStore;
 use crate::ui_party::{raid_row_guids, GroupState};
 
@@ -21,7 +21,6 @@ use crate::ui_party::{raid_row_guids, GroupState};
 fn fill_group<'a>(
     g: &mut UnitGuids,
     group: Option<&GroupState>,
-    me: u64,
     held: impl Fn(u64) -> Option<&'a ObjectStore>,
 ) {
     g.party = [0; 4];
@@ -36,7 +35,7 @@ fn fill_group<'a>(
         g.party[i] = m.guid;
         g.party_pets[i] = group.party_pet_guid(m.guid, live(m.guid)).unwrap_or(0);
     }
-    g.raid = raid_row_guids(group, Some(me));
+    g.raid = raid_row_guids(group);
     g.raid_pets.extend(
         g.raid
             .iter()
@@ -47,7 +46,8 @@ fn fill_group<'a>(
 /// What [`UnitAuras::feed`] reads this frame.
 pub(super) struct Inputs<'g, 'a, H, V> {
     pub(super) group: Option<&'g GroupState>,
-    /// Our guid: a token naming us reads the player's list, which the caller pushes.
+    /// Our guid, whose slots list as any held unit's: `UnitBuff("player")` walks the fields, not
+    /// the buff cache (`0x51960f`).
     pub(super) me: u64,
     /// `pet`, `target`, `mouseover` and `npc`'s guids, 0 for none.
     pub(super) pet: u64,
@@ -61,13 +61,17 @@ pub(super) struct Inputs<'g, 'a, H, V> {
     pub(super) catalog: Option<&'a SpellCatalog>,
     /// The spell catalog was replaced, so every list is rebuilt.
     pub(super) catalog_moved: bool,
+    /// Each aura's `raidFilter` verdict.
+    pub(super) raid: &'a RaidFilter,
+    /// The active player's `PLAYER_FIELD_BYTES2` byte 1, the auras it can see (`0x5198b0`).
+    pub(super) vision: Option<u8>,
 }
 
 /// One guid's list, shared by every token naming it.
 struct GuidList {
     /// What the list was built from; the list is rebuilt only when these move.
     inputs: Vec<AuraInput>,
-    list: Vec<AuraState>,
+    list: UnitAuraList,
     /// Taken from [`UnitAuras::versions`] each time the list changes.
     version: u64,
     /// The frame that last read it; an entry no token can name this frame is dropped.
@@ -116,6 +120,8 @@ impl UnitAuras {
             buffs_visible,
             catalog,
             catalog_moved,
+            raid,
+            vision,
         } = inputs;
         self.frame += 1;
         if catalog_moved || catalog.is_some() != self.catalog_present {
@@ -128,7 +134,7 @@ impl UnitAuras {
         let mut g = std::mem::take(&mut self.guids);
         let mut walk = std::mem::take(&mut self.walk);
         (g.player, g.pet, g.target, g.mouseover, g.npc) = (me, pet, target, mouseover, npc);
-        fill_group(&mut g, group, me, &held);
+        fill_group(&mut g, group, &held);
         g.held.clear();
         walk.clear();
         walk.extend([me, pet, target, mouseover, npc].map(|g| (g, false)));
@@ -144,9 +150,16 @@ impl UnitAuras {
                 g.held.insert(guid, next);
                 walk.push((next, false));
             }
-            if guid != me {
-                self.refresh(guid, store, record_ok, group, &buffs_visible, catalog);
-            }
+            self.refresh(
+                guid,
+                store,
+                record_ok,
+                group,
+                &buffs_visible,
+                catalog,
+                raid,
+                vision,
+            );
         }
         script.set_unit_guids(&g);
         self.guids = g;
@@ -174,14 +187,15 @@ impl UnitAuras {
     }
 
     /// `guid`'s list as last built, `None` for a unit with none.
-    pub(super) fn list(&self, guid: u64) -> Option<&[AuraState]> {
-        self.by_guid.get(&guid).map(|e| e.list.as_slice())
+    pub(super) fn list(&self, guid: u64) -> Option<&UnitAuraList> {
+        self.by_guid.get(&guid).map(|e| &e.list)
     }
 
-    /// Rebuild `guid`'s list this frame if what it is built from moved: the live unit's gated
-    /// slots (`store`, the object manager's answer), else, for a guid a group token names, the
-    /// roster record's block. A guid neither held nor a group token's gets no list, as
-    /// `UnitBuff`'s roster walk finds nothing for it.
+    /// Rebuild `guid`'s list this frame if what it is built from moved: the live unit's slots
+    /// (`store`, the object manager's answer) with its unit gate, else, for a guid a group token
+    /// names, the roster record's block, which has none (`0x519735`). A guid neither held nor a
+    /// group token's gets no list, as `UnitBuff`'s roster walk finds nothing for it.
+    #[allow(clippy::too_many_arguments)] // the list's inputs, as the feed reads them
     fn refresh(
         &mut self,
         guid: u64,
@@ -190,6 +204,8 @@ impl UnitAuras {
         group: Option<&GroupState>,
         buffs_visible: &impl Fn(u64, &ObjectStore) -> bool,
         catalog: Option<&SpellCatalog>,
+        raid: &RaidFilter,
+        vision: Option<u8>,
     ) {
         if self
             .by_guid
@@ -199,27 +215,30 @@ impl UnitAuras {
             return;
         }
         self.scratch.clear();
-        match store {
-            Some(store) => self.scratch.extend(other_unit_inputs(
-                store,
-                catalog,
-                buffs_visible(guid, store),
-            )),
-            None if record_ok => {
-                if let Some(group) = group {
-                    self.scratch
-                        .extend(record_inputs(group.roster_aura_slots(guid), catalog));
-                }
-            }
-            None => return,
-        }
+        let Some(gate) = list_inputs(
+            &mut self.scratch,
+            guid,
+            store,
+            record_ok,
+            group,
+            buffs_visible,
+            catalog,
+            raid,
+            vision,
+        ) else {
+            return;
+        };
+        let build = |inputs: &[AuraInput]| UnitAuraList {
+            auras: aura_list(catalog, inputs),
+            buffs_visible: gate,
+        };
         match self.by_guid.entry(guid) {
             Entry::Occupied(mut e) => {
                 let e = e.get_mut();
                 e.frame = self.frame;
-                if e.inputs != self.scratch {
+                if e.inputs != self.scratch || e.list.buffs_visible != gate {
                     std::mem::swap(&mut e.inputs, &mut self.scratch);
-                    let list = aura_list(catalog, &e.inputs);
+                    let list = build(&e.inputs);
                     if list != e.list {
                         e.list = list;
                         self.versions += 1;
@@ -230,7 +249,7 @@ impl UnitAuras {
             Entry::Vacant(e) => {
                 self.versions += 1;
                 let inputs = self.scratch.clone();
-                let list = aura_list(catalog, &inputs);
+                let list = build(&inputs);
                 e.insert(GuidList {
                     inputs,
                     list,
@@ -240,6 +259,72 @@ impl UnitAuras {
             }
         }
     }
+}
+
+/// What `guid`'s list is built from, into `inputs`, with its unit gate: the live unit's slots
+/// (`store`, the object manager's answer) with its gate, else, for a guid a group token names
+/// (`record_ok`), the roster record's block, which has none (`0x519735`). A guid neither held nor
+/// a group token's gets no list, as `UnitBuff`'s roster walk finds nothing for it.
+#[allow(clippy::too_many_arguments)] // the list's inputs, as the feed reads them
+fn list_inputs(
+    inputs: &mut Vec<AuraInput>,
+    guid: u64,
+    store: Option<&ObjectStore>,
+    record_ok: bool,
+    group: Option<&GroupState>,
+    buffs_visible: &impl Fn(u64, &ObjectStore) -> bool,
+    catalog: Option<&SpellCatalog>,
+    raid: &RaidFilter,
+    vision: Option<u8>,
+) -> Option<bool> {
+    match store {
+        Some(store) => {
+            inputs.extend(other_unit_inputs(store, catalog, raid, vision));
+            Some(buffs_visible(guid, store))
+        }
+        None if record_ok => {
+            if let Some(group) = group {
+                inputs.extend(record_inputs(
+                    group.roster_aura_slots(guid),
+                    catalog,
+                    raid,
+                    vision,
+                ));
+            }
+            Some(true)
+        }
+        None => None,
+    }
+}
+
+/// `guid`'s list off `store` and the record `group` holds, as [`UnitAuras::feed`] builds it.
+#[allow(clippy::too_many_arguments)] // the list's inputs, as the feed reads them
+pub(super) fn list_of(
+    guid: u64,
+    store: Option<&ObjectStore>,
+    record_ok: bool,
+    group: Option<&GroupState>,
+    buffs_visible: &impl Fn(u64, &ObjectStore) -> bool,
+    catalog: Option<&SpellCatalog>,
+    raid: &RaidFilter,
+    vision: Option<u8>,
+) -> Option<UnitAuraList> {
+    let mut inputs = Vec::new();
+    let gate = list_inputs(
+        &mut inputs,
+        guid,
+        store,
+        record_ok,
+        group,
+        buffs_visible,
+        catalog,
+        raid,
+        vision,
+    )?;
+    Some(UnitAuraList {
+        auras: aura_list(catalog, &inputs),
+        buffs_visible: gate,
+    })
 }
 
 #[cfg(test)]
@@ -362,6 +447,92 @@ mod tests {
             .non_send_resource::<UiScript>()
             .eval::<Vec<String>>("local s = SEEN SEEN = {} return s")
             .unwrap()
+    }
+
+    /// The player's slots list under its guid as any held unit's: `UnitBuff("player")` walks the
+    /// fields in slot order (`0x51960f`), not the buff cache's arrival order.
+    #[test]
+    fn the_player_token_reads_the_slots_in_slot_order() {
+        let mut app = party_app();
+        let me = app.world().resource::<GuidIndex>().0[&ME];
+        let seat = |app: &mut App, fields: &[(u16, u32)]| {
+            app.world_mut()
+                .entity_mut(me)
+                .insert(ObjectStore(ObjectFields::from_pairs(fields)));
+            app.update();
+        };
+        // Stance lands first, in slot 1; then Mark, in slot 0.
+        seat(
+            &mut app,
+            &[(FLAGS, 0x0800_0000), (AURA + 1, 2457), (AURAFLAGS, 0x90)],
+        );
+        seat(
+            &mut app,
+            &[
+                (FLAGS, 0x0800_0000),
+                (AURA, 1126),
+                (AURA + 1, 2457),
+                (AURAFLAGS, 0x99),
+            ],
+        );
+        assert_eq!(listed(&mut app, "player", false), [1126, 2457]);
+    }
+
+    /// A set `raidFilter` counts the buffs the player could cast, off the books as they stand: a
+    /// spell learnt rebuilds the verdicts (`0x4b2603`).
+    #[test]
+    fn a_raid_filter_follows_the_book() {
+        let mut app = party_app();
+        let row = |id: u32| {
+            (
+                id,
+                benilla_formats::SpellDisplay {
+                    id,
+                    icon: Some(format!("Spell_{id}")),
+                    ..Default::default()
+                },
+            )
+        };
+        app.world_mut().insert_resource(crate::ui_action::Spells {
+            catalog: benilla_formats::SpellCatalog::from_displays([row(1243), row(1126)].into()),
+            ..crate::ui_action::Spells::empty_for_tests()
+        });
+        let mut actions = crate::ui_action::PlayerActions::default();
+        actions.spells.insert(1243);
+        app.world_mut().insert_resource(actions);
+        stream(
+            &mut app,
+            MEMBER,
+            &[
+                (FLAGS, 0x0800_0000),
+                (AURA, 1126),
+                (AURA + 1, 1243),
+                (AURAFLAGS, 0x0000_0088),
+            ],
+        );
+        let kept = |app: &mut App| {
+            app.world_mut()
+                .non_send_resource::<UiScript>()
+                .eval::<Vec<String>>(
+                    r#"local t = {}
+                       for i = 1, 32 do
+                           local icon = UnitBuff("party1", i, 1)
+                           if not icon then break end
+                           table.insert(t, icon)
+                       end
+                       return t"#,
+                )
+                .unwrap()
+        };
+        app.update();
+        assert_eq!(kept(&mut app), ["Spell_1243"]);
+        assert_eq!(listed(&mut app, "party1", false), [1126, 1243]);
+        app.world_mut()
+            .resource_mut::<crate::ui_action::PlayerActions>()
+            .spells
+            .insert(1126);
+        app.update();
+        assert_eq!(kept(&mut app), ["Spell_1126", "Spell_1243"]);
     }
 
     /// A live member reads its own `UNIT_FIELD_AURA` slots; `UnitBuff` keeps the unit gate, open
@@ -599,16 +770,221 @@ mod tests {
         assert!(listed(&mut app, "partypet1", false).is_empty());
     }
 
+    // == The pet token ==
+
+    /// `OBJECT_FIELD_TYPE`, and the player's and a unit's type masks.
+    const OBJECT_TYPE: u16 = 2;
+    const TYPE_PLAYER: u32 = 0x19;
+    const TYPE_UNIT: u32 = 0x9;
+    /// `UNIT_FIELD_CHARM`, `UNIT_FIELD_CHARMEDBY` and `UNIT_FIELD_CREATEDBY`, two-field guids.
+    const CHARM: u16 = 6;
+    const CHARMEDBY: u16 = 10;
+    const CREATEDBY: u16 = 14;
+    /// `UNIT_FLAG_PLAYER_CONTROLLED`, which players and their pets carry.
+    const PLAYER_CONTROLLED: u32 = 0x8;
+    /// A unit we charm.
+    const THRALL: u64 = 0xF130_0000_0000_0055;
+
+    /// `field` and the next one holding `guid`.
+    fn guid_at(field: u16, guid: u64) -> [(u16, u32); 2] {
+        [(field, guid as u32), (field + 1, (guid >> 32) as u32)]
+    }
+
+    /// Our descriptor replaced by these fields.
+    fn seat_me(app: &mut App, fields: &[(u16, u32)]) {
+        let me = app.world().resource::<GuidIndex>().0[&ME];
+        app.world_mut()
+            .entity_mut(me)
+            .insert(ObjectStore(ObjectFields::from_pairs(fields)));
+    }
+
+    /// The pet bar's cached guid (`[0xb714a0]`).
+    fn bar(app: &mut App, guid: u64) {
+        app.world_mut()
+            .resource_mut::<crate::ui_pet::PetBar>()
+            .spells
+            .pet_guid = guid;
+    }
+
+    /// `"pet"` names our `UNIT_FIELD_CHARM`, else our `UNIT_FIELD_SUMMON`, off our own descriptor
+    /// (`0x515a5e`-`0x515a6e`), never the pet bar's guid: its list is that unit's, a bar naming
+    /// another unit changes nothing, and with neither field the token names nobody.
+    #[test]
+    fn the_pet_token_lists_our_charm_else_our_summon_not_the_bar() {
+        let mut app = party_app();
+        let open = (FLAGS, 0x0800_0000);
+        stream(&mut app, PET, &[open, (AURA, 1126), (AURAFLAGS, 0x9)]);
+        stream(&mut app, THRALL, &[open, (AURA, 21562), (AURAFLAGS, 0x9)]);
+        bar(&mut app, THRALL);
+        seat_me(&mut app, &guid_at(SUMMON, PET));
+        app.update();
+        assert_eq!(listed(&mut app, "pet", false), [1126], "the summon");
+
+        bar(&mut app, PET);
+        let mut both = guid_at(SUMMON, PET).to_vec();
+        both.extend(guid_at(CHARM, THRALL));
+        seat_me(&mut app, &both);
+        app.update();
+        assert_eq!(listed(&mut app, "pet", false), [21562], "the charm first");
+
+        seat_me(&mut app, &[]);
+        app.update();
+        assert!(
+            listed(&mut app, "pet", false).is_empty(),
+            "no charm and no summon name nobody, whatever the bar holds"
+        );
+    }
+
+    /// The pet's buffs pass `UnitBuff`'s unit gate as any unit's (`0x5195aa`-`0x5195f7`): our own
+    /// pet passes `CanAssist` (`0x6066f0`), and while our `UNIT_FIELD_CHARMEDBY` is set
+    /// (`0x5195eb`-`0x5195f7`) its buffs are nil. `UnitDebuff` has no gate.
+    #[test]
+    fn the_pets_buffs_close_while_we_are_charmed() {
+        let mut app = party_app();
+        stream(
+            &mut app,
+            PET,
+            &[
+                (OBJECT_TYPE, TYPE_UNIT),
+                (FLAGS, PLAYER_CONTROLLED),
+                guid_at(CREATEDBY, ME)[0],
+                guid_at(CREATEDBY, ME)[1],
+                (AURA, 1126),
+                (AURA + 33, 589),
+                (AURAFLAGS, 0x9),
+                (AURAFLAGS + 4, 0x80),
+            ],
+        );
+        bar(&mut app, PET);
+        let me = |charmer: u64| {
+            let mut f = vec![(OBJECT_TYPE, TYPE_PLAYER), (FLAGS, PLAYER_CONTROLLED)];
+            f.extend(guid_at(SUMMON, PET));
+            f.extend(guid_at(CHARMEDBY, charmer));
+            f
+        };
+        seat_me(&mut app, &me(0));
+        app.update();
+        assert_eq!(
+            listed(&mut app, "pet", false),
+            [1126],
+            "we assist our own pet"
+        );
+        assert_eq!(listed(&mut app, "pet", true), [589]);
+
+        seat_me(&mut app, &me(THRALL));
+        app.update();
+        assert!(
+            listed(&mut app, "pet", false).is_empty(),
+            "charmed, we list nobody's buffs, our pet's included"
+        );
+        assert_eq!(listed(&mut app, "pet", true), [589], "the debuffs stay");
+    }
+
+    // == The vision test ==
+
+    /// `PLAYER_FIELD_BYTES2`, whose byte 1 holds the auras the player can see (`+0x10c1`).
+    const BYTES2: u16 = 1260;
+    /// 26869 Amorous, whose `RequiredAuraVision` is 1, and an aura with none.
+    const AMOROUS: u32 = 26869;
+
+    /// A catalog of Amorous, needing vision 1, and Power Word: Fortitude, needing none.
+    fn vision_catalog(app: &mut App) {
+        let row = |id: u32, required_aura_vision: u32| {
+            (
+                id,
+                benilla_formats::SpellDisplay {
+                    id,
+                    icon: Some(format!("Spell_{id}")),
+                    required_aura_vision,
+                    ..Default::default()
+                },
+            )
+        };
+        app.world_mut().insert_resource(crate::ui_action::Spells {
+            catalog: benilla_formats::SpellCatalog::from_displays(
+                [row(AMOROUS, 1), row(1243, 0)].into(),
+            ),
+            ..crate::ui_action::Spells::empty_for_tests()
+        });
+    }
+
+    /// `IsAuraDisplayable` (`0x519860`) hides an aura whose `RequiredAuraVision` is set unless
+    /// bit `value - 1` of the active player's `PLAYER_FIELD_BYTES2` byte 1 is (`0x51989c`-
+    /// `0x5198b8`), on every unit's rows, the player's own included (`0x51966d`); the record walk
+    /// runs it too (`0x51979f`). The player's buff bar does not (`0x4e4170`).
+    #[test]
+    fn an_aura_needing_vision_shows_only_while_the_player_has_it() {
+        let mut app = party_app();
+        vision_catalog(&mut app);
+        let open = (FLAGS, 0x0800_0000);
+        stream(
+            &mut app,
+            MEMBER,
+            &[open, (AURA, AMOROUS), (AURA + 1, 1243), (AURAFLAGS, 0x99)],
+        );
+        let me = |vision: u32| {
+            [
+                open,
+                (AURA, AMOROUS),
+                (AURAFLAGS, 0x9),
+                (BYTES2, vision << 8),
+            ]
+        };
+        seat_me(&mut app, &me(0));
+        app.update();
+        assert_eq!(listed(&mut app, "party1", false), [1243], "Amorous hidden");
+        assert!(listed(&mut app, "player", false).is_empty(), "on us too");
+        let bar_shows = |app: &mut App| {
+            app.world_mut()
+                .non_send_resource::<UiScript>()
+                .eval::<i64>(r#"return (GetPlayerBuff(0, "HELPFUL"))"#)
+                .unwrap()
+        };
+        assert_eq!(bar_shows(&mut app), 0, "the buff bar runs no vision test");
+
+        // Bit 0 of byte 1 is vision 1 (Detect Amore).
+        seat_me(&mut app, &me(1));
+        app.update();
+        assert_eq!(
+            listed(&mut app, "party1", false),
+            [i64::from(AMOROUS), 1243]
+        );
+        assert_eq!(listed(&mut app, "player", false), [i64::from(AMOROUS)]);
+        // Bit 1 alone is another vision.
+        seat_me(&mut app, &me(2));
+        app.update();
+        assert_eq!(listed(&mut app, "party1", false), [1243]);
+    }
+
+    /// A member out of view reads its record's block, which the vision test filters as well
+    /// (`0x51979f`).
+    #[test]
+    fn a_records_aura_needing_vision_is_hidden_without_it() {
+        let mut app = party_app();
+        vision_catalog(&mut app);
+        stats(
+            &mut app,
+            true,
+            PartyMemberStatsInfo {
+                status: Some(member_status::ONLINE),
+                auras: Some(vec![(0, AMOROUS as u16), (1, 1243)]),
+                ..Default::default()
+            },
+        );
+        app.update();
+        assert_eq!(listed(&mut app, "party1", false), [1243]);
+    }
+
     // == The raid tokens ==
 
-    /// In our subgroup, so `party1` and `raid2`.
+    /// In our subgroup, so `party1` and `raid1`.
     const MATE: u64 = 0x2001;
-    /// Subgroup 2, `raid5` only.
+    /// Subgroup 2, `raid4` only.
     const FAR: u64 = 0x2004;
     const FAR_PET: u64 = 0xF140_0000_0000_0099;
 
-    /// A raid of five: us (row 1, subgroup 1), `MATE` (subgroup 1), two in subgroup 2 and `FAR`
-    /// in subgroup 3, in wire order, none streamed and none with a record.
+    /// A raid of five: `MATE` (subgroup 1), two in subgroup 2 and `FAR` in subgroup 3 in wire
+    /// order, then us (row 5, subgroup 1); none streamed and none with a record.
     fn raid_app() -> App {
         let mut app = party_app();
         relist_raid(&mut app, member_status::ONLINE);
@@ -664,9 +1040,9 @@ mod tests {
             ],
         );
         app.update();
-        assert_eq!(listed(&mut app, "raid5", true), [589]);
+        assert_eq!(listed(&mut app, "raid4", true), [589]);
         assert!(
-            listed(&mut app, "raid5", false).is_empty(),
+            listed(&mut app, "raid4", false).is_empty(),
             "no factions, so `CanAssist` fails and the gate drops the buffs"
         );
         for token in ["party1", "party2", "raid6"] {
@@ -691,17 +1067,17 @@ mod tests {
             },
         );
         app.update();
-        assert_eq!(listed(&mut app, "raid5", true), [589, 11976]);
+        assert_eq!(listed(&mut app, "raid4", true), [589, 11976]);
         let count = app
             .world_mut()
             .non_send_resource::<UiScript>()
-            .eval::<i64>(r#"local _, count = UnitDebuff("raid5", 1) return count"#)
+            .eval::<i64>(r#"local _, count = UnitDebuff("raid4", 1) return count"#)
             .unwrap();
         assert_eq!(count, 1);
-        assert_eq!(listed(&mut app, "raidpet5", false), [1126]);
-        assert_eq!(listed(&mut app, "raidpet5", true), [770]);
+        assert_eq!(listed(&mut app, "raidpet4", false), [1126]);
+        assert_eq!(listed(&mut app, "raidpet4", true), [770]);
         assert!(
-            listed(&mut app, "raidpet4", true).is_empty(),
+            listed(&mut app, "raidpet3", true).is_empty(),
             "a petless member's raidpet token names nobody"
         );
     }
@@ -716,12 +1092,12 @@ mod tests {
         stats_of(&mut app, FAR, true, online(vec![(32, 770)]));
         app.update();
         assert!(seen(&mut app).is_empty());
-        assert_eq!(listed(&mut app, "raid5", true), [770]);
+        assert_eq!(listed(&mut app, "raid4", true), [770]);
 
         stats_of(&mut app, MATE, false, online(vec![(33, 11976)]));
         app.update();
         assert!(seen(&mut app).is_empty());
-        assert_eq!(listed(&mut app, "raid2", true), [589, 11976]);
+        assert_eq!(listed(&mut app, "raid1", true), [589, 11976]);
         assert_eq!(listed(&mut app, "party1", true), [589, 11976]);
     }
 
@@ -733,17 +1109,17 @@ mod tests {
         let mut app = raid_app();
         stats_of(&mut app, MATE, true, online(vec![(32, 589)]));
         app.update();
-        assert_eq!(listed(&mut app, "raid2", true), [589]);
+        assert_eq!(listed(&mut app, "raid1", true), [589]);
         assert_eq!(listed(&mut app, "party1", true), [589]);
 
         relist_raid(&mut app, member_status::OFFLINE);
         app.update();
-        assert!(listed(&mut app, "raid2", true).is_empty());
+        assert!(listed(&mut app, "raid1", true).is_empty());
         assert!(listed(&mut app, "party1", true).is_empty());
 
         relist_raid(&mut app, member_status::ONLINE);
         app.update();
-        assert_eq!(listed(&mut app, "raid2", true), [589]);
+        assert_eq!(listed(&mut app, "raid1", true), [589]);
         assert_eq!(listed(&mut app, "party1", true), [589]);
     }
 
@@ -776,12 +1152,12 @@ mod tests {
             },
         );
         app.update();
-        for token in ["raid5", "raidpet5", "raid6", "raid40", "raidpet40"] {
+        for token in ["raid4", "raidpet4", "raid6", "raid40", "raidpet40"] {
             assert!(listed(&mut app, token, true).is_empty(), "{token}");
         }
     }
 
-    /// Row 1 is us: the player's own list, as `"player"` answers it.
+    /// The last row, 5, is us: the player's own list, as `"player"` answers it.
     #[test]
     fn our_raid_row_mirrors_the_player_list() {
         let mut app = raid_app();
@@ -793,7 +1169,7 @@ mod tests {
             ]));
         app.update();
         assert_eq!(listed(&mut app, "player", true), [589]);
-        assert_eq!(listed(&mut app, "raid1", true), [589]);
+        assert_eq!(listed(&mut app, "raid5", true), [589]);
     }
 
     /// A frame where nothing moved builds no list: the feed compares the inputs, not the lists.
@@ -850,16 +1226,14 @@ mod tests {
         let mut app = party_app();
         app.init_resource::<crate::target::Hovered>();
         let me = app.world_mut().resource::<GuidIndex>().0[&ME];
+        let mut fields = unit_fields(0x19, MOB, 6788);
+        fields.extend(guid_at(SUMMON, PET));
         *app.world_mut().get_mut::<ObjectStore>(me).unwrap() =
-            ObjectStore(ObjectFields::from_pairs(&unit_fields(0x19, MOB, 6788)));
+            ObjectStore(ObjectFields::from_pairs(&fields));
         stream(&mut app, MOB, &unit_fields(0x9, MEMBER, 589));
         stream(&mut app, MEMBER, &unit_fields(0x19, ADD, 11976));
         stream(&mut app, ADD, &unit_fields(0x9, ME, 770));
         stream(&mut app, PET, &unit_fields(0x9, MOB, 1));
-        app.world_mut()
-            .resource_mut::<crate::ui_pet::PetBar>()
-            .spells
-            .pet_guid = PET;
         let (mob, add) = {
             let index = &app.world().resource::<GuidIndex>().0;
             (index[&MOB], index[&ADD])
@@ -974,13 +1348,13 @@ mod tests {
     fn a_raid_members_target_reads_whatever_the_guid_holds() {
         let mut app = raid_app();
         stats_of(&mut app, FAR, true, online(vec![(32, 589)]));
-        // `raid3` is 0x2002, in view and targeting `FAR`, which is not.
+        // `raid2` is 0x2002, in view and targeting `FAR`, which is not.
         stream(&mut app, 0x2002, &unit_fields(0x19, FAR, 770));
         app.update();
-        assert_eq!(listed(&mut app, "raid3", true), [770]);
-        assert_eq!(listed(&mut app, "raid3target", true), [589]);
-        assert_eq!(listed(&mut app, "raid5", true), [589]);
-        assert!(listed(&mut app, "raid5target", true).is_empty());
-        assert!(listed(&mut app, "raid3targettarget", true).is_empty());
+        assert_eq!(listed(&mut app, "raid2", true), [770]);
+        assert_eq!(listed(&mut app, "raid2target", true), [589]);
+        assert_eq!(listed(&mut app, "raid4", true), [589]);
+        assert!(listed(&mut app, "raid4target", true).is_empty());
+        assert!(listed(&mut app, "raid2targettarget", true).is_empty());
     }
 }

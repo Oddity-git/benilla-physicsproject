@@ -1099,6 +1099,9 @@ fn global_strings() -> Option<&'static str> {
 /// Every seat below is a state an in-world character is always in, kept minimal and ordinary: a VM
 /// answering nil or zero there would fail addons on a state the 1.12 client cannot be in.
 fn seat_a_session(script: &mut UiScript) {
+    // No engine behind it: a verb's call is kept, not refused (stock `RaidFrame_OnEvent` asks
+    // `RequestRaidInfo()` on `PLAYER_ENTERING_WORLD`, `RaidFrame.lua:28-29`).
+    script.keep_calls();
     // The 1.12 client boots FrameXML with this file first; so does our app.
     if let Some(src) = global_strings() {
         let _ = script.run(src);
@@ -1154,8 +1157,9 @@ fn seat_a_session(script: &mut UiScript) {
             // `UnitFactionGroup("player")`: every playable race has a side, and AceDB-2.0
             // concatenates it into its per-realm key at file scope.
             faction_group: Some("Alliance".into()),
-            // `0x5efe00`'s team digit for Human (race 1), the rank-title key's second `%d`.
-            pvp_team: crate::ui_unit::race_pvp_team(1),
+            // `0x5efe00`'s team digit for Human (race 1), the rank-title key's second `%d`: the
+            // stock row's template has group mask 3, Alliance.
+            pvp_team: 1,
             ..Default::default()
         }),
     );
@@ -1170,7 +1174,7 @@ fn seat_a_session(script: &mut UiScript) {
         player: 1,
         ..Default::default()
     });
-    script.set_player_auras(vec![benilla_ui::script::AuraState {
+    let fortitude = vec![benilla_ui::script::AuraState {
         spell_id: 1243,
         name: Some("Power Word: Fortitude".into()),
         icon: Some("Interface\\Icons\\Spell_Holy_WordFortitude".into()),
@@ -1178,7 +1182,10 @@ fn seat_a_session(script: &mut UiScript) {
         helpful: true,
         cancelable: true,
         ..Default::default()
-    }]);
+    }];
+    // Both of the player's lists: the buff cache and the slots `UnitBuff("player")` reads.
+    script.set_unit_auras(1, Some(fortitude.clone().into()));
+    script.set_player_auras(fortitude);
     script.set_action(
         1,
         Some(benilla_ui::script::ActionSlot {
@@ -1268,7 +1275,7 @@ fn seat_a_session(script: &mut UiScript) {
         script.set_container(
             0,
             Some(benilla_ui::script::ContainerState {
-                name: Some("Backpack".into()),
+                name: None,
                 num_slots: 16,
                 slots,
             }),
@@ -1310,7 +1317,7 @@ fn seat_a_session(script: &mut UiScript) {
     // The talent tree (`Talent.dbc` x `TalentTab.dbc`), read by position at file scope
     // (`KTM_Data.lua:376`). Zero ranks and the full pool, a fresh 60 (51 points, `level - 9`), so a
     // rank is a number rather than nil.
-    if let Some(state) = talent_snapshot(script) {
+    if let Some(state) = talent_snapshot() {
         script.set_talents(state);
     }
 }
@@ -1339,9 +1346,8 @@ fn auction_item_classes() -> Vec<benilla_ui::script::AuctionCategory> {
 }
 
 /// The seated character's talent pages, built by the live client's `build_pages`. The DBCs are read
-/// once per process; the pages are built per VM, since the requirement lines come from that VM's
-/// `GlobalStrings.lua`. `None` with no install.
-fn talent_snapshot(script: &UiScript) -> Option<benilla_ui::script::TalentUiState> {
+/// once per process; the pages are built per VM. `None` with no install.
+fn talent_snapshot() -> Option<benilla_ui::script::TalentUiState> {
     use std::sync::OnceLock;
     #[allow(clippy::type_complexity)]
     static DBCS: OnceLock<
@@ -1359,14 +1365,6 @@ fn talent_snapshot(script: &UiScript) -> Option<benilla_ui::script::TalentUiStat
             Some((talents, spells))
         })
         .as_ref()?;
-    let get = |key: &str| {
-        script
-            .lua()
-            .globals()
-            .get::<String>(key)
-            .ok()
-            .filter(|t| !t.is_empty())
-    };
     // Human (`ChrRaces.dbc` 1) warrior (`ChrClasses.dbc` 1), the character `seat_a_session` seats.
     Some(crate::ui_talent::build_pages(
         talents,
@@ -1375,7 +1373,6 @@ fn talent_snapshot(script: &UiScript) -> Option<benilla_ui::script::TalentUiStat
         1,
         1,
         (51, 0),
-        &get,
     ))
 }
 
@@ -1386,6 +1383,8 @@ fn equip_slot(item_id: u32, name: &str) -> benilla_ui::script::InvSlotView {
         icon: Some("Interface\\Icons\\INV_Misc_QuestionMark".into()),
         count: 1,
         quality: 2,
+        // A cached record of a wearable type.
+        inventory_type: Some(1),
         name: Some(name.to_string()),
         // Full durability: the setter fires `UPDATE_INVENTORY_ALERTS`, and a worn item would light
         // DurabilityFrame.
@@ -3779,10 +3778,10 @@ mod dependency_tests {
 
         // The backpack: 16 slots, two filled.
         assert_eq!(s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(), 16);
-        assert_eq!(
-            s.eval::<String>("return GetBagName(0)").unwrap(),
-            "Backpack"
-        );
+        // Named by the stock global, empty where no interface defines it (`0x703bf0`).
+        assert!(s
+            .eval::<bool>("return GetBagName(0) == (BACKPACK_TOOLTIP or '')")
+            .unwrap());
         assert_eq!(
             s.eval::<i64>("local _, c = GetContainerItemInfo(0, 5) return c")
                 .unwrap(),

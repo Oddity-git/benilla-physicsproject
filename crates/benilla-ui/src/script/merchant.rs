@@ -1,6 +1,7 @@
 //! The merchant bindings: the app pushes the open vendor ([`UiScript::set_merchant`]), and the
-//! Lua verbs queue intents it drains. A row is 1-based; the app maps it to the item entry
-//! `CMSG_BUY_ITEM` needs.
+//! Lua verbs act inside their calls through the host ([`MerchantCall`]); `CloseMerchant` alone
+//! leaves its close to the interaction latch, which runs the window's close core. A row is
+//! 1-based; the host maps it to the item entry `CMSG_BUY_ITEM` needs.
 //!
 //! `GetMerchantItemInfo(index)` answers `name, texture, price, quantity, numAvailable, isUsable`
 //! (`0x4fb150`), or `(nil, nil, 0, 1, 0, 1)` for an invalid index (`0x4fb2be`). Unlimited stock is
@@ -75,6 +76,9 @@ pub struct RepairCosts {
     pub equipped: std::collections::HashMap<u32, u32>,
     /// Container items by `(bag, slot)`: bags 0-4, the bank vault -1 and bank bags 5-10.
     pub bags: std::collections::HashMap<(i64, u32), u32>,
+    /// The item's own cost before the discount (`0x5da330`), by item guid, for every item of
+    /// [`Self::bags`]: what the merchant price takes off (`0x52e44a`).
+    pub own: std::collections::HashMap<u64, u32>,
 }
 
 /// One open merchant window, pushed whole by the app; `None` means no vendor is open.
@@ -90,14 +94,9 @@ pub struct MerchantState {
 }
 
 impl super::UiScript {
-    /// Push (or clear, with `None`) the open vendor. Clearing it leaves repair mode, as the
-    /// merchant-close handler restores the Point base mode (`0x4fadf0`).
+    /// Push (or clear, with `None`) the open vendor.
     pub fn set_merchant(&mut self, state: Option<MerchantState>) {
-        let closing = state.is_none();
         self.model_mut().merchant = state;
-        if closing {
-            self.model_mut().repair_mode = false;
-        }
     }
 
     /// Push `GetRepairAllCost`'s total in copper, swept by the app ahead of the events that read it.
@@ -110,34 +109,50 @@ impl super::UiScript {
         self.model_mut().repair_costs = costs;
     }
 
-    /// Drain the `(row, quantity)` buys `BuyMerchantItem` queued, the row 1-based.
+    /// The `(row, quantity)` buys a harness's VM kept ([`Self::keep_calls`]), the row 1-based.
     pub fn take_merchant_buys(&mut self) -> Vec<(u32, u32)> {
-        std::mem::take(&mut self.model_mut().merchant_buys)
+        self.take_calls_where(|call| match call {
+            super::ScriptCall::Merchant(MerchantCall::Buy { row, quantity }) => {
+                Some((*row, *quantity))
+            }
+            _ => None,
+        })
     }
 
-    /// Drain the `(bag, slot)` of each cursor item dropped on the vendor; the app sells it.
-    pub fn take_merchant_cursor_sells(&mut self) -> Vec<(i64, u32)> {
-        std::mem::take(&mut self.model_mut().merchant_cursor_sells)
+    /// The merchant calls a harness's VM kept ([`Self::keep_calls`]), in call order.
+    pub fn take_merchant_calls(&mut self) -> Vec<MerchantCall> {
+        self.take_calls_where(|call| match call {
+            super::ScriptCall::Merchant(call) => Some(*call),
+            _ => None,
+        })
     }
 
-    /// Drain the `(bag, slot, entry)` of held rows dropped into bags (`CMSG_BUY_ITEM_IN_SLOT`).
+    /// The `(bag, slot, entry)` of held rows a harness's VM kept dropped into slots
+    /// ([`Self::keep_calls`], `CMSG_BUY_ITEM_IN_SLOT`).
     pub fn take_merchant_slot_buys(&mut self) -> Vec<(i64, u32, u32)> {
-        std::mem::take(&mut self.model_mut().merchant_slot_buys)
+        self.take_calls_where(|call| match call {
+            super::ScriptCall::Merchant(MerchantCall::BuyInSlot { bag, slot, entry }) => {
+                Some((*bag, *slot, *entry))
+            }
+            _ => None,
+        })
     }
 
-    /// Whether `CloseMerchant` was called since the last drain; the close sends no packet.
-    pub fn take_merchant_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().merchant_close)
-    }
-
-    /// Drain the 1-based buyback slots `BuybackItem` queued.
+    /// The 1-based buyback slots a harness's VM kept ([`Self::keep_calls`]) for `BuybackItem`.
     pub fn take_merchant_buybacks(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.model_mut().merchant_buybacks)
+        self.take_calls_where(|call| match call {
+            super::ScriptCall::Merchant(MerchantCall::Buyback(index)) => Some(*index),
+            _ => None,
+        })
     }
 
-    /// Whether `RepairAllItems` was called since the last drain.
+    /// Whether a harness's VM kept ([`Self::keep_calls`]) a `RepairAllItems`.
     pub fn take_repair_all(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().repair_all)
+        !self
+            .take_calls_where(|call| {
+                matches!(call, super::ScriptCall::Merchant(MerchantCall::RepairAll)).then_some(())
+            })
+            .is_empty()
     }
 
     /// The repair-mode latch: while set, a bag or equipment click repairs the item.
@@ -146,10 +161,63 @@ impl super::UiScript {
     }
 
     /// Leave repair mode, as `HideRepairCursor` does, for the world's right mouse-down, which
-    /// resets the Repair base mode to Point (`0x492c68`).
+    /// resets the Repair base mode to Point (`0x492c68`), and the merchant close's tail
+    /// (`0x4fae4f`-`0x4fae68`).
     pub fn end_repair_mode(&mut self) {
         self.model_mut().repair_mode = false;
     }
+}
+
+/// A merchant verb past its binding's checks, which the host applies inside the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MerchantCall {
+    /// `BuyMerchantItem(index, quantity)` (`0x4fb850`), after its cursor clear: with the row in
+    /// range (`0x4fb904`-`0x4fb90e`), a vendor cell (`0x4fb91d`) and a row slot (`0x4fb92e`),
+    /// `CMSG_BUY_ITEM` for the row's item (`0x4fb93c`).
+    Buy {
+        /// 1-based.
+        row: u32,
+        /// 1 to 255 (`0x4fb8bf`-`0x4fb8ff`).
+        quantity: u32,
+    },
+    /// `PickupMerchantItem`'s sale (`0x4fb7a7` → `0x5e1d50`): `CMSG_SELL_ITEM` with the vendor
+    /// cell as it stands, never tested, the cursor item's guid (`0x494c60`) and its split count
+    /// (`[0xb4b40c]`, 0 for a whole stack).
+    Sell { item_guid: u64, count: u8 },
+    /// `BuybackItem(index)` (`0x4fb950`), 1-based into the buyback list.
+    Buyback(u32),
+    /// `RepairAllItems()` (`0x4fbfe0`) at a repairing vendor: the purse test, then
+    /// `CMSG_REPAIR_ITEM` with guid 0.
+    RepairAll,
+    /// A held vendor row dropped into a bag or doll slot (`0x4f9f35`, `0x4c78fd`):
+    /// `CMSG_BUY_ITEM_IN_SLOT` (`0x1a3`) for the row's item into Lua's `(bag, slot)`, count 1.
+    BuyInSlot { bag: i64, slot: u32, entry: u32 },
+    /// A held vendor row dropped on a bag slot or the backpack button (`0x4c7e66`-`0x4c7eaa`):
+    /// `CMSG_BUY_ITEM_IN_SLOT` into the item in that bag slot, `None` the player's own for the
+    /// backpack (`0x4c7c7d`), slot `0xFF` so the server picks, count 1.
+    BuyIntoBag { bag_guid: Option<u64>, entry: u32 },
+    /// `CloseMerchant()` (`0x4fb120`): the close core `0x4fadf0`.
+    Close,
+}
+
+/// Hand `call` to the host, which applies it before this returns ([`super::calls::submit`]).
+fn submit(lua: &Lua, call: MerchantCall) -> mlua::Result<()> {
+    super::calls::submit(lua, super::ScriptCall::Merchant(call))
+}
+
+/// Hand the host the buys the drop verb just made (`Model::merchant_drops`), before the verb
+/// returns, as the reference sends from the drop itself.
+pub(super) fn submit_slot_buys(lua: &Lua) -> mlua::Result<()> {
+    let buys = std::mem::take(
+        &mut lua
+            .app_data_mut::<Model>()
+            .expect("model app_data")
+            .merchant_drops,
+    );
+    for call in buys {
+        submit(lua, call)?;
+    }
+    Ok(())
 }
 
 /// 1 or nil, as the client pushes a usable flag (`pushnumber(1.0)` / `pushnil`).
@@ -308,15 +376,21 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, (index, quantity): (Value, Value)| {
             // `is-number` else `Usage: BuyMerchantItem(index)` (`0x84dcd8`, `0x4fb861`).
             let index = binding_abi::index_arg32(lua, index, "Usage: BuyMerchantItem(index)")?;
+            // `ClearCursor(1, 1)` before anything is read (`0x4fb89f`).
+            super::tick::verb(lua, crate::script::cursor::clear_cursor);
             // The quantity is 1 unless `is-number` passes and `_ftol` gives 1 or more, and at most
             // 255 (`0x4fb8bf`-`0x4fb8ff`); a non-number never raises.
             let quantity = lua
                 .coerce_number(quantity)?
                 .map(binding_abi::ftol)
                 .map_or(1, |q| q.clamp(1, 0xff)) as u32;
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.merchant_buys.push((index, quantity));
-            Ok(())
+            submit(
+                lua,
+                MerchantCall::Buy {
+                    row: index,
+                    quantity,
+                },
+            )
         })?,
     )?;
 
@@ -328,18 +402,25 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // Every refusal ([`merchant_grab`]) is silent and clears the cursor.
     g.set(
         "PickupMerchantItem",
-        lua.create_function(|lua, index: Option<f64>| {
+        lua.create_function(|lua, index: Value| {
+            // `lua_isnumber` (`0x4fb7c4`) gates the row; a miss is `merchant_grab`'s refusal.
+            let index = crate::script::binding_abi::is_number(lua, index);
             // The sell fork comes first, before the argument is read. Its clear is the sale's, not
             // `ClearCursor`: `CURSOR_UPDATE` fires and the source slot stays greyed until the
             // server's inventory update (`0x494b60`). Every other leg reads the row, then clears.
             let grab = super::tick::verb(lua, |model| {
-                if let Some(item) = crate::script::cursor::take_cursor_item_for_sale(model) {
-                    model.merchant_cursor_sells.push((item.bag, item.slot));
-                    return None;
+                match crate::script::cursor::take_cursor_item_for_sale(model) {
+                    Some(item) => Err(MerchantCall::Sell {
+                        item_guid: item.guid,
+                        count: item.count.unwrap_or(0) as u8,
+                    }),
+                    None => Ok(merchant_grab(model, index)),
                 }
-                Some(merchant_grab(model, index))
             });
-            let Some(grab) = grab else { return Ok(()) };
+            let grab = match grab {
+                Ok(grab) => grab,
+                Err(sale) => return submit(lua, sale),
+            };
 
             // Every other leg clears with the real `ClearCursor(1,1)` (`0x4fb82d`/`0x4fb83f` on a
             // refusal, `0x495112` in the grab), not a bare drop: a held spell fires `CURSOR_UPDATE`
@@ -352,13 +433,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // CloseMerchant() (`0x4fb120`): the close core `0x4fadf0` inside the call; no packet.
     g.set(
         "CloseMerchant",
-        lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.merchant_close = true;
-            Ok(())
-        })?,
+        lua.create_function(|lua, ()| submit(lua, MerchantCall::Close))?,
     )?;
 
     g.set(
@@ -421,9 +499,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, index: Value| {
             // `is-number` else `Usage: BuybackItem(slot)` (`0x84dcf8`, `0x4fb968`).
             let index = binding_abi::index_arg32(lua, index, "Usage: BuybackItem(slot)")?;
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.merchant_buybacks.push(index);
-            Ok(())
+            submit(lua, MerchantCall::Buyback(index))
         })?,
     )?;
 
@@ -459,11 +535,16 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "RepairAllItems",
         lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             // `0x4fbff0`: nothing, not even the purse test, unless the open merchant repairs
             // (`0x4fadb0`, `UNIT_NPC_FLAGS` bit 14).
-            if model.merchant.as_ref().is_some_and(|m| m.can_repair) {
-                model.repair_all = true;
+            let repairs = lua
+                .app_data_ref::<Model>()
+                .expect("model app_data")
+                .merchant
+                .as_ref()
+                .is_some_and(|m| m.can_repair);
+            if repairs {
+                submit(lua, MerchantCall::RepairAll)?;
             }
             Ok(())
         })?,
@@ -754,23 +835,22 @@ mod tests {
     }
 
     #[test]
-    fn buy_merchant_item_queues_intents() {
+    fn buy_merchant_item_calls_with_its_row_and_quantity() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_merchant(Some(stock()));
         s.run("BuyMerchantItem(1)").unwrap(); // default quantity 1
         s.run("BuyMerchantItem(2, 5)").unwrap();
         assert_eq!(s.take_merchant_buys(), vec![(1, 1), (2, 5)]);
-        assert!(s.take_merchant_buys().is_empty(), "drained");
     }
 
     #[test]
-    fn close_merchant_flags_the_intent() {
+    fn close_merchant_is_a_call() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_merchant(Some(stock()));
-        assert!(!s.take_merchant_close());
         s.run("CloseMerchant()").unwrap();
-        assert!(s.take_merchant_close());
-        assert!(!s.take_merchant_close(), "drained");
+        assert_eq!(s.take_merchant_calls(), [super::MerchantCall::Close]);
     }
 
     /// The question-mark fallback and the buyback miss: a vendor row whose wire display has no
@@ -824,8 +904,9 @@ mod tests {
     }
 
     #[test]
-    fn buyback_reads_and_intents() {
+    fn buyback_reads_and_calls() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         assert_eq!(s.eval::<i64>("return GetNumBuybackItems()").unwrap(), 0);
         assert!(s
             .eval::<bool>(
@@ -854,7 +935,6 @@ mod tests {
 
         s.run("BuybackItem(1)").unwrap();
         assert_eq!(s.take_merchant_buybacks(), vec![1]);
-        assert!(s.take_merchant_buybacks().is_empty(), "drained");
     }
 
     /// Away from a vendor that repairs, the total reads 0, as `0x4fbd60` pushes there.
@@ -897,8 +977,9 @@ mod tests {
     }
 
     #[test]
-    fn repair_reads_intents_and_mode_latch() {
+    fn repair_reads_calls_and_mode_latch() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         assert!(s.eval::<bool>("return CanMerchantRepair() == nil").unwrap());
 
         let mut state = stock();
@@ -918,7 +999,6 @@ mod tests {
 
         s.run("RepairAllItems()").unwrap();
         assert!(s.take_repair_all());
-        assert!(!s.take_repair_all(), "drained");
         assert!(
             s.take_sounds().is_empty(),
             "the stock button's OnClick plays ITEM_REPAIR"
@@ -931,13 +1011,6 @@ mod tests {
         assert_eq!(s.ui_cursor(), None, "repair clears a stale hover override");
         s.run("HideRepairCursor()").unwrap();
         assert!(!s.repair_mode());
-
-        s.run("ShowRepairCursor()").unwrap();
-        s.set_merchant(None);
-        assert!(
-            !s.repair_mode(),
-            "closing the merchant hides the repair cursor"
-        );
     }
 
     #[test]
@@ -1064,6 +1137,7 @@ mod tests {
     #[test]
     fn pickup_merchant_item_grabs_a_row_as_mode_5() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_merchant(Some(stock()));
 
         s.run("PickupMerchantItem(1)").unwrap();
@@ -1083,6 +1157,7 @@ mod tests {
     #[test]
     fn pickup_merchant_item_refuses_silently_and_clears() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_merchant(Some(stock()));
 
         for bad in [
@@ -1116,6 +1191,7 @@ mod tests {
     fn pickup_merchant_item_sells_what_the_cursor_holds() {
         use crate::script::cursor::{CursorItem, CursorPayload};
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_merchant(Some(stock()));
         s.model_mut().cursor = Some(CursorPayload::Item(CursorItem {
             item_class: None,
@@ -1134,17 +1210,20 @@ mod tests {
 
         s.run("PickupMerchantItem(0)").unwrap();
         assert_eq!(
-            s.take_merchant_cursor_sells(),
-            vec![(0, 7)],
+            s.take_merchant_calls(),
+            [super::MerchantCall::Sell {
+                item_guid: 0x101,
+                count: 0
+            }],
             "index 0 is ignored — the cursor decides"
         );
         assert!(s.eval::<bool>("return not CursorHasItem()").unwrap());
-        assert!(s.take_merchant_cursor_sells().is_empty(), "drained");
     }
 
     #[test]
     fn a_held_vendor_row_dropped_in_a_bag_is_a_buy() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_merchant(Some(stock()));
         s.run("PickupMerchantItem(1)").unwrap();
         s.run("PickupContainerItem(0, 3)").unwrap();
@@ -1165,6 +1244,7 @@ mod tests {
     #[test]
     fn a_stale_vendor_row_drops_without_buying() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_merchant(Some(stock()));
         s.run("PickupMerchantItem(2)").unwrap();
         // The list is replaced while the cursor holds row 2 of the old one.
@@ -1182,6 +1262,7 @@ mod tests {
     #[test]
     fn the_action_bar_refuses_a_vendor_row_and_keeps_it_held() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_merchant(Some(stock()));
         s.run("PickupMerchantItem(1)").unwrap();
         s.run("PlaceAction(1)").unwrap();

@@ -11,18 +11,14 @@
 //! `GMSURVEY_DISPLAY` is not fired: vmangos never sends its trigger, `SMSG_GM_TICKET_STATUS_UPDATE`
 //! status 3, and the survey window (`Blizzard_GMSurveyUI`) is not built.
 
-use benilla_ui::script::{GmTicketIntent, GmTicketWrite, ScriptValue, UiScript, UnservedSend};
+use benilla_ui::script::{GmTicketIntent, GmTicketWrite, ScriptValue, UnservedSend};
 use bevy::prelude::*;
 
 use benilla_assets::coords::bevy_to_wow;
 
 use crate::net::{ClientCommand, NetCommands};
 use crate::player::Player;
-use crate::ui_script::{UiFeed, UiInput, VmMemo};
-
-/// Spell 7355 "Stuck", what `Stuck()` casts: the only spell with `SPELL_EFFECT_STUCK` (84), which
-/// moves the player to their last safe position (vmangos `SpellEffects.cpp:4697`).
-const SPELL_STUCK: u32 = 7355;
+use crate::ui_script::{UiFeed, VmMemo};
 
 /// What the last `SMSG_GMTICKET_GETTICKET` said, and how many have arrived: the feed fires on the
 /// count, so the window's poll is answered even when nothing changed.
@@ -32,7 +28,7 @@ pub(crate) struct GmTicketState {
     ticket: Option<Box<benilla_protocol::messages::GmTicket>>,
     /// One per `SMSG_GMTICKET_GETTICKET`, wrapping.
     answers: u32,
-    /// Re-asks the engine owes ([`Self::note_write_landed`]), sent by [`drain_gm_ticket`].
+    /// Re-asks the engine owes ([`Self::note_write_landed`]), sent by [`send_gm_reasks`].
     engine_reasks: u32,
     /// The last queue status, with its own answer count. Signed as in the reference, which copies
     /// the wire dword verbatim (`0x418e95`), pushes it unmodified (`0x5e467b`) and loads it signed
@@ -87,45 +83,47 @@ struct FedTicket {
 
 /// Fire `UPDATE_TICKET` and `UPDATE_GM_STATUS` for unheard answers; push the categories once.
 fn feed_gm_ticket(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     state: Res<GmTicketState>,
     categories: Option<Res<GmTicketCategories>>,
     survey: Option<Res<GmSurveyResource>>,
     mut feed: ResMut<GmTicketFeedState>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let fed = feed.vm.get(&script);
+    hosted_vm.run(|script| {
+        let Some(script) = script else {
+            return;
+        };
+        let fed = feed.vm.get(script);
 
-    if !fed.categories_pushed {
-        if let Some(categories) = categories.as_deref() {
-            script.set_gm_ticket_categories(categories.0.clone());
-            fed.categories_pushed = true;
+        if !fed.categories_pushed {
+            if let Some(categories) = categories.as_deref() {
+                script.set_gm_ticket_categories(categories.0.clone());
+                fed.categories_pushed = true;
+            }
         }
-    }
 
-    if !fed.survey_pushed {
-        if let Some(survey) = survey.as_deref() {
-            script.set_gm_survey_tables(survey.0.clone());
-            fed.survey_pushed = true;
+        if !fed.survey_pushed {
+            if let Some(survey) = survey.as_deref() {
+                script.set_gm_survey_tables(survey.0.clone());
+                fed.survey_pushed = true;
+            }
         }
-    }
 
-    if fed.queue_answers != state.queue_answers {
-        fed.queue_answers = state.queue_answers;
-        // `arg1` is the status as a number: `HelpFrame` tests `== 1` for up and `== -1` to show
-        // `HELP_TICKET_QUEUE_DISABLED`; vmangos sends only 0 or 1, passed through unmapped.
-        script.fire_event(
-            "UPDATE_GM_STATUS",
-            vec![ScriptValue::Int(i64::from(state.queue_status))],
-        );
-    }
+        if fed.queue_answers != state.queue_answers {
+            fed.queue_answers = state.queue_answers;
+            // `arg1` is the status as a number: `HelpFrame` tests `== 1` for up and `== -1` to show
+            // `HELP_TICKET_QUEUE_DISABLED`; vmangos sends only 0 or 1, passed through unmapped.
+            script.fire_event(
+                "UPDATE_GM_STATUS",
+                vec![ScriptValue::Int(i64::from(state.queue_status))],
+            );
+        }
 
-    if fed.answers != state.answers {
-        fed.answers = state.answers;
-        script.fire_event("UPDATE_TICKET", update_ticket_args(state.ticket.as_deref()));
-    }
+        if fed.answers != state.answers {
+            fed.answers = state.answers;
+            script.fire_event("UPDATE_TICKET", update_ticket_args(state.ticket.as_deref()));
+        }
+    })
 }
 
 /// `UPDATE_TICKET`'s arguments: category, text, the three day figures, assigned, opened. The wire
@@ -149,34 +147,68 @@ fn update_ticket_args(ticket: Option<&benilla_protocol::messages::GmTicket>) -> 
     ]
 }
 
-/// Turn the window's clicks into packets.
-fn drain_gm_ticket(
-    script: Option<NonSendMut<UiScript>>,
-    mut reask: ResMut<GmTicketState>,
-    commands: Res<NetCommands>,
-    player: Option<Res<Player>>,
-    map: Option<Res<benilla_world::world_map::CurrentMap>>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-
-    // The engine's re-asks first: they answer a push that arrived before this frame's input.
+/// The engine's re-asks ([`GmTicketState::note_write_landed`]): they answer a push that arrived
+/// before this frame's input.
+fn send_gm_reasks(mut reask: ResMut<GmTicketState>, commands: Res<NetCommands>) {
     for _ in 0..reask.take_reasks() {
         let _ = commands.0.send(ClientCommand::GmTicketGet);
     }
+}
 
-    for _ in 0..script.take_stuck_casts() {
-        let _ = commands.0.send(ClientCommand::CastSpell {
-            spell_id: SPELL_STUCK,
-            target: None,
+/// The Help window's ticket verbs and the unserved systems' sends inside their calls
+/// ([`benilla_ui::script::GmTicketCall`], [`benilla_ui::script::ScriptCall::Unserved`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct GmTicketSteps<'w> {
+    commands: Res<'w, NetCommands>,
+    player: Option<Res<'w, Player>>,
+    map: Option<Res<'w, benilla_world::world_map::CurrentMap>>,
+    /// The book, which holds `Stuck()`'s spell.
+    actions: Option<Res<'w, crate::ui_action::PlayerActions>>,
+}
+
+impl GmTicketSteps<'_> {
+    /// `[0xb70098]`, the spell `Stuck()` casts ([`crate::ui_action::PlayerActions::stuck_spell`]):
+    /// 7355 "Stuck" in the shipped `Spell.dbc`, which moves the player to their last safe
+    /// position (vmangos `SpellEffects.cpp:4697`). `None` is 0, no such spell learned.
+    pub(crate) fn stuck_spell(&self) -> Option<u32> {
+        self.actions.as_deref()?.stuck_spell
+    }
+
+    /// A ticket verb's packet, sent in its call, so call order is wire order:
+    /// `DeleteGMTicket(); GetGMTicket()` never becomes get-then-delete.
+    pub(crate) fn ticket(&self, intent: GmTicketIntent) {
+        let _ = self.commands.0.send(match intent {
+            GmTicketIntent::Ask => ClientCommand::GmTicketGet,
+            GmTicketIntent::AskStatus => ClientCommand::GmTicketSystemStatus,
+            GmTicketIntent::Delete => ClientCommand::GmTicketDelete,
+            GmTicketIntent::Write(write) => {
+                // Where the player stands at send time, in WoW coordinates: where `.ticket go`
+                // takes the GM.
+                let pos = self
+                    .player
+                    .as_deref()
+                    .map(|p| bevy_to_wow(p.pos))
+                    .unwrap_or([0.0; 3]);
+                let map = self.map.as_deref().map(|m| m.0).unwrap_or(0);
+                let category = write.category;
+                match client_command_for(write, map, pos) {
+                    Some(cmd) => cmd,
+                    None => {
+                        warn!(
+                            "gm ticket: refusing to file under category {category} — not a \
+                             GMTicketCategory.dbc id (1..={GM_TICKET_CATEGORY_MAX})"
+                        );
+                        return;
+                    }
+                }
+            }
         });
     }
 
-    // The lottery and survey verbs' sends (the lottery has no module of its own, its window being
-    // unbuilt), in call order.
-    for send in script.take_unserved_sends() {
-        let _ = commands.0.send(match send {
+    /// A lottery or survey verb's send (the lottery has no module of its own, its window being
+    /// unbuilt), or `BuySkillTier`'s.
+    pub(crate) fn unserved(&self, send: UnservedSend) {
+        let _ = self.commands.0.send(match send {
             UnservedSend::SkillBuyStep { skill_id } => ClientCommand::SkillBuyStep { skill_id },
             UnservedSend::LotteryQuery => ClientCommand::LotteryQuery,
             UnservedSend::BuyLotteryTicket { first, second } => {
@@ -196,35 +228,15 @@ fn drain_gm_ticket(
             },
         });
     }
+}
 
-    let intents = script.take_gm_ticket_intents();
-    if intents.is_empty() {
-        return;
-    }
-    // Where the player stands at send time, in WoW coordinates: where `.ticket go` takes the GM.
-    let pos = player.map(|p| bevy_to_wow(p.pos)).unwrap_or([0.0; 3]);
-    let map = map.map(|m| m.0).unwrap_or(0);
-    // In call order: `DeleteGMTicket(); GetGMTicket()` must not become get-then-delete.
-    for intent in intents {
-        let _ = commands.0.send(match intent {
-            GmTicketIntent::Ask => ClientCommand::GmTicketGet,
-            GmTicketIntent::AskStatus => ClientCommand::GmTicketSystemStatus,
-            GmTicketIntent::Delete => ClientCommand::GmTicketDelete,
-            GmTicketIntent::Write(write) => {
-                let category = write.category;
-                match client_command_for(write, map, pos) {
-                    Some(cmd) => cmd,
-                    None => {
-                        warn!(
-                            "gm ticket: refusing to file under category {category} — not a \
-                             GMTicketCategory.dbc id (1..={GM_TICKET_CATEGORY_MAX})"
-                        );
-                        continue;
-                    }
-                }
-            }
-        });
-    }
+/// `Stuck()` past its gate (`0x489370`): `CastSpellAsActivePlayer` (`0x6e5a90`) on `spell`, its
+/// [`GmTicketSteps::stuck_spell`], with no item and no target (`0x489376`, `0x489378`), into the
+/// cast attempt.
+pub(crate) fn cast_stuck(cast: &mut crate::spell::ScriptCast, spell: u32) {
+    let ctx = cast.targeting.context();
+    cast.ladder
+        .send(spell, &ctx, crate::spell::CastCommit::Spell);
 }
 
 /// The category a `NewGMTicket`/`UpdateGMTicket` call may put on the wire, 0 to 10. vmangos files
@@ -426,7 +438,7 @@ impl Plugin for UiGmTicketPlugin {
                 Update,
                 (
                     feed_gm_ticket.in_set(UiFeed),
-                    drain_gm_ticket.after(UiInput),
+                    send_gm_reasks.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }
@@ -435,19 +447,20 @@ impl Plugin for UiGmTicketPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::UiScript;
     /// Each lottery and survey verb reaches the wire exactly once, with the command the bytes
     /// call for, and a refused call reaches it not at all.
     #[test]
     fn the_lottery_and_survey_verbs_send_once_each() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut app = App::new();
-        app.insert_resource(NetCommands(tx))
-            .init_resource::<GmTicketState>()
-            .add_systems(Update, drain_gm_ticket);
+        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        app.insert_resource(NetCommands(tx));
         app.insert_non_send_resource(UiScript::new().unwrap());
+        // Each chunk with the host lent, which sends inside the verb.
         let run = |app: &mut App, lua: &str| {
-            app.world().non_send_resource::<UiScript>().run(lua).ok();
-            app.update();
+            crate::script_calls::with_hosted_vm(app.world_mut(), |s| {
+                let _ = s.expect("a VM").run(lua);
+            });
             rx.try_iter().collect::<Vec<_>>()
         };
         let one = |sent: Vec<ClientCommand>| {

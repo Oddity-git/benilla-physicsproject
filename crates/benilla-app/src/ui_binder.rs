@@ -18,12 +18,12 @@
 //! `ConfirmBinder()` in range re-sends the activate; this drops the guid on `SMSG_PLAYERBOUND`,
 //! because an answered question is not a question and the reference's dialog is gone by then.
 
-use benilla_ui::script::{ScriptValue, UiScript};
+use benilla_ui::script::ScriptValue;
 use bevy::prelude::*;
 
 use crate::area::AreaTableRes;
 use crate::net::{ClientCommand, NetCommands};
-use crate::ui_script::{UiFeed, UiInput};
+use crate::ui_script::UiFeed;
 use crate::ui_session::{close_npc_session_out_of_range, NpcSession};
 
 /// The innkeeper's pending bind question; everything the dialog reads rides the event's argument.
@@ -70,29 +70,32 @@ impl NpcSession for BinderState {
 /// Publishes `CheckBinderDist()` every frame and fires `CONFIRM_BINDER` for each packet that
 /// asked, unconditionally, as the reference's handler always reaches its `SignalEvent2`.
 fn feed_binder(
-    script: Option<NonSendMut<UiScript>>,
-    mut binder: ResMut<BinderState>,
+    // The question, which the Accept reads inside its call: an engine turn, its events signalled
+    // after.
+    mut vm: crate::script_calls::VmWith<ResMut<'static, BinderState>>,
     world: benilla_world::world_point::WorldPoint,
     areas: Option<Res<AreaTableRes>>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    script.set_binder_pending(binder.pending().is_some());
+    vm.turn(|script, mut binder| {
+        let Some(script) = script else {
+            return;
+        };
+        script.set_binder_pending(binder.pending().is_some());
 
-    if !binder.ask {
-        return;
-    }
-    binder.ask = false;
-    let name = area_name(&world, areas.as_deref(), &|key: &str| {
-        script
-            .lua()
-            .globals()
-            .get::<String>(key)
-            .ok()
-            .filter(|t| !t.is_empty())
-    });
-    script.fire_event("CONFIRM_BINDER", vec![ScriptValue::Str(name)]);
+        if !binder.ask {
+            return;
+        }
+        binder.ask = false;
+        let name = area_name(&world, areas.as_deref(), &|key: &str| {
+            script
+                .lua()
+                .globals()
+                .get::<String>(key)
+                .ok()
+                .filter(|t| !t.is_empty())
+        });
+        script.fire_event("CONFIRM_BINDER", vec![ScriptValue::Str(name)]);
+    })
 }
 
 /// The dialog's `%s`, an area and never the NPC's name (`0x5dfe5e`): the player's sub-area, else
@@ -129,27 +132,23 @@ fn area_name_of(
         .unwrap_or_default()
 }
 
-/// Turns the dialog's Accept into `CMSG_BINDER_ACTIVATE`, only while a question is pending: with
-/// no guid latched, the reference's `ConfirmBinder()` finds no unit and sends nothing (`0x5dfdfe`).
-fn drain_binder(
-    script: Option<NonSendMut<UiScript>>,
-    binder: Res<BinderState>,
-    commands: Res<NetCommands>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let confirms = script.take_binder_confirms();
-    if confirms == 0 {
-        return;
-    }
-    let Some(npc) = binder.pending() else {
-        return;
-    };
-    for _ in 0..confirms {
-        let _ = commands
-            .0
-            .send(ClientCommand::BinderActivate { binder: npc });
+/// `ConfirmBinder()` inside its call ([`benilla_ui::script::BinderCall`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct BinderSteps<'w> {
+    binder: Option<Res<'w, BinderState>>,
+    net: Res<'w, NetCommands>,
+}
+
+impl BinderSteps<'_> {
+    /// `0x5dfdc0(0)`: `CMSG_BINDER_ACTIVATE` while a question is pending; with no guid latched
+    /// the reference finds no unit and sends nothing (`0x5dfdfe`).
+    pub(crate) fn confirm(&self) {
+        if let Some(npc) = self.binder.as_deref().and_then(BinderState::pending) {
+            let _ = self
+                .net
+                .0
+                .send(ClientCommand::BinderActivate { binder: npc });
+        }
     }
 }
 
@@ -183,19 +182,13 @@ pub(crate) mod net {
     fn on_bound(
         In(ev): In<SessionEvent>,
         mut binder: ResMut<BinderState>,
-        mut errors: ResMut<crate::ui_action::UiErrorKeys>,
+        errors: Res<crate::ui_action::UiErrorKeys>,
         areas: Option<Res<AreaTableRes>>,
         mut sounds: MessageWriter<ServerSoundMessage>,
     ) {
         if let SessionEvent::PlayerBound { binder: npc, area } = ev {
             debug!("net: bound to area {area} by {npc:#x}");
-            bound(
-                area,
-                &mut binder,
-                &mut errors,
-                areas.as_deref(),
-                &mut sounds,
-            );
+            bound(area, &mut binder, &errors, areas.as_deref(), &mut sounds);
         }
     }
 
@@ -206,7 +199,7 @@ pub(crate) mod net {
     pub(crate) fn bound(
         area: u32,
         binder: &mut BinderState,
-        errors: &mut crate::ui_action::UiErrorKeys,
+        errors: &crate::ui_action::UiErrorKeys,
         areas: Option<&AreaTableRes>,
         sounds: &mut MessageWriter<ServerSoundMessage>,
     ) {
@@ -220,7 +213,7 @@ pub(crate) mod net {
             debug!("ui_binder: bound to area {area}, which AreaTable does not name — no line");
             return;
         };
-        errors.0.push(crate::ui_action::UiError::s(
+        errors.push(crate::ui_action::UiError::s(
             "ERR_DEATHBIND_SUCCESS_S",
             name,
         ));
@@ -237,9 +230,11 @@ impl Plugin for UiBinderPlugin {
             Update,
             (
                 // Range-close before the feed, so walking away hides the dialog the same frame.
-                close_npc_session_out_of_range::<BinderState>.before(feed_binder),
+                // Before the pass: `ConfirmBinder`'s call reads the question.
+                close_npc_session_out_of_range::<BinderState>
+                    .before(feed_binder)
+                    .before(crate::vm_pass::VmPass::Start),
                 feed_binder.in_set(UiFeed),
-                drain_binder.after(UiInput),
             ),
         );
     }
@@ -248,6 +243,7 @@ impl Plugin for UiBinderPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::UiScript;
 
     #[test]
     fn asking_twice_owes_two_dialogs() {

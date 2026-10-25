@@ -23,6 +23,7 @@ fn one_tab_state() -> TalentUiState {
         talents: vec![
             vec![
                 TalentView {
+                    talent_id: 100,
                     name: "Improved Fireball".into(),
                     texture: Some("Interface\\Icons\\Spell_Fire_FlameBolt".into()),
                     tier: 1,
@@ -34,10 +35,11 @@ fn one_tab_state() -> TalentUiState {
                     prereqs: Vec::new(),
                     display_spell: 11070,
                     next_spell: 11071,
-                    req_lines: Vec::new(),
+                    reqs: Vec::new(),
                     learnable: true,
                 },
                 TalentView {
+                    talent_id: 101,
                     name: "Ignite".into(),
                     texture: None,
                     tier: 2,
@@ -53,7 +55,10 @@ fn one_tab_state() -> TalentUiState {
                     }],
                     display_spell: 11119,
                     next_spell: 0,
-                    req_lines: vec!["Requires 5 points in Improved Fireball".into()],
+                    reqs: vec![TalentReq::Prereq {
+                        rank: 5,
+                        name: "Improved Fireball".into(),
+                    }],
                     learnable: false,
                 },
             ],
@@ -132,13 +137,27 @@ fn talent_flags_are_one_or_nil() {
     assert!(s.take_errors().is_empty());
 }
 
+/// `LearnTalent` hands the talent id and its rank count to the host (`0x4f37c7`, `0x4f37d1`) for a
+/// talent below its maximum (`0x4f378f`), and `ConfirmTalentWipe` its answer.
 #[test]
-fn learn_talent_queues_for_the_app_drain() {
+fn learn_talent_hands_the_talent_and_its_rank() {
     let mut s = script();
-    s.set_talents(one_tab_state());
-    s.run("LearnTalent(1, 1); LearnTalent(1, 2)").unwrap();
-    assert_eq!(s.take_talent_learns(), vec![(1, 1), (1, 2)]);
-    assert!(s.take_talent_learns().is_empty(), "drain empties the queue");
+    s.keep_calls();
+    let mut state = one_tab_state();
+    state.talents[0][1].rank = 5;
+    s.set_talents(state);
+    s.run("LearnTalent(1, 1); LearnTalent(1, 2); LearnTalent(2, 1); ConfirmTalentWipe()")
+        .unwrap();
+    assert_eq!(
+        s.take_talent_calls(),
+        [
+            crate::script::TalentCall::Learn {
+                talent_id: 100,
+                rank: 3
+            },
+            crate::script::TalentCall::ConfirmWipe,
+        ]
+    );
     assert!(s.take_errors().is_empty());
 }
 
@@ -150,6 +169,8 @@ fn seed_talent_strings(s: &mut UiScript) {
         TOOLTIP_TALENT_RANK      = "[RANK %d/%d]"
         TOOLTIP_TALENT_NEXT_RANK = "[NEXT_RANK]"
         TOOLTIP_TALENT_LEARN     = "[LEARN]"
+        TOOLTIP_TALENT_PREREQ_P1 = "Requires %d points in %s"
+        TOOLTIP_TALENT_TIER_POINTS = "Requires %d points in %s Talents"
     "#,
     )
     .unwrap();
@@ -164,8 +185,8 @@ fn passive_body(description: &str) -> SpellTooltipView {
         range: Some("30 yd range".into()),
         cast_time: Some("Instant".into()),
         cooldown: Some("6 sec cooldown".into()),
-        requires_item: Some("Requires One-Handed Axes".into()),
-        requires_form: Some("Requires Battle Stance".into()),
+        requires_item: Some("One-Handed Axes".into()),
+        requires_form: Some("Battle Stance".into()),
         reagents: Some("Reagents: Light Feather".into()),
         chance: Some("2.62% chance to dodge".into()),
         description: description.into(),
@@ -238,7 +259,10 @@ fn set_talent_on_an_exceptional_talent_keeps_the_spell_body() {
     let holy_shield = &mut state.talents[0][1];
     holy_shield.name = "Holy Shield".into();
     holy_shield.exceptional = true;
-    holy_shield.req_lines = vec!["Requires 30 points in Protection Talents".into()];
+    holy_shield.reqs = vec![TalentReq::Tier {
+        points: 30,
+        tab: "Protection".into(),
+    }];
     s.set_talents(state);
     s.set_spell_tooltip(
         11119,
@@ -246,13 +270,14 @@ fn set_talent_on_an_exceptional_talent_keeps_the_spell_body() {
             name: "Holy Shield".into(),
             cost: Some("150 Mana".into()),
             cast_time: Some("Instant cast".into()),
-            requires_item: Some("Requires Shields".into()),
+            requires_item: Some("Shields".into()),
             description: "Increases chance to block by 30% for 10 sec.".into(),
             ..Default::default()
         },
     );
     s.run(
         r#"
+        SPELL_EQUIPPED_ITEM = "Requires %s"
         local a = CreateFrame("Button", "TB3"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
         local tt = CreateFrame("GameTooltip", "TT3", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")

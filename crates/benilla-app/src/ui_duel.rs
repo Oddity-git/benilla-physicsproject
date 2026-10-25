@@ -8,15 +8,15 @@
 //! delays the popup rather than dropping it; the reference reads it off the streamed player and
 //! fires nothing without one (`0x4d4a72`).
 
-use benilla_ui::script::{DuelRequest, ScriptValue, UiScript};
+use benilla_ui::script::{DuelRequest, ScriptValue};
 use bevy::prelude::*;
 
 use crate::names::NameCache;
-use crate::net::{ClientCommand, Guid, GuidIndex, NetCommands, SelfPlayer};
+use crate::net::{ClientCommand, GuidIndex, NetCommands};
 use crate::query_cache::Ask;
-use crate::target::Selection;
+use crate::spell::CastCommit;
 use crate::ui_action::Spells;
-use crate::ui_script::{SweepApp, SweepLeg, UiFeed, UiInput};
+use crate::ui_script::{SweepApp, SweepLeg, UiFeed};
 
 /// The `Effect[0]` that marks the duel spell (7266 on 1.12 data): the reference's spell-learned
 /// walk stores any learned spell with `SpellRec+0xf4 == 0x53` in `[0xb71130]` (`0x4b2605`), which
@@ -145,7 +145,7 @@ pub(crate) mod net {
     fn on_requested(
         In(ev): In<SessionEvent>,
         mut duel: ResMut<DuelState>,
-        mut errors: ResMut<crate::ui_action::UiErrorKeys>,
+        errors: Res<crate::ui_action::UiErrorKeys>,
         commands: Res<NetCommands>,
         self_guid: Res<crate::net::SelfGuid>,
         social: Res<crate::ui_social::SocialState>,
@@ -157,7 +157,7 @@ pub(crate) mod net {
         {
             requested(
                 &mut duel,
-                &mut errors,
+                &errors,
                 &commands,
                 arbiter,
                 challenger,
@@ -178,10 +178,10 @@ pub(crate) mod net {
     fn on_complete(
         In(ev): In<SessionEvent>,
         mut duel: ResMut<DuelState>,
-        mut errors: ResMut<crate::ui_action::UiErrorKeys>,
+        errors: Res<crate::ui_action::UiErrorKeys>,
     ) {
         if let SessionEvent::DuelComplete { started } = ev {
-            complete(&mut duel, &mut errors, started);
+            complete(&mut duel, &errors, started);
         }
     }
 
@@ -212,7 +212,7 @@ pub(crate) mod net {
     /// `CMSG_DUEL_CANCELLED` and shows nothing (`0x4d4a33`).
     pub(crate) fn requested(
         duel: &mut DuelState,
-        errors: &mut crate::ui_action::UiErrorKeys,
+        errors: &crate::ui_action::UiErrorKeys,
         commands: &NetCommands,
         arbiter: u64,
         challenger: u64,
@@ -224,22 +224,18 @@ pub(crate) mod net {
             return;
         }
         if duel.apply_requested(arbiter, challenger, own) {
-            errors
-                .0
-                .push(crate::ui_action::UiError::key("ERR_DUEL_REQUESTED"));
+            errors.push(crate::ui_action::UiError::key("ERR_DUEL_REQUESTED"));
             let _ = commands.0.send(ClientCommand::DuelAccepted { arbiter });
         }
     }
 
     pub(crate) fn complete(
         duel: &mut DuelState,
-        errors: &mut crate::ui_action::UiErrorKeys,
+        errors: &crate::ui_action::UiErrorKeys,
         started: bool,
     ) {
         if duel.apply_complete(started) {
-            errors
-                .0
-                .push(crate::ui_action::UiError::key("ERR_DUEL_CANCELLED"));
+            errors.push(crate::ui_action::UiError::key("ERR_DUEL_CANCELLED"));
         }
     }
 
@@ -272,8 +268,9 @@ fn clear_duel_on_leave_world(mut duel: ResMut<DuelState>) {
 
 /// Fire the four duel events on [`DuelState`]'s edges.
 fn feed_duel(
-    script: Option<NonSendMut<UiScript>>,
-    mut duel: ResMut<DuelState>,
+    // The session, which the answers read inside their calls: an engine turn, its events
+    // signalled after.
+    mut vm: crate::script_calls::VmWith<ResMut<'static, DuelState>>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
     mut sink: crate::ui_action::MessageSink,
@@ -281,55 +278,57 @@ fn feed_duel(
     // Apart from the bounds: the leave-world sweep drops the arbiter with no `DUEL_FINISHED`.
     mut fed_held: crate::ui_script::WindowMemo<bool>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let fed = fed.get(&script);
-    let fed_held = fed_held.get(&script);
-
-    // Lines before events: a line describes the transition its event announces.
-    let owed = std::mem::take(&mut duel.owed);
-    let lines: Vec<crate::ui_action::Shown> = {
-        let get = |key: &str| script.lua().globals().get::<String>(key).ok();
-        owed.iter()
-            .filter_map(|line| {
-                owed_text(line, &get).map(|text| {
-                    crate::ui_action::Shown::unkeyed(benilla_ui::messages::MsgKind::Chat, text)
-                })
-            })
-            .collect()
-    };
-    crate::ui_action::show_messages(&mut script, &mut sink, "ui_duel", lines);
-
-    // `DUEL_REQUESTED(name)`, held until the name resolves (the module's deviation).
-    if let Some(guid) = duel.challenger {
-        let ask = Ask::at(
-            !std::mem::replace(&mut duel.challenger_asked, true),
-            &commands,
-        );
-        if let Some(name) = names.resolve_player(guid, ask).map(str::to_string) {
-            script.fire_event("DUEL_REQUESTED", vec![ScriptValue::Str(name)]);
-            duel.challenger = None;
-        }
-    }
-
-    // `DUEL_FINISHED` when the arbiter clears (`0x4d4b51`).
-    let held = duel.arbiter != 0;
-    if *fed_held && !held {
-        script.fire_event("DUEL_FINISHED", Vec::new());
-    }
-    *fed_held = held;
-
-    // The bounds pair (`0x4d4aa0`, `0x4d4ac0`).
-    if fed.out_of_bounds != duel.out_of_bounds {
-        fed.out_of_bounds = duel.out_of_bounds;
-        let event = if duel.out_of_bounds {
-            "DUEL_OUTOFBOUNDS"
-        } else {
-            "DUEL_INBOUNDS"
+    vm.turn(|script, mut duel| {
+        let Some(script) = script else {
+            return;
         };
-        script.fire_event(event, Vec::new());
-    }
+        let fed = fed.get(script);
+        let fed_held = fed_held.get(script);
+
+        // Lines before events: a line describes the transition its event announces.
+        let owed = std::mem::take(&mut duel.owed);
+        let lines: Vec<crate::ui_action::Shown> = {
+            let get = |key: &str| script.lua().globals().get::<String>(key).ok();
+            owed.iter()
+                .filter_map(|line| {
+                    owed_text(line, &get).map(|text| {
+                        crate::ui_action::Shown::unkeyed(benilla_ui::messages::MsgKind::Chat, text)
+                    })
+                })
+                .collect()
+        };
+        crate::ui_action::show_messages(script, &mut sink, "ui_duel", lines);
+
+        // `DUEL_REQUESTED(name)`, held until the name resolves (the module's deviation).
+        if let Some(guid) = duel.challenger {
+            let ask = Ask::at(
+                !std::mem::replace(&mut duel.challenger_asked, true),
+                &commands,
+            );
+            if let Some(name) = names.resolve_player(guid, ask).map(str::to_string) {
+                script.fire_event("DUEL_REQUESTED", vec![ScriptValue::Str(name)]);
+                duel.challenger = None;
+            }
+        }
+
+        // `DUEL_FINISHED` when the arbiter clears (`0x4d4b51`).
+        let held = duel.arbiter != 0;
+        if *fed_held && !held {
+            script.fire_event("DUEL_FINISHED", Vec::new());
+        }
+        *fed_held = held;
+
+        // The bounds pair (`0x4d4aa0`, `0x4d4ac0`).
+        if fed.out_of_bounds != duel.out_of_bounds {
+            fed.out_of_bounds = duel.out_of_bounds;
+            let event = if duel.out_of_bounds {
+                "DUEL_OUTOFBOUNDS"
+            } else {
+                "DUEL_INBOUNDS"
+            };
+            script.fire_event(event, Vec::new());
+        }
+    })
 }
 
 /// What [`feed_duel`] last announced.
@@ -364,61 +363,42 @@ fn tick_countdown(time: Res<Time>, mut duel: ResMut<DuelState>, mut started: Loc
     }
 }
 
-/// Drain the duel verbs' intents into their sends.
-fn drain_duel(
-    script: Option<NonSendMut<UiScript>>,
-    duel: Res<DuelState>,
-    spells: Option<Res<Spells>>,
-    actions: Res<crate::ui_action::PlayerActions>,
-    selection: Res<Selection>,
-    index: Res<GuidIndex>,
-    self_q: Query<&Guid, With<SelfPlayer>>,
-    names: Res<NameCache>,
-    commands: Res<NetCommands>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let requests = script.take_duel_requests();
-    if requests.is_empty() {
-        return;
+/// The duel verbs inside their calls ([`DuelRequest`]): the popup's answers, and the duel spell a
+/// challenge casts, whose cast the host's ladder sends.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct DuelSteps<'w> {
+    /// Absent in a world with no duel session, which answers with guid 0.
+    duel: Option<Res<'w, DuelState>>,
+    actions: Res<'w, crate::ui_action::PlayerActions>,
+    spells: Option<Res<'w, Spells>>,
+    net: Res<'w, NetCommands>,
+}
+
+impl DuelSteps<'_> {
+    /// `AcceptDuel()` (`0x4d4830`) and `CancelDuel()` (`0x4d48b0`): the packet with the stored flag
+    /// guid `[0xb73240]`, with no test that a duel exists.
+    pub(crate) fn answer(&self, request: &DuelRequest) {
+        let arbiter = self.duel.as_deref().map_or(0, |d| d.arbiter);
+        let command = match request {
+            DuelRequest::Accept => ClientCommand::DuelAccepted { arbiter },
+            DuelRequest::Cancel => ClientCommand::DuelCancelled { arbiter },
+            DuelRequest::StartByGuid(_) => return,
+        };
+        let _ = self.net.0.send(command);
     }
-    let self_guid = self_q.iter().next().map(|g| g.0);
-    for req in requests {
-        match req {
-            DuelRequest::Accept => {
-                if duel.arbiter != 0 {
-                    let _ = commands.0.send(ClientCommand::DuelAccepted {
-                        arbiter: duel.arbiter,
-                    });
-                }
-            }
-            DuelRequest::Cancel => {
-                if duel.arbiter != 0 {
-                    let _ = commands.0.send(ClientCommand::DuelCancelled {
-                        arbiter: duel.arbiter,
-                    });
-                }
-            }
-            DuelRequest::StartByUnit(token) => {
-                // `StartDuelUnit` (`0x4d4c90`) resolves the token through `0x515970`, with no
-                // player gate; these are the tokens the unit popup passes.
-                let guid = match token.as_str() {
-                    "target" => selection.guid,
-                    "player" => self_guid,
-                    _ => None,
-                };
-                challenge(guid, self_guid, &index, &spells, &actions, &commands);
-            }
-            DuelRequest::StartByName(name) => {
-                // `/duel <name>`: `StartDuel` (`0x4d4c40`) matches the name through `0x493aa0`
-                // with typemask `0x10` (`0x4d4c66`), players only; here, the streamed guid index
-                // named through the cache.
-                let guid = streamed_player_named(&name, &index, &names);
-                challenge(guid, self_guid, &index, &spells, &actions, &commands);
-            }
-        }
+
+    /// The duel spell `[0xb71130]` a challenge casts (`0x4d4810`).
+    pub(crate) fn duel_spell(&self) -> Option<u32> {
+        duel_spell(self.spells.as_deref(), &self.actions)
     }
+}
+
+/// A challenge's cast inside its call: `CastDuelSpell 0x4d4810`, the duel spell through `0x6e5a90`,
+/// the cast attempt with the guid as its explicit target, so the bind's refusal of the caster, the
+/// range test and the server's answer decide what shows.
+pub(crate) fn cast_duel(cast: &mut crate::spell::ScriptCast, spell_id: u32, guid: u64) {
+    let ctx = cast.targeting.context_at_guid(guid);
+    cast.ladder.send(spell_id, &ctx, CastCommit::Spell);
 }
 
 /// A streamed player by name, case-insensitive, for a typed `/duel` argument.
@@ -439,38 +419,9 @@ pub(crate) fn streamed_player_named(
         })
 }
 
-/// Cast the duel spell at `guid`, a plain spell cast as in the reference's `0x4d4810`, not a duel
-/// opcode. Drops a missing, self, non-player or unstreamed target; the reference's bindings drop
-/// only a zero guid, plus a non-player in `StartDuel`'s name match.
-fn challenge(
-    guid: Option<u64>,
-    own: Option<u64>,
-    index: &GuidIndex,
-    spells: &Option<Res<Spells>>,
-    actions: &crate::ui_action::PlayerActions,
-    commands: &NetCommands,
-) {
-    let Some(guid) = guid.filter(|g| *g != 0 && Some(*g) != own) else {
-        return;
-    };
-    if !benilla_protocol::guid::is_player(guid) || !index.0.contains_key(&guid) {
-        return;
-    }
-    let Some(spell_id) = duel_spell(spells, actions) else {
-        return;
-    };
-    let _ = commands.0.send(ClientCommand::CastSpell {
-        spell_id,
-        target: Some(guid),
-    });
-}
-
 /// The learned spell whose `Effect[0]` is [`SPELL_EFFECT_DUEL`], the reference's `[0xb71130]`.
-fn duel_spell(
-    spells: &Option<Res<Spells>>,
-    actions: &crate::ui_action::PlayerActions,
-) -> Option<u32> {
-    let spells = spells.as_ref()?;
+fn duel_spell(spells: Option<&Spells>, actions: &crate::ui_action::PlayerActions) -> Option<u32> {
+    let spells = spells?;
     actions.spells.iter().copied().find(|id| {
         spells
             .catalog
@@ -492,17 +443,23 @@ impl Plugin for UiDuelPlugin {
                 (
                     // The tick names its line and `feed_duel` resolves it, so the tick runs first or
                     // each "Duel starting: N" lands a frame late.
-                    tick_countdown.before(feed_duel),
+                    // Before the pass: the duel answers' calls read the session.
+                    tick_countdown
+                        .before(feed_duel)
+                        .before(crate::vm_pass::VmPass::Start),
                     feed_duel.in_set(UiFeed),
-                    drain_duel.after(UiInput),
                 ),
             );
     }
 }
 
 #[cfg(test)]
+mod challenge_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::UiScript;
 
     /// The challenge looks its challenger's name up once, as its packet's; the frames the popup
     /// waits through read. A refused name is asked by no frame after it, only by the next

@@ -628,7 +628,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 (
                     record.character.guid,
                     record.character.name.clone(),
-                    m.glue.name_lists(),
+                    m.name_lists(),
                     m.name_charsets(),
                 )
             };
@@ -1354,12 +1354,20 @@ mod tests {
     fn rename_character_with_a_failing_name_fires_the_checks_key() {
         struct Reserved;
         impl super::super::NameLists for Reserved {
-            fn matches(&self, name: &str) -> bool {
+            fn names_profanity(&self, _: &str) -> bool {
+                false
+            }
+
+            fn chat_profanity(&self, _: &str) -> bool {
+                false
+            }
+
+            fn names_reserved(&self, name: &str) -> bool {
                 name.eq_ignore_ascii_case("thrall")
             }
         }
         let mut s = rename_vm();
-        s.set_glue_name_lists(std::rc::Rc::new(Reserved));
+        s.set_name_lists(std::rc::Rc::new(Reserved));
         for (call, key) in [
             ("RenameCharacter(2, 'X')", "CHAR_NAME_TOO_SHORT"),
             ("RenameCharacter(2, 'Abc1')", "CHAR_NAME_INVALID_CHARACTER"),

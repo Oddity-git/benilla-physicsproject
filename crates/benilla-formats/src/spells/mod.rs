@@ -32,12 +32,15 @@ mod immunity;
 pub use immunity::{cc_exemption, grants_immunity, CcExemption};
 pub use radius::{load_spell_radii, SpellRadius, SpellRadiusCatalog};
 pub use ranges::{
-    load_spell_ranges, min_max_range, min_max_range_reads_units, RangeTargets, RangeUnit,
-    SpellRange, SpellRangeCatalog, UnitMotion, COMBAT_REACH_ADD, MELEE_RANGE_FLOOR,
-    MOVING_BONUS_FLAGS, MOVING_RANGE_BONUS, ON_NEXT_SWING_RANGE,
+    load_spell_ranges, min_max_range, min_max_range_reads_ranged_slot, min_max_range_reads_units,
+    RangeTargets, RangeUnit, SpellRange, SpellRangeCatalog, UnitMotion, COMBAT_REACH_ADD,
+    MELEE_RANGE_FLOOR, MOVING_BONUS_FLAGS, MOVING_RANGE_BONUS, ON_NEXT_SWING_RANGE,
 };
 pub use soft_float::modify as soft_modify;
-pub use tokens::{substitute, SpellMods, TokenContext, TokenNumber};
+pub use tokens::{
+    resolve_parts, substitute, substitute_parts, ExpandAt, SpellMods, TokenContext, TokenNumber,
+    TokenPart,
+};
 
 use std::collections::HashMap;
 
@@ -67,6 +70,7 @@ const COL_MANA_COST: usize = 32;
 const COL_MANA_COST_PCT: usize = 156;
 const COL_MANA_COST_PER_LEVEL: usize = 33;
 const COL_MANA_PER_SECOND: usize = 34;
+const COL_MANA_PER_SECOND_PER_LEVEL: usize = 35;
 /// `rangeIndex` (`+0x90`), resolved by `GetMinMaxRange` (`0x6e3480`).
 const COL_RANGE_INDEX: usize = 36;
 /// `modalNextSpell` (`+0x98`): 52 of its 57 nonzero rows are hunter shots naming Auto Shot.
@@ -81,7 +85,7 @@ const COL_SPELL_FAMILY_FLAGS_LOW: usize = 161;
 /// `Targets` (`+0x34`): the seed the cast arm loads into its targeting word (`0x6e525a`).
 const COL_TARGETS: usize = 13;
 /// `TargetCreatureType` (`+0x38`): the creature-type mask `BindTarget` (`0x6e5c26`) and
-/// `SpellCanTargetUnit`'s mirror (`0x6e6544`) test the unit's type against, bit `type - 1`.
+/// `SpellCanTargetObject`'s mirror (`0x6e6544`) test the unit's type against, bit `type - 1`.
 const COL_TARGET_CREATURE_TYPE: usize = 14;
 /// `EffectImplicitTargetA[0]` (`+0x148`), the key of the cast arm's 62-case switch (`0x6e5484`).
 const COL_IMPLICIT_TARGET_A1: usize = 82;
@@ -171,6 +175,9 @@ const COL_PROC_CHARGES: usize = 26;
 const COL_STACK_AMOUNT: usize = 39;
 const COL_MAX_TARGET_LEVEL: usize = 159;
 const COL_MAX_AFFECTED_TARGETS: usize = 163;
+const COL_MIN_FACTION_ID: usize = 170;
+const COL_MIN_REPUTATION: usize = 171;
+const COL_REQUIRED_AURA_VISION: usize = 172;
 const COL_DAMAGE_MULTIPLIER_1: usize = 167;
 const COL_EFFECT_POINTS_PER_COMBO_POINT_1: usize = 112;
 
@@ -241,6 +248,12 @@ const ATTR_EX_CHANNELED: u32 = 0x44;
 /// (`0x6e83c0`), not at the send: the stealth openers, positional strikes and Judgement.
 const ATTR_EX2_INITIATE_COMBAT_POST_CAST: u32 = 0x0010_0000;
 
+/// `SPELL_ATTR_EX2_ACTIVE_THREAT`: `0x6e4870` answers 1 for it ahead of every other test.
+const ATTR_EX2_ACTIVE_THREAT: u32 = 0x4000_0000;
+/// `SPELL_ATTR_EX_NO_THREAT` and `SPELL_ATTR_EX2_NOT_AN_ACTION`: `0x6e4870` answers 0 for either.
+const ATTR_EX_NO_THREAT: u32 = 0x400;
+const ATTR_EX2_NOT_AN_ACTION: u32 = 0x1000_0000;
+
 /// `SPELL_ATTR_COOLDOWN_ON_EVENT`: held by the `SMSG_SPELL_COOLDOWN` handler (`0x6e9460`).
 const ATTR_COOLDOWN_ON_EVENT: u32 = 0x0200_0000;
 
@@ -287,6 +300,33 @@ pub struct SpellCatalog {
     /// Spell id to the `Languages.dbc` id its first effect declares.
     declared_language: HashMap<u32, u32>,
     dispel_types: SpellDispelTypes,
+    /// The weapon-skill spell by weapon subclass ([`weapon_skill_table`]), `0xc4d730`.
+    weapon_skills: Vec<u32>,
+}
+
+/// The weapon subclasses the weapon-skill table holds: `0x5e2db0` sizes it one past the highest
+/// class-2 subclass in `ItemSubClass.dbc`, 20 (Fishing Pole) at build 5875.
+const WEAPON_SUBCLASSES: u32 = 21;
+
+/// The table `0x5e2ca0` builds at world entry from weapon subclass to the spell that teaches its
+/// skill (`0xc4d730`, data at `0xc4d738`): of the spells with `Attributes & 0x40`, each with
+/// `EquippedItemClass` 2 and a single subclass bit (`0x5e2e10`) writes its id for that subclass,
+/// walking the rows from last to first, so the first row wins (`0x5e2d30`-`0x5e2d9a`). Spell.dbc's
+/// rows run in id order. A subclass no spell names holds 0.
+fn weapon_skill_table(spells: &HashMap<u32, SpellDisplay>) -> Vec<u32> {
+    let mut table = vec![0; WEAPON_SUBCLASSES as usize];
+    let mut ids: Vec<u32> = spells.keys().copied().collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    for id in ids {
+        let d = &spells[&id];
+        let mask = d.equipped_item_subclass_mask;
+        if d.attributes & 0x40 != 0 && d.equipped_item_class == 2 && mask.is_power_of_two() {
+            if let Some(slot) = table.get_mut(mask.trailing_zeros() as usize) {
+                *slot = id;
+            }
+        }
+    }
+    table
 }
 
 impl SpellCatalog {
@@ -311,12 +351,23 @@ impl SpellCatalog {
             })
             .collect();
         Self {
+            weapon_skills: weapon_skill_table(&spells),
             spells,
             learned_spell,
             learn_effects,
             declared_language: HashMap::new(),
             dispel_types: SpellDispelTypes::default(),
         }
+    }
+
+    /// The spell that teaches the skill of a weapon of `subclass`, the table `0xc4d738` that
+    /// `GetSkillSpell 0x5ea5d0` indexes by a hand's weapon subclass; `None` for a subclass with no
+    /// such spell (`0x5ea666`).
+    pub fn weapon_skill_spell(&self, subclass: u32) -> Option<u32> {
+        self.weapon_skills
+            .get(subclass as usize)
+            .copied()
+            .filter(|&id| id != 0)
     }
 
     /// A spell's learn effects in slot order, empty for a plain ability.
@@ -328,10 +379,17 @@ impl SpellCatalog {
         self.spells.get(&id)
     }
 
-    /// The dispel class's name, for the aura tooltip and the debuff border's `debuffType`; `None`
-    /// when `SpellDispelType.dbc`'s `[+0x28]` gate withholds it.
+    /// The dispel class's key, the `debuffType` `UnitDebuff` returns (`0x519a89`) and the debuff
+    /// border keys `DebuffTypeColor` on: `SpellDispelType.dbc` column 11, English on every locale.
+    /// `None` when the `[+0x28]` gate withholds it.
     pub fn dispel_name(&self, display: &SpellDisplay) -> Option<&str> {
         self.dispel_types.name(display.dispel)
+    }
+
+    /// The dispel class's word at the client's locale slot, the aura tooltip's right column
+    /// (`0x52f880`); `None` as for [`Self::dispel_name`].
+    pub fn dispel_label(&self, display: &SpellDisplay) -> Option<&str> {
+        self.dispel_types.label(display.dispel)
     }
 
     /// Every loaded spell, unordered.
@@ -561,6 +619,7 @@ pub fn load_spell_catalog(chain: &mut Chain) -> Result<SpellCatalog> {
                 mana_cost_pct: u32_at(r, COL_MANA_COST_PCT).unwrap_or(0),
                 mana_cost_per_level: u32_at(r, COL_MANA_COST_PER_LEVEL).unwrap_or(0),
                 mana_per_second: u32_at(r, COL_MANA_PER_SECOND).unwrap_or(0),
+                mana_per_second_per_level: u32_at(r, COL_MANA_PER_SECOND_PER_LEVEL).unwrap_or(0),
                 range_index: u32_at(r, COL_RANGE_INDEX).unwrap_or(0),
                 modal_next_spell: u32_at(r, COL_MODAL_NEXT_SPELL).unwrap_or(0),
                 targets: u32_at(r, COL_TARGETS).unwrap_or(0),
@@ -609,6 +668,9 @@ pub fn load_spell_catalog(chain: &mut Chain) -> Result<SpellCatalog> {
                 stack_amount: u32_at(r, COL_STACK_AMOUNT).unwrap_or(0),
                 max_target_level: u32_at(r, COL_MAX_TARGET_LEVEL).unwrap_or(0),
                 max_affected_targets: u32_at(r, COL_MAX_AFFECTED_TARGETS).unwrap_or(0),
+                min_faction_id: u32_at(r, COL_MIN_FACTION_ID).unwrap_or(0),
+                min_reputation: u32_at(r, COL_MIN_REPUTATION).unwrap_or(0),
+                required_aura_vision: u32_at(r, COL_REQUIRED_AURA_VISION).unwrap_or(0),
                 effect_base_points: std::array::from_fn(|i| {
                     i32_at(r, COL_EFFECT_BASE_POINTS_1 + i).unwrap_or(0)
                 }),
@@ -654,6 +716,7 @@ pub fn load_spell_catalog(chain: &mut Chain) -> Result<SpellCatalog> {
         );
     }
     Ok(SpellCatalog {
+        weapon_skills: weapon_skill_table(&spells),
         spells,
         learned_spell,
         learn_effects,

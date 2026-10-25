@@ -4,12 +4,13 @@
 
 use std::io::{self, Read};
 
-use crate::wire::{capacity_hint, read_cstring, read_u32_le, read_u64_le, read_u8};
+use crate::wire::{capacity_hint, read_cstring_capped, read_u32_le, read_u64_le, read_u8};
 
 /// `SMSG_FRIEND_STATUS`'s result byte, vmangos `FriendsResult` (`SocialMgr.h:81-110`). The client
 /// (`0x5acab0`) prints each result's `ERR_*` string to the chat frame, not the red error line.
 pub mod friend_result {
-    /// `ERR_FRIEND_DB_ERROR`: the server's lookup failed.
+    /// vmangos `FRIEND_DB_ERROR`, the server's lookup failed; the client shows it as
+    /// `ERR_FRIEND_NOT_FOUND`, result 4's line (`0x5ace1c`, `0x5acad6`).
     pub const DB_ERROR: u8 = 0x00;
     /// `ERR_FRIEND_LIST_FULL`: 50 friends already.
     pub const LIST_FULL: u8 = 0x01;
@@ -61,8 +62,8 @@ pub mod friend_status {
     pub const DND: u8 = 4;
 }
 
-/// One friend-list row. The name is not on the wire: the client resolves it through its name cache
-/// (`0x55f080`, filled by `CMSG_NAME_QUERY`) when it draws the row.
+/// One friend-list row. The name is not on the wire: the client copies it into the slot from its
+/// name cache at the packet (`0x55f080` at `0x5ae438`), or when the cache's answer arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FriendEntry {
     /// Always a player guid: vmangos rebuilds it as `ObjectGuid(HIGHGUID_PLAYER, lowguid)`.
@@ -174,24 +175,38 @@ pub struct WhoResults {
     pub displayed: u32,
     /// The full match count when over 49, else equal to [`Self::displayed`].
     pub total: u32,
-    /// In server order.
+    /// In server order, one per record to [`Self::displayed`], those past a cut or poisoned read
+    /// empty and kept to 50 ([`read_who`]).
     pub entries: Vec<WhoEntry>,
 }
 
-/// Read `SMSG_WHO` (vmangos `WhoListClientQueryTask`, client `0x5adde0`): two `u32` counts, then
-/// `{name, guild, level, class, race, zone}` per entry. 1.12 has no trailing party-status `u32`.
-pub fn read_who(r: &mut impl Read) -> io::Result<WhoResults> {
+/// The records `OnWhoList` keeps (`0x5adf87`-`0x5adf92`, the array's `0x1f40` bytes at
+/// `0x5ae045`).
+const WHO_KEPT: usize = 50;
+
+/// Read `SMSG_WHO` as `OnWhoList` (`0x5adf60`) reads it: two `u32` counts, then
+/// `{name, guild, level, class, race, zone}` per record, the name and the guild through
+/// `GetCString` at `0x30` and `0x60` (`0x5adff0`, `0x5adffd`). 1.12 has no trailing party-status
+/// `u32`. A string with no NUL inside its capacity or before the end reads `""` and poisons the
+/// store, and every read after it fails, a dword staying the 0 it was zeroed to
+/// (`0x5ae013`-`0x5ae03d`); the loop still runs to the count (`0x5ae0c1`), so a short or poisoned
+/// answer keeps its records, those past the cut empty. The empty tail is kept to the 50 the list
+/// holds; the chat exit, the only reader of more, takes at most 3 (`0x5adfc1`).
+pub fn read_who(r: &mut &[u8]) -> io::Result<WhoResults> {
     let displayed = read_u32_le(r)?;
     let total = read_u32_le(r)?;
-    let mut entries = Vec::with_capacity(capacity_hint(displayed, 64));
+    let mut entries = Vec::with_capacity(capacity_hint(displayed, WHO_KEPT));
     for _ in 0..displayed {
+        if r.is_empty() && entries.len() >= WHO_KEPT {
+            break;
+        }
         entries.push(WhoEntry {
-            name: read_cstring(r)?,
-            guild: read_cstring(r)?,
-            level: read_u32_le(r)?,
-            class: read_u32_le(r)?,
-            race: read_u32_le(r)?,
-            zone: read_u32_le(r)?,
+            name: who_string(r, 0x30),
+            guild: who_string(r, 0x60),
+            level: who_dword(r),
+            class: who_dword(r),
+            race: who_dword(r),
+            zone: who_dword(r),
         });
     }
     Ok(WhoResults {
@@ -201,26 +216,45 @@ pub fn read_who(r: &mut impl Read) -> io::Result<WhoResults> {
     })
 }
 
-/// A `/who` query parsed from the typed filter, e.g. `z-"Elwynn Forest" 1-10`, which the 1.12
-/// engine (not FrameXML) parses for `SendWho`. [`Default`] is a bare `/who`.
+/// `GetCString` (`0x4191b0`) at `capacity`; a miss empties the store, as its poisoned cursor fails
+/// every later read.
+fn who_string(r: &mut &[u8], capacity: usize) -> String {
+    read_cstring_capped(r, capacity).unwrap_or_else(|| {
+        *r = &[];
+        String::new()
+    })
+}
+
+/// A dword (`0x418e30`): short of four bytes it reads 0 and empties the store, a failed read
+/// poisoning it.
+fn who_dword(r: &mut &[u8]) -> u32 {
+    read_u32_le(r).unwrap_or_else(|_| {
+        *r = &[];
+        0
+    })
+}
+
+/// A `/who` query as the 1.12 engine's builder (`0x5aebb0`, not FrameXML) makes it from the typed
+/// filter, e.g. `z-"Elwynn Forest" 1-10`. [`Default`] is an empty filter's. The strings are the
+/// filter's bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhoRequest {
-    /// Inclusive minimum level.
+    /// Inclusive minimum level, 0 unset (`0x5aebd7`).
     pub level_min: u32,
-    /// Inclusive maximum level; the 1.12 client sends 100 when unset, not 255.
+    /// Inclusive maximum level, 100 unset (`0x5aebda`).
     pub level_max: u32,
-    /// `n-`: a name substring, empty for any.
-    pub player_name: String,
-    /// `g-`: a guild-name substring, empty for any.
-    pub guild_name: String,
-    /// `r-`: a bitmask over race ids (`1 << race`), all-ones for any.
+    /// The name tag's text, up to 47 bytes, empty for any.
+    pub player_name: Vec<u8>,
+    /// The guild tag's text, up to 47 bytes, empty for any.
+    pub guild_name: Vec<u8>,
+    /// A bitmask over race ids (`1 << race`), all ones for any.
     pub race_mask: u32,
-    /// `c-`: a bitmask over class ids (`1 << class`), all-ones for any.
+    /// A bitmask over class ids (`1 << class`), all ones for any.
     pub class_mask: u32,
-    /// `z-`: zone ids, resolved from names client-side.
+    /// The zone ids the zone tags found, up to 10.
     pub zones: Vec<u32>,
-    /// Untagged words; the server matches each against name, guild and zone name.
-    pub search_terms: Vec<String>,
+    /// Untagged words, up to 4; the server matches each against name, guild and zone name.
+    pub search_terms: Vec<Vec<u8>>,
 }
 
 impl Default for WhoRequest {
@@ -228,8 +262,8 @@ impl Default for WhoRequest {
         Self {
             level_min: 0,
             level_max: 100,
-            player_name: String::new(),
-            guild_name: String::new(),
+            player_name: Vec::new(),
+            guild_name: Vec::new(),
             race_mask: u32::MAX,
             class_mask: u32::MAX,
             zones: Vec::new(),
@@ -238,33 +272,32 @@ impl Default for WhoRequest {
     }
 }
 
-/// Over 10 zones or 4 search terms, `HandleWhoOpcode` silently drops the whole query.
-pub const WHO_MAX_ZONES: usize = 10;
-/// See [`WHO_MAX_ZONES`].
-pub const WHO_MAX_SEARCH_TERMS: usize = 4;
-
-/// Body of `CMSG_WHO` (vmangos `Misc.cpp`, `Who::ReadFromWorldPacket`). Both arrays are trimmed to
-/// the server's caps, so an over-long query narrows instead of matching nobody.
+/// Body of `CMSG_WHO` as the builder writes it (`0x5af0a4`-`0x5af141`): the levels, the name and
+/// guild C strings, the masks, the zone count and ids, the term count and terms, every number a
+/// u32.
 pub fn who(request: &WhoRequest) -> Vec<u8> {
-    let zones = &request.zones[..request.zones.len().min(WHO_MAX_ZONES)];
-    let terms = &request.search_terms[..request.search_terms.len().min(WHO_MAX_SEARCH_TERMS)];
-
     let mut body = Vec::with_capacity(32 + request.player_name.len() + request.guild_name.len());
     body.extend_from_slice(&request.level_min.to_le_bytes());
     body.extend_from_slice(&request.level_max.to_le_bytes());
-    push_cstring(&mut body, &request.player_name);
-    push_cstring(&mut body, &request.guild_name);
+    push_bytes(&mut body, &request.player_name);
+    push_bytes(&mut body, &request.guild_name);
     body.extend_from_slice(&request.race_mask.to_le_bytes());
     body.extend_from_slice(&request.class_mask.to_le_bytes());
-    body.extend_from_slice(&(zones.len() as u32).to_le_bytes());
-    for zone in zones {
+    body.extend_from_slice(&(request.zones.len() as u32).to_le_bytes());
+    for zone in &request.zones {
         body.extend_from_slice(&zone.to_le_bytes());
     }
-    body.extend_from_slice(&(terms.len() as u32).to_le_bytes());
-    for term in terms {
-        push_cstring(&mut body, term);
+    body.extend_from_slice(&(request.search_terms.len() as u32).to_le_bytes());
+    for term in &request.search_terms {
+        push_bytes(&mut body, term);
     }
     body
+}
+
+/// A C string of raw bytes.
+fn push_bytes(body: &mut Vec<u8>, s: &[u8]) {
+    body.extend_from_slice(s);
+    body.push(0);
 }
 
 /// Body of `CMSG_FRIEND_LIST`: empty. The `ShowFriends()` refresh; the list also arrives unasked
@@ -459,17 +492,86 @@ mod tests {
         assert_eq!(who.entries[0].level, 5);
     }
 
+    fn who_record(body: &mut Vec<u8>, name: &[u8], guild: &[u8], level: u32) {
+        body.extend_from_slice(name);
+        body.push(0);
+        body.extend_from_slice(guild);
+        body.push(0);
+        for v in [level, 1, 1, 12] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// `0x5adf60` reads the name and guild with `GetCString` at `0x30` and `0x60` (`0x5adff0`,
+    /// `0x5adffd`): 47 and 95 bytes fit with their NUL; one more reads `""` and poisons the store,
+    /// so the record's dwords and every later record read empty, and each is still kept.
+    #[test]
+    fn who_strings_read_at_their_capacities() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(&3u32.to_le_bytes());
+        who_record(&mut body, &[b'a'; 47], &[b'g'; 95], 10);
+        who_record(&mut body, b"Bob", &[b'g'; 96], 20);
+        who_record(&mut body, b"Cid", b"", 30);
+        let who = read_who(&mut &body[..]).unwrap();
+        assert_eq!(who.entries.len(), 3);
+        assert_eq!(who.entries[0].name.len(), 47);
+        assert_eq!(who.entries[0].guild.len(), 95);
+        assert_eq!(who.entries[0].level, 10);
+        let poisoned = WhoEntry {
+            name: "Bob".into(),
+            ..WhoEntry::default()
+        };
+        assert_eq!(who.entries[1..], [poisoned, WhoEntry::default()]);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        who_record(&mut body, &[b'a'; 48], b"", 10);
+        let who = read_who(&mut &body[..]).unwrap();
+        assert_eq!(who.entries, [WhoEntry::default()], "a 48-byte name");
+    }
+
+    /// A short `SMSG_WHO` keeps every record up to its count, as the loop reads on through a
+    /// poisoned store (`0x5ae045`-`0x5ae0c6`): the cut record keeps what it read and the rest
+    /// are empty, up to the 50 the list keeps (`0x5adf87`).
+    #[test]
+    fn a_short_who_answer_keeps_its_rows() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&80u32.to_le_bytes());
+        body.extend_from_slice(&80u32.to_le_bytes());
+        who_record(&mut body, b"Ann", b"G", 7);
+        who_record(&mut body, b"Ben", b"H", 8);
+        body.truncate(body.len() - 6);
+        let who = read_who(&mut &body[..]).unwrap();
+        assert_eq!((who.displayed, who.total), (80, 80));
+        assert_eq!(who.entries.len(), 50);
+        assert_eq!(who.entries[0].level, 7);
+        let cut = &who.entries[1];
+        assert_eq!(
+            (
+                cut.name.as_str(),
+                cut.guild.as_str(),
+                cut.level,
+                cut.class,
+                cut.race
+            ),
+            ("Ben", "H", 8, 1, 0)
+        );
+        assert!(who.entries[2..].iter().all(|e| *e == WhoEntry::default()));
+    }
+
     #[test]
     fn who_request_body_is_byte_exact() {
         let request = WhoRequest {
             level_min: 1,
             level_max: 10,
-            player_name: "bob".into(),
-            guild_name: String::new(),
+            player_name: b"bob".to_vec(),
+            guild_name: Vec::new(),
             race_mask: 0xFFFF_FFFF,
             class_mask: 0x0000_0002,
             zones: vec![12],
-            search_terms: vec!["elw".into()],
+            search_terms: vec![b"elw".to_vec()],
         };
         let mut want = Vec::new();
         want.extend_from_slice(&1u32.to_le_bytes());
@@ -485,7 +587,7 @@ mod tests {
         assert_eq!(who(&request), want);
     }
 
-    /// A bare `/who` as bytes: levels 0 to 100, both names empty, every race and class, no lists.
+    /// An empty filter as bytes: levels 0 to 100, both names empty, every race and class, no lists.
     #[test]
     fn the_default_who_query_encodes_levels_0_to_100_with_every_filter_open() {
         let body = who(&WhoRequest::default());
@@ -497,21 +599,6 @@ mod tests {
         assert_eq!(&body[18..22], &0u32.to_le_bytes(), "no zones");
         assert_eq!(&body[22..26], &0u32.to_le_bytes(), "no terms");
         assert_eq!(body.len(), 26);
-    }
-
-    #[test]
-    fn who_trims_to_the_servers_caps() {
-        let request = WhoRequest {
-            zones: (0..15).collect(),
-            search_terms: (0..7).map(|i| i.to_string()).collect(),
-            ..Default::default()
-        };
-        let body = who(&request);
-        let zone_count = u32::from_le_bytes(body[18..22].try_into().unwrap());
-        assert_eq!(zone_count as usize, WHO_MAX_ZONES);
-        let after_zones = 22 + WHO_MAX_ZONES * 4;
-        let term_count = u32::from_le_bytes(body[after_zones..after_zones + 4].try_into().unwrap());
-        assert_eq!(term_count as usize, WHO_MAX_SEARCH_TERMS);
     }
 
     #[test]

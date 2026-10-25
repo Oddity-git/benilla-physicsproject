@@ -43,6 +43,7 @@ mod hover_walk;
 mod hyperlink;
 mod index_usage;
 mod input;
+mod is_number_gates;
 mod keep_rect;
 mod keyboard;
 mod layout_gate;
@@ -67,14 +68,17 @@ mod protected_gate;
 mod reference_surface;
 mod region_map;
 mod regions;
+mod reputation_list;
 mod resize_bounds;
 mod screen_units;
+mod script_lengths;
 mod scrollframe;
 mod set_font_args;
 mod setparent;
 mod shown_bit;
 mod simplehtml;
 mod size_changed;
+mod skill_list;
 mod slider;
 mod statusbar;
 mod stdlib;
@@ -90,13 +94,17 @@ mod tooltip_setter_flags;
 mod tooltip_size;
 mod tooltip_spell;
 mod tooltip_unit;
+mod tooltip_unit_status;
 mod toplevel;
 mod update_walk;
 mod usage_lines;
+mod usage_number_args;
+mod usage_range_gates;
 mod visibility;
 mod wheel;
 mod widget_args;
 mod widget_surface;
+mod world_press_hook;
 mod worldframe;
 mod worldmap;
 
@@ -195,10 +203,12 @@ fn get_bind_location_answers_the_pushed_name_and_never_nil() {
     );
 }
 
-/// `RequestTimePlayed()` queues the ask; `TIME_PLAYED_MSG` carries the answer.
+/// `RequestTimePlayed()` is a call the host sends inside the verb; `TIME_PLAYED_MSG` carries the
+/// answer.
 #[test]
-fn request_time_played_queues_an_ask_and_the_answer_arrives_as_an_event() {
+fn request_time_played_is_a_call_and_the_answer_arrives_as_an_event() {
     let mut s = crate::script::UiScript::new().unwrap();
+    s.keep_calls();
 
     assert_eq!(s.arity("RequestTimePlayed()").unwrap(), 0);
     // A count, not a latch: the packet is empty, so two asks in a frame are two sends.
@@ -208,7 +218,11 @@ fn request_time_played_queues_an_ask_and_the_answer_arrives_as_an_event() {
         3,
         "the eval above plus two more — each ask is its own CMSG_PLAYED_TIME"
     );
-    assert_eq!(s.take_played_time_asks(), 0, "the drain empties the queue");
+    assert_eq!(
+        s.take_played_time_asks(),
+        0,
+        "the take empties the kept calls"
+    );
 
     s.run(
         r#"

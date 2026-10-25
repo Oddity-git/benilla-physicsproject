@@ -222,10 +222,10 @@ impl GlueRebuild {
 }
 
 /// The glue's aspect (`0x46ab40`): 4/3 with `widescreen` off, else the applied `gxResolution`
-/// scanned as width, separator, height (`0x46ab8f`). Not the window's: benilla writes
-/// `gxResolution` only through the CVar set path (the config load, `SetCVar`, `/console set`,
-/// `SetScreenResolution`, each committed at `RestartGx` as the row is latched), never from a
-/// window drag. A size `video::parse_resolution` refuses, a zero or unparsable extent, is no value.
+/// scanned as width, separator, height (`0x46ab8f`). Not the window's: `gxResolution` moves only
+/// through the CVar set path (the config load, `SetCVar`, `/console set`, `SetScreenResolution`,
+/// each committed at `RestartGx` as the row is latched) and, in fullscreen, to the screen's own
+/// size (`video::show_screen_size`), never with a window drag. A size `video::parse_resolution` refuses, a zero or unparsable extent, is no value.
 fn gx_aspect(cvars: Option<&crate::cvars::Cvars>) -> Option<f32> {
     let cvars = cvars?;
     if cvars.flag("widescreen") == Some(false) {
@@ -350,19 +350,6 @@ pub(crate) fn run_pending_glue_rebuild(world: &mut World) {
     info!("ui_script: glue rebuild on \"{screen}\"");
     // The old VM goes with the replacement; the buffer is the client's, so it carries over.
     super::lifecycle::install_glue_side_vm(world, &screen);
-}
-
-/// `ConsoleExec` lines the glue VM left for the console (`0x515f10` → `ConsoleCommandExecute`),
-/// run as the in-game drain runs its own, their output to the log: the glue has no chat to print
-/// to.
-pub(crate) fn drain_glue_console(world: &mut World) {
-    let lines = match world.get_non_send_resource_mut::<UiScript>() {
-        Some(mut s) if s.vm_kind() == benilla_ui::script::VmKind::Glue => s.take_console_lines(),
-        _ => return,
-    };
-    for line in lines {
-        crate::console::run(world, &line);
-    }
 }
 
 #[cfg(test)]
@@ -643,7 +630,7 @@ mod tests {
     fn glue_world() -> World {
         use crate::console::ConsoleCommandApp;
         let mut app = App::new();
-        app.console_command(
+        app.console_command_in_call(
             "reloadUI",
             crate::console::GRAPHICS,
             None,
@@ -680,11 +667,18 @@ mod tests {
         let set_state = |world: &World, state: ScreenState| {
             world.non_send_resource::<SharedGlueMgr>().get_mut().state = state;
         };
-        world
-            .non_send_resource::<UiScript>()
-            .run("SetGlueScreen('credits') ConsoleExec('reloadUI')")
-            .unwrap();
-        drain_glue_console(&mut world);
+        // The console line as the host runs it inside the call.
+        let lines = {
+            let mut s = world.non_send_resource_mut::<UiScript>();
+            s.keep_calls();
+            s.run("SetGlueScreen('credits') ConsoleExec('reloadUI')")
+                .unwrap();
+            s.take_console_lines()
+        };
+        assert_eq!(lines, ["reloadUI"]);
+        for line in lines {
+            crate::console::execute(&mut world, &line);
+        }
         let old = session(&world);
 
         set_state(&world, ScreenState::Logon);
@@ -733,7 +727,10 @@ mod tests {
             let mut app = App::new();
             app.init_resource::<GlueRebuild>()
                 .insert_resource(crate::cvars::Cvars::with_value("gxResolution", "1024x768"))
-                .add_systems(Update, watch_glue_aspect);
+                .add_systems(
+                    PreUpdate,
+                    watch_glue_aspect.after(crate::video::show_screen_size),
+                );
             let mut window = Window::default();
             window.resolution.set(1024.0, 768.0);
             let win = app
@@ -780,6 +777,39 @@ mod tests {
             !c.frame(1360.0, 768.0),
             "16:9 to 1.7708 moves the stored aspect by under a hundredth"
         );
+    }
+
+    /// A switch to fullscreen at the glue rebuilds it in the frame the window takes the screen:
+    /// the screen's size is shown first, so the callback compares the screen's aspect, and the
+    /// row answers the screen's size that frame. Wired as `UiScriptPlugin` and `VideoPlugin` wire
+    /// the two.
+    #[test]
+    fn a_switch_to_fullscreen_at_the_glue_rebuilds_it() {
+        use crate::video::{show_screen_size, DisplayMode, VideoConfig};
+        use bevy::window::{MonitorSelection, WindowMode};
+        let mut c = SizeCallback::new();
+        c.app
+            .insert_resource(VideoConfig {
+                vsync: true,
+                display: DisplayMode::Windowed,
+                maximize: false,
+                windowed: UVec2::new(1024, 768),
+            })
+            .add_systems(PreUpdate, show_screen_size);
+        assert!(!c.frame(1024.0, 768.0), "the size it was built at");
+        c.app.world_mut().resource_mut::<VideoConfig>().display = DisplayMode::Fullscreen;
+        c.app.world_mut().get_mut::<Window>(c.win).unwrap().mode =
+            WindowMode::BorderlessFullscreen(MonitorSelection::Current);
+        assert!(c.frame(1440.0, 900.0), "4:3 to 16:10 rebuilds");
+        assert_eq!(
+            c.app
+                .world()
+                .resource::<crate::cvars::Cvars>()
+                .get("gxResolution"),
+            Some("1440x900"),
+            "the row answers the screen that frame"
+        );
+        assert!(!c.frame(1440.0, 900.0), "once");
     }
 
     /// The window is not the aspect: a drag to any size with `gxResolution` unchanged stores the

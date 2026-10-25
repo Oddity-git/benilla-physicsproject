@@ -170,18 +170,17 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // CancelPlayerBuff(buffIndex) (`0x4e49a0`): no return values on any path. It queues the spell
-    // id, the one `u32` of `CMSG_CANCEL_AURA` (0x136, `Spell_C::CancelAura` `0x6e7040`), on the
-    // queue `CancelTrackingBuff` uses; a refused or absent aura is a silent no-op.
+    // CancelPlayerBuff(buffIndex) (`0x4e49a0`): no return values on any path. It cancels the spell
+    // through `Spell_C::CancelAura` (`0x6e7040`), whose `CMSG_CANCEL_AURA` (0x136) names the spell,
+    // inside the call, as `CancelTrackingBuff` does; a refused or absent aura is a silent no-op.
     g.set(
         "CancelPlayerBuff",
         lua.create_function(|lua, index: Value| {
             let pos = buff_index_arg(lua, index, "Usage: CancelPlayerBuff(buffIndex)")?;
-            if let Some(a) = player_buff_record(lua, pos).filter(cancel_authorized) {
-                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                model.cancel_aura_requests.push(a.spell_id);
+            match player_buff_record(lua, pos).filter(cancel_authorized) {
+                Some(a) => super::cancel_aura(lua, a.spell_id),
+                None => Ok(()),
             }
-            Ok(())
         })?,
     )?;
 
@@ -198,6 +197,7 @@ mod tests {
             name: Some(name.into()),
             icon: Some(format!("Interface\\Icons\\Spell_{spell_id}")),
             count: 1,
+            level: 0,
             debuff_type: None,
             duration: 0.0,
             expiration_time: 0.0,
@@ -205,6 +205,8 @@ mod tests {
             cancelable,
             until_cancelled: false,
             channeled: false,
+            raid_listed: false,
+            vision_hidden: false,
         }
     }
 
@@ -225,6 +227,7 @@ mod tests {
 
     fn with_player_cache() -> UiScript {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_player_auras(player_cache());
         s
     }

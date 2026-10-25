@@ -7,7 +7,7 @@
 
 use bevy::prelude::*;
 
-use benilla_ui::script::{ActionSlot, ScriptValue, UiScript, UnitState};
+use benilla_ui::script::{ActionSlot, ScriptValue, UnitState};
 
 use crate::ui_unit::UnitFeed;
 use benilla_world::schedule::WorldStage;
@@ -143,8 +143,9 @@ pub(crate) struct UiKeyboardCapture {
 pub(crate) struct PlayerUiClickConsumed(pub(crate) bool);
 
 /// A press the UI consumed this frame, whatever is under the pointer: the layout drag's press
-/// returns at `0x766353`–`0x76635b`, before any frame, the world frame included, sees it, so the
-/// world latch takes no press this frame even with no UI frame hovered.
+/// returns at `0x766353`–`0x76635b`, and a right press with a payload held at the world input
+/// hook (`0x492b50`, `0x766370`), each before any frame, the world frame included, sees it, so
+/// the world latch takes no press this frame even with no UI frame hovered.
 #[derive(Resource, Default)]
 pub(crate) struct PlayerUiPressConsumed(pub(crate) bool);
 
@@ -170,21 +171,37 @@ pub(crate) struct UiPassState {
     pub(crate) derives_before: u64,
 }
 
-/// The player-UI feed phase, after [`WorldStage::Net`] and ungated (`UnitFeed` is the gated
-/// sub-phase): every push this frame's tick must see, as in the reference's frame, where packet
-/// dispatch precedes every `FrameScript_SignalEvent` and both precede `OnUpdate`. Every VM holder
-/// in `Update` is in this set or `.after(UiInput)`, as `game_plugins::schedule_tests` checks.
+/// The player-UI feed phase, after [`WorldStage::Net`] and the input pass and ungated (`UnitFeed`
+/// is the gated sub-phase): every push this frame's tick must see, as in the reference's tick,
+/// where the packets (category 6, `0x420d55`) follow the window input and precede the frame pass's
+/// `OnUpdate`. Every VM holder in `Update` is in [`UiInput`], in this set or `.after(UiTick)`, as
+/// `game_plugins::schedule_tests` checks.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiFeed;
+
+/// The drains of what the pass's Lua asked for (a send, a window's verb, a save, a sound), after
+/// the tick and after every later host they are free to follow: the reference applies each
+/// inside its call, so an ask is drained the frame it is made, wherever in the pass its Lua ran.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiDrain;
 
 /// The player-UI paint pass, after the camera so world-anchored widgets use this frame's view.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiPaint;
 
-/// The player-UI input pass (tick, hit-test, handlers), before [`WorldStage::Input`] so its
-/// [`PlayerUiHover`] reaches `PointerOverUi` before `player::control` reads it.
+/// The player-UI input pass (hit test, handlers, then the bindings): the frame's window input
+/// records, which the reference runs ahead of its packets (`0x423920` at `0x420d23`), so ahead of
+/// [`UiFeed`]; and before [`WorldStage::Input`], so its [`PlayerUiHover`] reaches `PointerOverUi`
+/// before `player::control` reads it. It follows the net drain, as the pass's start does
+/// ([`crate::vm_pass::VmPass::Start`]).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiInput;
+
+/// The tick: the `OnUpdate` walk of the frame pass (category 0x11 at `0x420d6a`, `0x764330` →
+/// `0x765650`), after the input pass and the feeds, so a handler reads this frame's input and
+/// packets applied.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiTick;
 
 /// The frame's atomic (`Instant`, `GetTime`) pair, the one base for mapping a store `Instant` onto
 /// `GetTime`: `anchor`'s steps are the VM clock's deltas, so a mapped start is stable frame to
@@ -223,9 +240,9 @@ pub(crate) fn run_or_warn(script: &benilla_ui::script::UiScript, chunk: &str) {
 }
 
 /// The reference's `uiScale` CVar, which the VM makes `UIParent`'s own scale
-/// ([`UiScript::set_ui_scale`]): the screen root stays 768 units tall, so `uiScale = 768/screenH`
-/// is pixel-perfect inside `UIParent`, and a frame outside it is not scaled. Tests pin the
-/// `Default` 1.0.
+/// ([`benilla_ui::script::UiScript::set_ui_scale`]): the screen root stays 768 units tall, so
+/// `uiScale = 768/screenH` is pixel-perfect inside `UIParent`, and a frame outside it is not
+/// scaled. Tests pin the `Default` 1.0.
 #[derive(Resource)]
 pub(crate) struct UiScaleCvar(pub(crate) f32);
 
@@ -291,12 +308,13 @@ pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut scale: ResMut<UiSca
 /// `/reload` queue, which the world alone honours. It prints nothing in any state: the handler
 /// sets the flag `[0xb41d8c]` and calls `CGGameUI::Reload` (`0x491380`), neither of which writes
 /// a line, so a run with no interface to reload is silent too.
-fn console_reload_ui(world: &mut World, _args: &str) -> Vec<String> {
-    if let Some(mut rebuild) = world.get_resource_mut::<glue::GlueRebuild>() {
+fn console_reload_ui(steps: &mut crate::console::ConsoleSteps, _args: &str) -> Vec<String> {
+    if let Some(rebuild) = steps.glue_rebuild.as_deref_mut() {
         rebuild.request();
     }
-    if let Some(mut script) = world.get_non_send_resource_mut::<UiScript>() {
-        script.queue_session_request(benilla_ui::script::SessionRequest::ReloadUi);
+    // `CGGameUI::Reload`'s flag `0xb4b3f4`, which the session's `ReloadUI()` sets too.
+    if let Some(reload) = steps.reload.as_deref_mut() {
+        reload.0 = true;
     }
     Vec::new()
 }
@@ -306,7 +324,7 @@ impl Plugin for UiScriptPlugin {
         use crate::console::ConsoleCommandApp;
         app.add_observer(on_cvar);
         // Category 1 with no help (`0x402ba6`-`0x402bb4`).
-        app.console_command(
+        app.console_command_in_call(
             "reloadUI",
             crate::console::GRAPHICS,
             None,
@@ -342,9 +360,11 @@ impl Plugin for UiScriptPlugin {
             .add_systems(
                 Startup,
                 // After the CVars load: the glue screens read the agreements as they come up. After
-                // the glyph cache, which measures the text their first show sizes frames by.
+                // the glyph cache, which measures the text their first show sizes frames by. After
+                // the word lists, which every VM is seated with as it is made.
                 setup_script
                     .after(benilla_assets::AssetSet::Open)
+                    .after(crate::text_filter::TextFilterLoad)
                     .after(crate::cvars::CvarLoad)
                     .after(crate::ui_text::FontAtlasInit),
             )
@@ -354,10 +374,18 @@ impl Plugin for UiScriptPlugin {
                 OnEnter(crate::client_state::ClientState::InWorld),
                 lifecycle::arm_entry_ui_load,
             )
-            // The shutdown tail: events, then writes, in the reference's order.
+            // The shutdown tail: events, then writes, in the reference's order; the clears of what
+            // the dying state shows after its `PLAYER_LOGOUT`, then the glue VM.
+            .configure_sets(
+                OnExit(crate::client_state::ClientState::InWorld),
+                (SessionEnd::Shutdown, SessionEnd::Clears, SessionEnd::Glue).chain(),
+            )
             .add_systems(
                 OnExit(crate::client_state::ClientState::InWorld),
-                end_ui_session,
+                (
+                    lifecycle::shut_down_session.in_set(SessionEnd::Shutdown),
+                    lifecycle::install_session_glue.in_set(SessionEnd::Glue),
+                ),
             )
             // `init_` here and in `UiUnitPlugin`: either plugin may be built alone in a test.
             .init_world_leave_sweep()
@@ -371,26 +399,33 @@ impl Plugin for UiScriptPlugin {
                 PreUpdate,
                 (
                     run_pending_reload,
-                    // The glue's `ConsoleExec` lines the last frame left and its top's size
-                    // callback, then the rebuild either asked for.
-                    (glue::drain_glue_console, glue::watch_glue_aspect)
-                        .chain()
+                    // The glue top's size callback, then the rebuild it or a `reloadUI` asked
+                    // for. The callback reads the `gxResolution` the screen shows this frame.
+                    glue::watch_glue_aspect
+                        .after(crate::video::show_screen_size)
                         .run_if(glue::glue_ui_up),
                     glue::run_pending_glue_rebuild,
                     lifecycle::run_pending_entry_load,
                 )
                     .chain(),
             )
-            // The three UI phases in order: feeds after the net drain, the tick, then the paint.
+            // The UI phases in the reference's tick order (`core/loop`, "What one tick runs"): the
+            // window input records (`0x423920` at `0x420d23`), then the feeds of the packets
+            // (category 6, `0x420d55`), then the tick, the frame pass's `OnUpdate` walk (category
+            // 0x11, `0x420d6a`), and the paint; the drains of what the Lua asked after the tick,
+            // and after every later host the VM pass can put them behind, before the paint
+            // (`crate::vm_pass`).
             .configure_sets(
                 Update,
                 (
-                    UiFeed.after(WorldStage::Net),
-                    UiInput.before(WorldStage::Input),
+                    UiInput.after(WorldStage::Net),
+                    UiFeed,
+                    UiTick.before(WorldStage::Input),
                     UiPaint,
                 )
                     .chain(),
             )
+            .configure_sets(Update, UiDrain.after(UiTick))
             // `GetFramerate()`'s ring, a static of the client's that no reload or logout
             // resets: the feed hands a new VM its rate before the tick, and each world frame's
             // step joins the ring after its paint, standing for `CGWorldFrame::OnRender`
@@ -404,26 +439,35 @@ impl Plugin for UiScriptPlugin {
                     .after(WorldStage::Present)
                     .run_if(in_state(crate::client_state::ClientState::InWorld)),
             )
-            // The input pass hit-tests the rects the tick just resolved, and runs in-world only or
-            // on the stock glue screens.
+            // The input pass hit-tests the rects the last frame's paint resolved, as the reference's
+            // records meet the rects its last frame pass drained (`0x7656ba`, `0x765799`), and runs
+            // in-world only or on the stock glue screens.
             .init_resource::<UiPassState>()
             .add_systems(
                 Update,
                 (
-                    extract::tick_script,
                     input::feed_ui_input.run_if(
                         in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
                     ),
                     input::feed_ui_wheel.run_if(
                         in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
                     ),
-                    // Off the walk that just ran, for the pick and the arbiter after the pass.
-                    crate::vplates::seed_plate_hover,
                 )
                     .chain()
                     .in_set(UiInput)
                     // So a key a focused box consumed never also fires a binding.
                     .before(crate::bindings::BindingSet),
+            )
+            .add_systems(
+                Update,
+                (
+                    extract::tick_script,
+                    // After the input pass's hover walk and the pump's leaves and re-pick, for the
+                    // pick after the pass.
+                    crate::vplates::seed_plate_hover,
+                )
+                    .chain()
+                    .in_set(UiTick),
             )
             // After the plate driver seats this frame's nameplates, and before the append lane
             // fills the widget slot this pass parks.
@@ -449,7 +493,7 @@ impl Plugin for UiScriptPlugin {
                 Update,
                 (
                     // After the tick whose Lua called its verbs.
-                    glue_mgr::drive_glue_mgr.after(UiInput),
+                    glue_mgr::drive_glue_mgr.in_set(crate::ui_script::UiDrain),
                     // Off the roster and the screen the manager and the tick just moved.
                     glue_scene::feed_stock_glue_preview.in_set(crate::portrait::GluePreviewFeed),
                     // Each reads only its message, so no state orders it but the sets.
@@ -472,6 +516,26 @@ impl Plugin for UiScriptPlugin {
     }
 }
 
+/// The mouse and key feed once, for a test over the whole client: the input pass's Lua, with the
+/// call host the world lends.
+#[cfg(test)]
+pub(crate) fn feed_input_once(world: &mut World) {
+    use bevy::ecs::system::RunSystemOnce;
+    world
+        .run_system_once(input::feed_ui_input)
+        .expect("the input feeds");
+}
+
+/// The tick once, for a test over the whole client: the `OnUpdate` pump's Lua, with the call host
+/// the world lends.
+#[cfg(test)]
+pub(crate) fn tick_once(world: &mut World) {
+    use bevy::ecs::system::RunSystemOnce;
+    world
+        .run_system_once(extract::tick_script)
+        .expect("the tick runs");
+}
+
 /// Whether a capture includes the player UI: world baselines stay UI-free unless
 /// [`crate::run_mode::capture_ui_opted_in`], which the UI load and window size also read.
 fn capture_ui_active(capture: Option<Res<crate::run_mode::CaptureMode>>) -> bool {
@@ -491,8 +555,8 @@ fn arbitrate_pointer_over_ui(
 /// The session lifecycle: the VM's birth, identity, death and reload.
 mod lifecycle;
 pub(crate) use lifecycle::{
-    end_ui_session, ingame_ui_up, run_pending_reload, setup_script, strings_vm, AddOnIdentity,
-    PendingEntryUiLoad, ReloadUiPending,
+    ingame_ui_up, run_pending_reload, setup_script, strings_vm, AddOnIdentity, PendingEntryUiLoad,
+    ReloadUiPending, SessionEnd,
 };
 /// The leave-world sweep `0x490a80`: its latch, its schedule and its legs' order.
 mod sweep;
@@ -511,7 +575,7 @@ pub(crate) use lifecycle::load_ingame_ui_on_world_entry;
 use lifecycle::shutdown_on_exit;
 #[cfg(test)]
 pub(crate) use lifecycle::{
-    finish_ui_load, is_emote_token_line, seat_from_roster, shutdown_ui_state,
+    end_ui_session, finish_ui_load, is_emote_token_line, seat_from_roster, shutdown_ui_state,
 };
 
 /// The 30 world-frame times `GetFramerate()` averages (`0xc631c8`).
@@ -519,225 +583,229 @@ pub(crate) use lifecycle::{
 struct WorldFrameTimes(benilla_ui::script::FrameTimeRing);
 
 /// `GetFramerate()`'s rate as the ring stands, for the tick about to run.
-fn feed_framerate(script: Option<NonSendMut<UiScript>>, times: Res<WorldFrameTimes>) {
-    if let Some(mut script) = script {
-        script.set_framerate(times.0.rate());
-    }
+fn feed_framerate(mut hosted_vm: crate::script_calls::HostedVm, times: Res<WorldFrameTimes>) {
+    hosted_vm.run(|script| {
+        if let Some(script) = script {
+            script.set_framerate(times.0.rate());
+        }
+    })
 }
 
-/// One world frame's step into the ring (`0x672700`), the elapsed every `OnUpdate` was handed.
+/// One world frame's step into the ring (`0x672700`), the elapsed every `OnUpdate` was handed;
+/// [`feed_framerate`] hands the VM the rate before the next tick reads it.
 fn record_world_frame_time(
-    script: Option<NonSendMut<UiScript>>,
     step: Res<benilla_world::frame_pace::FrameStep>,
     mut times: ResMut<WorldFrameTimes>,
 ) {
     times.0.push(step.delta.as_secs_f32());
-    if let Some(mut script) = script {
-        script.set_framerate(times.0.rate());
-    }
 }
 
 /// Synthetic player and target snapshots for a server-less UI capture, and its first events once.
-fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<bool>>) {
-    /// The synthetic target's guid: a creature high part; only its distinctness matters.
-    const DEMO_TARGET_GUID: u64 = 0xF130_0000_0000_0001;
+fn demo_unit_feed(mut hosted_vm: crate::script_calls::HostedVm, mut fired: Local<VmMemo<bool>>) {
+    hosted_vm.run(|script| {
+        /// The synthetic target's guid: a creature high part; only its distinctness matters.
+        const DEMO_TARGET_GUID: u64 = 0xF130_0000_0000_0001;
 
-    let Some(mut script) = script else {
-        return;
-    };
-    // Session-keyed: a fresh VM needs the one-shot events and bar seeds again.
-    let fired = fired.get(&script);
-    // Debug (`WOW_CAPTURE_REHOVER=1`): re-fire the world hover every frame, a flapping raycast.
-    if std::env::var("WOW_CAPTURE_REHOVER").as_deref() == Ok("1") {
-        script.world_tooltip_unit("mouseover");
-    }
-    script.set_unit(
-        "player",
-        Some(UnitState {
-            exists: true,
-            name: Some("Benilla".into()),
-            health: 72,
-            max_health: 100,
-            level: 12,
-            power_type: 0, // mana
-            power: 45,
-            max_power: 80,
-            dead: false,
-            reaction: 0, // own avatar: no reaction to itself
-            // Race/class so the ui-char capture's level line reads "Level 12 Night Elf Warrior".
-            race: Some("Night Elf".into()),
-            race_file: Some("NightElf".into()),
-            class: Some("Warrior".into()),
-            class_file: Some("WARRIOR".into()),
-            sex: 2,
-            is_player: true,
-            player_controlled: true,
-            ..Default::default()
-        }),
-    );
-    script.set_unit(
-        "target",
-        Some(UnitState {
-            exists: true,
-            name: Some("Young Wolf".into()),
-            health: 30,
-            max_health: 50,
-            level: 3,
-            // A powerless beast (maxPower 0): exercises the power-bar-hide path in the capture.
-            power_type: 0,
-            power: 0,
-            max_power: 0,
-            dead: false,
-            reaction: 4, // neutral: yellow (UnitReactionColor[4])
-            // A beast: no race/class tokens (UnitRace/UnitClass report the absent shape).
-            race: None,
-            race_file: None,
-            class: None,
-            class_file: None,
-            sex: 0,
-            // The tooltip's level line reads "Level 3 Beast".
-            creature_type_name: Some("Beast".into()),
-            // `GetComboPoints` reports only points banked on the current target's guid.
-            guid: DEMO_TARGET_GUID,
-            ..Default::default()
-        }),
-    );
-    // The combo dots need a rogue and banked points, seeded only for `ui-combopoints`.
-    if std::env::var("WOW_CAPTURE").as_deref() == Ok("ui-combopoints") {
-        script.set_player_req_state(benilla_ui::script::PlayerReqState {
-            level: 12,
-            class_id: 4, // rogue
-            ..Default::default()
-        });
-        script.set_combo_points(4, DEMO_TARGET_GUID);
-        script.fire_event("PLAYER_COMBO_POINTS", vec![]);
-    }
-    if !*fired {
-        // Battle-stance page slots (actions 73..); slot 80 is a consumable stack of 5, since stock
-        // `ActionButton_UpdateCount` shows only a consumable's count (`ActionButton.lua:287`).
-        script.set_bonus_bar_offset(1);
-        // A macro on button 4; a capture has no character for `ui_macro::load_macros` to read.
-        script.set_macros(benilla_ui::script::MacroState {
-            account: vec![benilla_ui::script::MacroView {
-                name: "spawn".into(),
-                texture: Some("Interface\\Icons\\Ability_Racial_Cannibalize".into()),
-                body: ".spawn 16032".into(),
-                local_only: false,
-            }],
-            character: Vec::new(),
-        });
-        for (action, icon, kind, id, count) in [
-            (
-                73,
-                "Interface\\Icons\\Ability_SteelMelee",
-                0x00u8,
-                100u32,
-                0u32,
-            ),
-            (74, "Interface\\Icons\\Ability_Rogue_Ambush", 0x00, 101, 0),
-            (
-                75,
-                "Interface\\Icons\\Ability_Warrior_BattleShout",
-                0x00,
-                102,
-                0,
-            ),
-            (
-                76,
-                "Interface\\Icons\\Ability_Racial_Cannibalize",
-                0x40,
-                1,
-                0,
-            ),
-            (80, "Interface\\Icons\\INV_Misc_Food_16", 0x80, 117, 5),
-            (84, "Interface\\Icons\\Spell_Holy_SealOfMight", 0x00, 103, 0),
-            // BottomLeft is actions 61..72, BottomRight 49..60; an empty multibar well hides.
-            (
-                61,
-                "Interface\\Icons\\Spell_Nature_Regenerate",
-                0x00,
-                104,
-                0,
-            ),
-            (62, "Interface\\Icons\\Spell_Shadow_Curse", 0x00, 105, 0),
-            (
-                72,
-                "Interface\\Icons\\Spell_Frost_FrostBolt02",
-                0x00,
-                106,
-                0,
-            ),
-            (49, "Interface\\Icons\\Spell_Fire_FlameBolt", 0x00, 107, 0),
-            (60, "Interface\\Icons\\Spell_Holy_Heal", 0x00, 108, 0),
-        ] {
-            script.set_action(
-                action,
-                Some(ActionSlot {
-                    texture: Some(icon.into()),
-                    kind,
-                    action: id,
-                    count,
-                    // The seed's only item slot is the food stack, which is consumable.
-                    consumable: kind == 0x80,
-                    use_spell: None,
-                }),
-            );
-            // Server-less a slot has no usable state; a live bar's resting state is usable.
-            script.set_action_state(
-                action,
-                Some(benilla_ui::script::ActionState {
-                    usable: true,
+        let Some(script) = script else {
+            return;
+        };
+        // Session-keyed: a fresh VM needs the one-shot events and bar seeds again.
+        let fired = fired.get(script);
+        // Debug (`WOW_CAPTURE_REHOVER=1`): re-fire the world hover every frame, a flapping raycast.
+        if std::env::var("WOW_CAPTURE_REHOVER").as_deref() == Ok("1") {
+            script.world_tooltip_unit("mouseover");
+        }
+        script.set_unit(
+            "player",
+            Some(UnitState {
+                exists: true,
+                name: Some("Benilla".into()),
+                health: 72,
+                max_health: 100,
+                level: 12,
+                power_type: 0, // mana
+                power: 45,
+                max_power: 80,
+                dead: false,
+                reaction: 0, // own avatar: no reaction to itself
+                // Race/class so the ui-char capture's level line reads "Level 12 Night Elf
+                // Warrior".
+                race: Some("Night Elf".into()),
+                race_file: Some("NightElf".into()),
+                class: Some("Warrior".into()),
+                class_file: Some("WARRIOR".into()),
+                sex: 2,
+                is_player: true,
+                player_controlled: true,
+                ..Default::default()
+            }),
+        );
+        script.set_unit(
+            "target",
+            Some(UnitState {
+                exists: true,
+                name: Some("Young Wolf".into()),
+                health: 30,
+                max_health: 50,
+                level: 3,
+                // A powerless beast (maxPower 0): exercises the power-bar-hide path in the capture.
+                power_type: 0,
+                power: 0,
+                max_power: 0,
+                dead: false,
+                reaction: 4, // neutral: yellow (UnitReactionColor[4])
+                // A beast: no race/class tokens (UnitRace/UnitClass report the absent shape).
+                race: None,
+                race_file: None,
+                class: None,
+                class_file: None,
+                sex: 0,
+                // The tooltip's level line reads "Level 3 Beast".
+                creature_type_name: Some("Beast".into()),
+                // `GetComboPoints` reports only points banked on the current target's guid.
+                guid: DEMO_TARGET_GUID,
+                ..Default::default()
+            }),
+        );
+        // The combo dots need a rogue and banked points, seeded only for `ui-combopoints`.
+        if std::env::var("WOW_CAPTURE").as_deref() == Ok("ui-combopoints") {
+            script.set_player_req_state(benilla_ui::script::PlayerReqState {
+                level: 12,
+                class_id: 4, // rogue
+                ..Default::default()
+            });
+            script.set_combo_points(4, DEMO_TARGET_GUID);
+            script.fire_event("PLAYER_COMBO_POINTS", vec![]);
+        }
+        if !*fired {
+            // Battle-stance page slots (actions 73..); slot 80 is a consumable stack of 5, since
+            // stock `ActionButton_UpdateCount` shows only a consumable's count
+            // (`ActionButton.lua:287`).
+            script.set_bonus_bar_offset(1);
+            // A macro on button 4; a capture has no character for `ui_macro::load_macros` to read.
+            script.set_macros(benilla_ui::script::MacroState::from_scopes(
+                vec![benilla_ui::script::MacroView {
+                    name: "spawn".into(),
+                    texture: Some("Interface\\Icons\\Ability_Racial_Cannibalize".into()),
+                    body: ".spawn 16032".into(),
                     ..Default::default()
-                }),
-            );
-        }
-        // The stance bar: battle active (bonus offset 1), defensive uncastable, berserker cooling.
-        script.set_shapeshift_forms(vec![
-            benilla_ui::script::ShapeshiftFormView {
-                spell_id: 2457,
-                texture: Some("Interface\\Icons\\Ability_Warrior_OffensiveStance".into()),
-                name: "Battle Stance".into(),
-                active: true,
-                castable: true,
-                cooldown: None,
-            },
-            benilla_ui::script::ShapeshiftFormView {
-                spell_id: 71,
-                texture: Some("Interface\\Icons\\Ability_Warrior_DefensiveStance".into()),
-                name: "Defensive Stance".into(),
-                active: false,
-                castable: false,
-                cooldown: None,
-            },
-            benilla_ui::script::ShapeshiftFormView {
-                spell_id: 2458,
-                texture: Some("Interface\\Icons\\Ability_Racial_Avatar".into()),
-                name: "Berserker Stance".into(),
-                active: false,
-                castable: true,
-                cooldown: Some((900, 1500, true)),
-            },
-        ]);
-        script.fire_event("UPDATE_SHAPESHIFT_FORMS", vec![]);
-        // 70% XP, set before the world-enter events so the bar's first update reads it.
-        script.set_player_xp(4200, 6000);
-        script.fire_world_enter();
-        // The bottom multibars ship off and a capture has no toggle byte, so raise them as the
-        // Options rows do; `WOW_DEMO_BOTTOM_BARS=0` leaves them down for the stance shelf art,
-        // which `ShapeshiftBar_UpdatePosition` hides under the bottom-left bar.
-        if std::env::var("WOW_DEMO_BOTTOM_BARS").as_deref() != Ok("0") {
-            let _ = script.run(
-                "SHOW_MULTI_ACTIONBAR_1 = 1 SHOW_MULTI_ACTIONBAR_2 = 1 \
+                }],
+                Vec::new(),
+            ));
+            for (action, icon, kind, id, count) in [
+                (
+                    73,
+                    "Interface\\Icons\\Ability_SteelMelee",
+                    0x00u8,
+                    100u32,
+                    0u32,
+                ),
+                (74, "Interface\\Icons\\Ability_Rogue_Ambush", 0x00, 101, 0),
+                (
+                    75,
+                    "Interface\\Icons\\Ability_Warrior_BattleShout",
+                    0x00,
+                    102,
+                    0,
+                ),
+                (
+                    76,
+                    "Interface\\Icons\\Ability_Racial_Cannibalize",
+                    0x40,
+                    1,
+                    0,
+                ),
+                (80, "Interface\\Icons\\INV_Misc_Food_16", 0x80, 117, 5),
+                (84, "Interface\\Icons\\Spell_Holy_SealOfMight", 0x00, 103, 0),
+                // BottomLeft is actions 61..72, BottomRight 49..60; an empty multibar well hides.
+                (
+                    61,
+                    "Interface\\Icons\\Spell_Nature_Regenerate",
+                    0x00,
+                    104,
+                    0,
+                ),
+                (62, "Interface\\Icons\\Spell_Shadow_Curse", 0x00, 105, 0),
+                (
+                    72,
+                    "Interface\\Icons\\Spell_Frost_FrostBolt02",
+                    0x00,
+                    106,
+                    0,
+                ),
+                (49, "Interface\\Icons\\Spell_Fire_FlameBolt", 0x00, 107, 0),
+                (60, "Interface\\Icons\\Spell_Holy_Heal", 0x00, 108, 0),
+            ] {
+                script.set_action(
+                    action,
+                    Some(ActionSlot {
+                        texture: Some(icon.into()),
+                        kind,
+                        action: id,
+                        count,
+                        // The seed's only item slot is the food stack, which is consumable.
+                        consumable: kind == 0x80,
+                        use_spell: None,
+                    }),
+                );
+                // Server-less a slot has no usable state; a live bar's resting state is usable.
+                script.set_action_state(
+                    action,
+                    Some(benilla_ui::script::ActionState {
+                        usable: true,
+                        ..Default::default()
+                    }),
+                );
+            }
+            // The stance bar: battle active (bonus offset 1), defensive uncastable, berserker
+            // cooling.
+            script.set_shapeshift_forms(vec![
+                benilla_ui::script::ShapeshiftFormView {
+                    spell_id: 2457,
+                    texture: Some("Interface\\Icons\\Ability_Warrior_OffensiveStance".into()),
+                    name: "Battle Stance".into(),
+                    active: true,
+                    castable: true,
+                    cooldown: None,
+                },
+                benilla_ui::script::ShapeshiftFormView {
+                    spell_id: 71,
+                    texture: Some("Interface\\Icons\\Ability_Warrior_DefensiveStance".into()),
+                    name: "Defensive Stance".into(),
+                    active: false,
+                    castable: false,
+                    cooldown: None,
+                },
+                benilla_ui::script::ShapeshiftFormView {
+                    spell_id: 2458,
+                    texture: Some("Interface\\Icons\\Ability_Racial_Avatar".into()),
+                    name: "Berserker Stance".into(),
+                    active: false,
+                    castable: true,
+                    cooldown: Some((900, 1500, true)),
+                },
+            ]);
+            script.fire_event("UPDATE_SHAPESHIFT_FORMS", vec![]);
+            // 70% XP, set before the world-enter events so the bar's first update reads it.
+            script.set_player_xp(4200, 6000);
+            script.fire_world_enter();
+            // The bottom multibars ship off and a capture has no toggle byte, so raise them as the
+            // Options rows do; `WOW_DEMO_BOTTOM_BARS=0` leaves them down for the stance shelf art,
+            // which `ShapeshiftBar_UpdatePosition` hides under the bottom-left bar.
+            if std::env::var("WOW_DEMO_BOTTOM_BARS").as_deref() != Ok("0") {
+                let _ = script.run(
+                    "SHOW_MULTI_ACTIONBAR_1 = 1 SHOW_MULTI_ACTIONBAR_2 = 1 \
                  if MultiActionBar_Update then MultiActionBar_Update() end",
-            );
+                );
+            }
+            script.fire_event("PLAYER_XP_UPDATE", vec![ScriptValue::Str("player".into())]);
+            for token in ["player", "target"] {
+                script.fire_event("UNIT_HEALTH", vec![ScriptValue::Str(token.into())]);
+            }
+            script.fire_event("PLAYER_TARGET_CHANGED", vec![]);
+            *fired = true;
         }
-        script.fire_event("PLAYER_XP_UPDATE", vec![ScriptValue::Str("player".into())]);
-        for token in ["player", "target"] {
-            script.fire_event("UNIT_HEALTH", vec![ScriptValue::Str(token.into())]);
-        }
-        script.fire_event("PLAYER_TARGET_CHANGED", vec![]);
-        *fired = true;
-    }
+    })
 }
 
 /// A test font engine: every character `.0` wide, 12 tall per line, greedily wrapped.
@@ -804,6 +872,8 @@ mod cinematic_tests;
 mod glue_input_tests;
 #[cfg(test)]
 mod key_walk_tests;
+#[cfg(test)]
+mod tick_order_tests;
 
 #[cfg(test)]
 mod cast_tests;

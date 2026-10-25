@@ -3,8 +3,9 @@
 //! `0x50c089`) and the targeting and posture verbs of the main table `0x83de68` (loop
 //! `0x49027c`). A key and its Lua function share one path: a held command's Start and Stop are the
 //! key's press and release ([`HeldInput`]), a one-shot command fires as its key does
-//! ([`FiredInput`]), and the targeting and attack calls go through the call queue
-//! ([`ScriptCall`]), so a macro's `TargetNearestEnemy()` then `/cast` casts at the new target.
+//! ([`FiredInput`]), and the targeting and attack calls are script calls ([`ScriptCall`]),
+//! applied inside the verb, so a macro's `TargetNearestEnemy()` then `/cast` casts at the new
+//! target.
 //!
 //! Every movement function but the mouselook three opens on the protected-action gate `0x494a50`
 //! with tag 0 ([`protected`]), which is all twenty-three of its tag-0 callers. The four
@@ -13,7 +14,7 @@
 
 use mlua::{Lua, MultiValue, Value};
 
-use super::binding_abi::{bool_or_default, flag};
+use super::binding_abi::{bool_or_default, flag, flag_or_default};
 use super::calls::{NearestMode, ScriptCall};
 use super::protected::{self, Event, Tag};
 use super::{Model, UiScript};
@@ -38,6 +39,50 @@ pub enum HeldInput {
     TurnOrAction,
     /// `0x2`, `CameraOrSelectOrMoveStart`/`Stop` (`0x514190`/`0x5141d0`), the left button's.
     CameraOrSelectOrMove,
+    /// `0x400`, `PitchUpStart`/`Stop` (`0x514060`/`0x514090`).
+    PitchUp,
+    /// `0x800`, `PitchDownStart`/`Stop` (`0x5140c0`/`0x5140f0`).
+    PitchDown,
+}
+
+/// One of the camera's six keyboard axes (`0x5112d0`), in the order of the index `0x50fd40` and
+/// `0x50fd90` take: the `MoveView*` pairs of the camera table `0x84f7a0` (`0x50b4a0`-`0x50b590`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewAxis {
+    /// 0, `MoveViewInStart`/`Stop`: the distance falls.
+    In,
+    /// 1, `MoveViewOutStart`/`Stop`: the distance rises.
+    Out,
+    /// 2, `MoveViewRightStart`/`Stop`: the yaw rises.
+    Right,
+    /// 3, `MoveViewLeftStart`/`Stop`: the yaw falls.
+    Left,
+    /// 4, `MoveViewUpStart`/`Stop`: the pitch rises, the camera climbing to look down.
+    Up,
+    /// 5, `MoveViewDownStart`/`Stop`: the pitch falls.
+    Down,
+}
+
+/// A call for the camera's look session, in call order: the calls that pass no gate, and the
+/// fourth argument a mouse bit's release hands `0x515090`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookCall {
+    /// `MouselookStart` (`true`) or `MouselookStop`.
+    Mouselook(bool),
+    /// `ToggleMouseMove()` (`0x50b5a0` → `0x50f910`): leave mouselook when the camera is in it,
+    /// else enter it with no button held.
+    ToggleMouseMove,
+    /// A gated `TurnOrActionStop` (`false`) or `CameraOrSelectOrMoveStop(sticky)`: the argument
+    /// `0x514b70` passes to `0x50f940` when the release leaves no mouse bit held (`0x514c48`).
+    MouseRelease { sticky: bool },
+}
+
+/// A posture verb the host applies inside its call ([`ScriptCall::Posture`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostureCall {
+    /// `SitOrStand()` (`0x48b920`): `SetStandState(1)` on the active player when its stand state
+    /// byte is 0, else `SetStandState(0)` (`0x5ed430`).
+    SitOrStand,
 }
 
 /// A one-shot command, fired as its key fires it.
@@ -49,8 +94,6 @@ pub enum FiredInput {
     ToggleRun,
     /// `ToggleAutoRun()` (`0x513de0`), which toggles `0x1000`.
     ToggleAutoRun,
-    /// `SitOrStand()` (`0x48b920`): sit when standing, else stand (`0x5ed430(1)` or `(0)`).
-    SitOrStand,
     /// `ToggleSheath()` (`0x48a070` → `0x5eb480`).
     ToggleSheath,
     /// `CameraZoomIn([yards])` (`0x50b400` → `0x50fc60`), 1.0 when absent.
@@ -65,6 +108,10 @@ pub enum BindingInput {
     Start(HeldInput),
     Stop(HeldInput),
     Fire(FiredInput),
+    /// `MoveView*Start`: `0x50fd40(axis, time, 0)`.
+    ViewStart(ViewAxis),
+    /// `MoveView*Stop`: `0x50fd90(axis, time)`.
+    ViewStop(ViewAxis),
 }
 
 /// The VM's half of the binding functions.
@@ -75,8 +122,8 @@ pub(crate) struct InputState {
     /// `[InputControl+4] & 1`, the TurnOrAction channel `IsMouselooking` tests (`0x514278`), as
     /// the app pushed it or a `MouselookStart`/`Stop` since moved it.
     turn_or_action: bool,
-    /// The `MouselookStart` (`true`) and `MouselookStop` calls since the app last drained them.
-    mouselook: Vec<bool>,
+    /// The look-session calls since the app last drained them.
+    look: Vec<LookCall>,
 }
 
 impl UiScript {
@@ -98,7 +145,9 @@ impl UiScript {
     /// no such command, or a release of one that is not `runOnUp`.
     pub fn execute_binding(&self, command: &str, down: bool) -> mlua::Result<bool> {
         let _event = protected::raise(self.lua(), Event::Binding);
-        super::keybind::run_command(&self.lua, command, down)
+        super::host::unheld(&self.lua, || {
+            super::keybind::run_command(&self.lua, command, down)
+        })
     }
 
     /// Push whether the TurnOrAction channel is held: the world holds the right mouse button, or
@@ -107,10 +156,10 @@ impl UiScript {
         self.model_mut().input.turn_or_action = held;
     }
 
-    /// Take the `MouselookStart` (`true`) and `MouselookStop` calls made since the last call, in
-    /// call order, for the app's look session.
-    pub fn take_mouselook_calls(&mut self) -> Vec<bool> {
-        std::mem::take(&mut self.model_mut().input.mouselook)
+    /// Take the look-session calls made since the last call, in call order, for the app's look
+    /// session.
+    pub fn take_look_calls(&mut self) -> Vec<LookCall> {
+        std::mem::take(&mut self.model_mut().input.look)
     }
 }
 
@@ -124,9 +173,13 @@ fn push(lua: &Lua, input: BindingInput) {
     model.input.queue.push(input);
 }
 
-fn push_call(lua: &Lua, call: ScriptCall) {
+fn push_look(lua: &Lua, call: LookCall) {
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-    model.queue_call(call);
+    model.input.look.push(call);
+}
+
+fn push_call(lua: &Lua, call: ScriptCall) -> mlua::Result<()> {
+    super::calls::submit(lua, call)
 }
 
 /// A zoom's optional amount: `0x6f34d0` (is-number, a numeric string passes) then `0x6f3620`,
@@ -140,25 +193,15 @@ fn zoom_amount(lua: &Lua, v: Option<Value>) -> Option<f32> {
     n.is_finite().then_some(n)
 }
 
-/// Register a function that takes any arguments and does nothing: the mechanism behind it is not
-/// built, so the call is answered with the reference's zero results and no effect.
-fn inert(lua: &Lua, names: &[&str]) -> mlua::Result<()> {
-    let g = lua.globals();
-    for name in names {
-        g.set(*name, lua.create_function(|_, _: MultiValue| Ok(()))?)?;
-    }
-    Ok(())
-}
-
 /// Register the 49 functions: the three tables' 48 and `TargetNearestFriend`.
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
     // ── The movement table `0x8500b8` ──────────────────────────────────────────────────────
-    // Each Start/Stop is `0x494a50(0)` ([`gate`]), then `0x515090(bit, set, time, 0)`; nothing is returned,
-    // and no argument is read but `CameraOrSelectOrMoveStop`'s sticky flag (`0x5141f6`), which
-    // nothing here acts on.
-    let held: [(&str, &str, HeldInput); 8] = [
+    // Each Start/Stop is `0x494a50(0)` ([`gate`]), then `0x515090(bit, set, time, 0)`; nothing is
+    // returned, and no argument is read but `CameraOrSelectOrMoveStop`'s sticky flag (`0x5141f6`),
+    // its fourth argument instead of 0.
+    let held: [(&str, &str, HeldInput); 10] = [
         (
             "MoveForwardStart",
             "MoveForwardStop",
@@ -190,6 +233,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             "CameraOrSelectOrMoveStop",
             HeldInput::CameraOrSelectOrMove,
         ),
+        // The pitch pair (`0x400`/`0x800`, `0x51406a`-`0x5140fa`), which the input tick's pitch
+        // emitter `0x515010` reads while the mover swims.
+        ("PitchUpStart", "PitchUpStop", HeldInput::PitchUp),
+        ("PitchDownStart", "PitchDownStop", HeldInput::PitchDown),
     ];
     for (start, stop, input) in held {
         g.set(
@@ -203,9 +250,21 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         )?;
         g.set(
             stop,
-            lua.create_function(move |lua, _: MultiValue| {
+            lua.create_function(move |lua, args: MultiValue| {
                 if gate(lua) {
                     push(lua, BindingInput::Stop(input));
+                    // A mouse bit's release carries its fourth argument to the camera: the sticky
+                    // flag through `0x6f1c10` with default 0 (`0x5141f6`), else 0 (`0x51417b`).
+                    match input {
+                        HeldInput::CameraOrSelectOrMove => {
+                            let sticky = flag_or_default(args.front(), 0) != 0;
+                            push_look(lua, LookCall::MouseRelease { sticky });
+                        }
+                        HeldInput::TurnOrAction => {
+                            push_look(lua, LookCall::MouseRelease { sticky: false });
+                        }
+                        _ => {}
+                    }
                 }
                 Ok(())
             })?,
@@ -248,24 +307,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             lua.create_function(move |lua, _: MultiValue| {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 model.input.turn_or_action = on;
-                model.input.mouselook.push(on);
-                Ok(())
-            })?,
-        )?;
-    }
-    // The pitch pair (`0x400`/`0x800`) opens on the same gate (`0x51406a`-`0x5140fa`) and acts on
-    // nothing here, since the mover has no keyboard pitch axis, so PITCHUP and PITCHDOWN (INSERT,
-    // DELETE) do nothing.
-    for name in [
-        "PitchUpStart",
-        "PitchUpStop",
-        "PitchDownStart",
-        "PitchDownStop",
-    ] {
-        g.set(
-            name,
-            lua.create_function(|lua, _: MultiValue| {
-                gate(lua);
+                model.input.look.push(LookCall::Mouselook(on));
                 Ok(())
             })?,
         )?;
@@ -290,27 +332,40 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
-    // Not built: the `MoveView*` pairs (`0x50b4a0`-`0x50b590`, `0x50fd40(direction, time, 0)` and
-    // `0x50fd90(direction, time)` for In, Out, Right, Left, Up, Down = 0..5), whose effect on the
-    // camera is not established; 1.12's own `MOVEVIEW*` bindings are commented out. And
-    // `ToggleMouseMove` (`0x50b5a0` → `0x50f910`), which toggles freelook with no button held.
-    inert(
-        lua,
-        &[
-            "MoveViewInStart",
-            "MoveViewInStop",
-            "MoveViewOutStart",
-            "MoveViewOutStop",
-            "MoveViewRightStart",
-            "MoveViewRightStop",
-            "MoveViewLeftStart",
-            "MoveViewLeftStop",
-            "MoveViewUpStart",
-            "MoveViewUpStop",
-            "MoveViewDownStart",
-            "MoveViewDownStop",
-            "ToggleMouseMove",
-        ],
+    // The `MoveView*` pairs (`0x50b4a0`-`0x50b590`) start and stop an axis on the world frame's
+    // camera at the last input time, `0x50fd40(axis, time, 0)` and `0x50fd90(axis, time)`; no
+    // gate, no argument read, nothing returned.
+    let axes: [(&str, &str, ViewAxis); 6] = [
+        ("MoveViewInStart", "MoveViewInStop", ViewAxis::In),
+        ("MoveViewOutStart", "MoveViewOutStop", ViewAxis::Out),
+        ("MoveViewRightStart", "MoveViewRightStop", ViewAxis::Right),
+        ("MoveViewLeftStart", "MoveViewLeftStop", ViewAxis::Left),
+        ("MoveViewUpStart", "MoveViewUpStop", ViewAxis::Up),
+        ("MoveViewDownStart", "MoveViewDownStop", ViewAxis::Down),
+    ];
+    for (start, stop, axis) in axes {
+        g.set(
+            start,
+            lua.create_function(move |lua, _: MultiValue| {
+                push(lua, BindingInput::ViewStart(axis));
+                Ok(())
+            })?,
+        )?;
+        g.set(
+            stop,
+            lua.create_function(move |lua, _: MultiValue| {
+                push(lua, BindingInput::ViewStop(axis));
+                Ok(())
+            })?,
+        )?;
+    }
+    // `ToggleMouseMove` (`0x50b5a0` → `0x50f910`): no gate, no argument, nothing returned.
+    g.set(
+        "ToggleMouseMove",
+        lua.create_function(|lua, _: MultiValue| {
+            push_look(lua, LookCall::ToggleMouseMove);
+            Ok(())
+        })?,
     )?;
 
     // ── The main table `0x83de68` ──────────────────────────────────────────────────────────
@@ -339,7 +394,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                         reverse,
                         may_cast,
                     },
-                );
+                )?;
                 Ok(())
             })?,
         )?;
@@ -349,7 +404,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "TargetLastTarget",
         lua.create_function(|lua, _: MultiValue| {
             let may_cast = protected::select_may_cast(lua);
-            push_call(lua, ScriptCall::TargetLastTarget { may_cast });
+            push_call(lua, ScriptCall::TargetLastTarget { may_cast })?;
             Ok(())
         })?,
     )?;
@@ -360,24 +415,26 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // of the attack has no gate.
             let may_pick = protected::gate(lua, Tag::TARGET);
             let may_cast = protected::select_may_cast(lua);
-            push_call(lua, ScriptCall::AttackTarget { may_pick, may_cast });
+            push_call(lua, ScriptCall::AttackTarget { may_pick, may_cast })?;
             Ok(())
         })?,
     )?;
     // `ToggleSheath()` and `SitOrStand()` resolve the active player and act on it, ungated.
-    let posture: [(&str, FiredInput); 2] = [
-        ("ToggleSheath", FiredInput::ToggleSheath),
-        ("SitOrStand", FiredInput::SitOrStand),
-    ];
-    for (name, input) in posture {
-        g.set(
-            name,
-            lua.create_function(move |lua, _: MultiValue| {
-                push(lua, BindingInput::Fire(input));
-                Ok(())
-            })?,
-        )?;
-    }
+    g.set(
+        "ToggleSheath",
+        lua.create_function(move |lua, _: MultiValue| {
+            push(lua, BindingInput::Fire(FiredInput::ToggleSheath));
+            Ok(())
+        })?,
+    )?;
+    // `SitOrStand()` (`0x48b920`): the host runs `SetStandState` inside the call, a sit when the
+    // stand state byte is 0, else a stand (`0x48b951`, `0x48b95b` → `0x5ed430`).
+    g.set(
+        "SitOrStand",
+        lua.create_function(|lua, _: MultiValue| {
+            push_call(lua, ScriptCall::Posture(PostureCall::SitOrStand))
+        })?,
+    )?;
     Ok(())
 }
 
@@ -440,7 +497,8 @@ mod tests {
 
     #[test]
     fn every_binding_function_is_a_global_that_answers() {
-        let s = UiScript::new().unwrap();
+        let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         for name in NAMES {
             let kind: String = s.eval(&format!("return type({name})")).unwrap();
             assert_eq!(kind, "function", "{name}");
@@ -474,11 +532,15 @@ mod tests {
         assert!(s.run_binding("error('boom')").is_err());
         s.run("TurnLeftStart()").unwrap();
         assert!(s.take_binding_input().is_empty());
+        s.keep_calls();
         s.run("SitOrStand() ToggleSheath() CameraZoomIn()").unwrap();
+        assert_eq!(
+            s.take_calls_like(&ScriptCall::Posture(PostureCall::SitOrStand)),
+            1
+        );
         assert_eq!(
             s.take_binding_input(),
             vec![
-                BindingInput::Fire(FiredInput::SitOrStand),
                 BindingInput::Fire(FiredInput::ToggleSheath),
                 BindingInput::Fire(FiredInput::CameraZoomIn(1.0)),
             ]
@@ -525,7 +587,7 @@ mod tests {
         let mut s = UiScript::new().unwrap();
         assert_eq!(s.arity("MouselookStart()").unwrap(), 0);
         s.run("MouselookStop()").unwrap();
-        s.take_mouselook_calls();
+        s.take_look_calls();
         let looking = |s: &UiScript| s.eval::<Option<i64>>("return IsMouselooking()").unwrap();
         s.run("MouselookStart()").unwrap();
         assert_eq!(
@@ -536,8 +598,11 @@ mod tests {
         s.run("MouselookStop() MouselookStart() MouselookStop()")
             .unwrap();
         assert_eq!(looking(&s), None);
-        assert_eq!(s.take_mouselook_calls(), vec![true, false, true, false]);
-        assert!(s.take_mouselook_calls().is_empty(), "drained");
+        assert_eq!(
+            s.take_look_calls(),
+            [true, false, true, false].map(LookCall::Mouselook)
+        );
+        assert!(s.take_look_calls().is_empty(), "drained");
         assert!(
             s.take_binding_input().is_empty(),
             "not a movement-binding call"
@@ -548,10 +613,111 @@ mod tests {
         assert_eq!(looking(&s), None);
     }
 
-    /// `TargetLastTarget` and `AttackTarget` join the call queue, in call order with the rest.
+    /// The `MoveView*` pairs (`0x50b4a0`-`0x50b590`) pass no gate and queue their axis, by the
+    /// index the camera table `0x84f7a0` gives each name: Right is 2 (`0x50b520`), Left 3.
+    #[test]
+    fn the_move_view_pairs_queue_their_axis_from_any_caller() {
+        let mut s = UiScript::new().unwrap();
+        s.run(
+            "MoveViewInStart() MoveViewOutStop() MoveViewRightStart() MoveViewLeftStop() \
+             MoveViewUpStart() MoveViewDownStop()",
+        )
+        .unwrap();
+        assert_eq!(
+            s.take_binding_input(),
+            vec![
+                BindingInput::ViewStart(ViewAxis::In),
+                BindingInput::ViewStop(ViewAxis::Out),
+                BindingInput::ViewStart(ViewAxis::Right),
+                BindingInput::ViewStop(ViewAxis::Left),
+                BindingInput::ViewStart(ViewAxis::Up),
+                BindingInput::ViewStop(ViewAxis::Down),
+            ]
+        );
+        for name in ["MoveViewInStart", "MoveViewDownStop"] {
+            assert_eq!(s.arity(&format!("{name}()")).unwrap(), 0, "{name}");
+        }
+    }
+
+    /// `ToggleMouseMove` (`0x50b5a0`) passes no gate and queues for the look session; it moves no
+    /// mouse bit, so `IsMouselooking` does not answer it.
+    #[test]
+    fn toggle_mouse_move_queues_for_the_look_session() {
+        let mut s = UiScript::new().unwrap();
+        assert_eq!(s.arity("ToggleMouseMove()").unwrap(), 0);
+        s.take_look_calls();
+        s.run("ToggleMouseMove() ToggleMouseMove()").unwrap();
+        assert_eq!(
+            s.take_look_calls(),
+            vec![LookCall::ToggleMouseMove, LookCall::ToggleMouseMove]
+        );
+        assert!(s
+            .eval::<Option<i64>>("return IsMouselooking()")
+            .unwrap()
+            .is_none());
+    }
+
+    /// `CameraOrSelectOrMoveStop`'s flag (`0x6f1c10` at `0x5141f6`, default 0) rides its release to
+    /// the camera; `TurnOrActionStop` hands 0 (`0x51417b`). Both behind the movement gate.
+    #[test]
+    fn a_mouse_release_carries_the_sticky_flag_to_the_camera() {
+        let mut s = UiScript::new().unwrap();
+        s.run("CameraOrSelectOrMoveStop(1)").unwrap();
+        assert!(
+            s.take_look_calls().is_empty(),
+            "the gate refuses it outside a binding"
+        );
+        s.run_binding(
+            "CameraOrSelectOrMoveStop(1) CameraOrSelectOrMoveStop() \
+             CameraOrSelectOrMoveStop(\"0\") TurnOrActionStop(1) CameraOrSelectOrMoveStart(1)",
+        )
+        .unwrap();
+        assert_eq!(
+            s.take_look_calls(),
+            vec![
+                LookCall::MouseRelease { sticky: true },
+                LookCall::MouseRelease { sticky: false },
+                LookCall::MouseRelease { sticky: false },
+                LookCall::MouseRelease { sticky: false },
+            ]
+        );
+        assert_eq!(
+            s.take_binding_input(),
+            vec![
+                BindingInput::Stop(HeldInput::CameraOrSelectOrMove),
+                BindingInput::Stop(HeldInput::CameraOrSelectOrMove),
+                BindingInput::Stop(HeldInput::CameraOrSelectOrMove),
+                BindingInput::Stop(HeldInput::TurnOrAction),
+                BindingInput::Start(HeldInput::CameraOrSelectOrMove),
+            ]
+        );
+    }
+
+    /// The pitch pair presses and releases bits `0x400` and `0x800` (`0x514060`, `0x5140c0`)
+    /// behind the movement gate.
+    #[test]
+    fn the_pitch_pair_moves_its_bits_inside_a_binding_body() {
+        let mut s = UiScript::new().unwrap();
+        s.run("PitchUpStart()").unwrap();
+        assert!(s.take_binding_input().is_empty());
+        s.run_binding("PitchUpStart() PitchDownStart() PitchUpStop() PitchDownStop()")
+            .unwrap();
+        assert_eq!(
+            s.take_binding_input(),
+            vec![
+                BindingInput::Start(HeldInput::PitchUp),
+                BindingInput::Start(HeldInput::PitchDown),
+                BindingInput::Stop(HeldInput::PitchUp),
+                BindingInput::Stop(HeldInput::PitchDown),
+            ]
+        );
+    }
+
+    /// `TargetLastTarget` and `AttackTarget` are script calls, made in call order with the rest.
     #[test]
     fn the_targeting_calls_join_the_call_queue_in_order() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.run(r#"TargetNearestEnemy(1) TargetLastTarget() AttackTarget() ClearTarget()"#)
             .unwrap();
         assert_eq!(
@@ -570,5 +736,43 @@ mod tests {
                 ScriptCall::ClearTarget,
             ]
         );
+    }
+
+    /// The TAB cyclers, `TargetLastTarget` and `AttackTarget` apply inside their call with a host
+    /// lent.
+    #[test]
+    fn the_targeting_keys_apply_in_the_call_with_a_host_lent() {
+        let mut s = UiScript::new().unwrap();
+        let calls = crate::script::host::test_support::applied_in_call(
+            &mut s,
+            "TargetNearestEnemy() TargetNearestFriend() TargetNearestPartyMember() \
+             TargetNearestRaidMember() TargetLastTarget() AttackTarget()",
+        );
+        let modes: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                ScriptCall::TargetNearest { mode, .. } => Some(*mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            modes,
+            [
+                NearestMode::Enemy,
+                NearestMode::Friend,
+                NearestMode::PartyMember,
+                NearestMode::RaidMember
+            ]
+        );
+        assert!(matches!(
+            calls[4..],
+            [
+                ScriptCall::TargetLastTarget { may_cast: true },
+                ScriptCall::AttackTarget {
+                    may_pick: true,
+                    may_cast: true
+                }
+            ]
+        ));
     }
 }
