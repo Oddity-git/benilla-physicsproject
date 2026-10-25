@@ -480,6 +480,7 @@ fn start_ragdolls(
             .map_or(STIFFNESS, |v| v.clamp(0.0, 1.0));
         // A heavy killing blow takes limbs off, when the option allows.
         let severed = if debris && dead && knock.is_none() {
+            commands.entity(unit).try_insert(super::dismember::Crumbling);
             // Fork: an elemental comes apart entirely, every rock and arm off the hub. Only the
             // bodies on the hub: a piece cut inside another would draw the same skin twice and
             // stretch it between the two.

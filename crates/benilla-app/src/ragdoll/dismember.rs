@@ -137,6 +137,10 @@ pub(super) struct LimbPart {
     pub(super) mesh: Handle<Mesh>,
 }
 
+/// Fork: on a unit that comes apart whole (an elemental's rocks).
+#[derive(Component)]
+pub(super) struct Crumbling;
+
 /// On a limb copy's palette holder: the unit it was cut from.
 #[derive(Component)]
 struct LimbHolder(Entity);
@@ -270,6 +274,7 @@ pub(super) fn heal(commands: &mut Commands, unit: Entity) {
 /// What a limb copy takes from each of its unit's skinned parts: the mesh, or the parked one of a
 /// part a blood stain or the body sway hides and draws a copy of instead.
 type SkinnedPart = (
+    &'static Visibility,
     Option<&'static Mesh3d>,
     Option<&'static ParkedMesh>,
     &'static MeshMaterial3d<WowModelMaterial>,
@@ -280,7 +285,7 @@ type SkinnedPart = (
 /// Gives each severed limb a second palette slot and a copy of the unit's skinned parts on it.
 fn build_limb_copies(
     mut commands: Commands,
-    mut units: Query<(Entity, &mut Dismembered, &RigSkin, &Children)>,
+    mut units: Query<(Entity, &mut Dismembered, &RigSkin, &Children, Has<Crumbling>)>,
     parts: Query<SkinnedPart, With<RigPart>>,
     mut palettes: ResMut<RigPalettes>,
     materials: Res<Assets<WowModelMaterial>>,
@@ -298,7 +303,7 @@ fn build_limb_copies(
                     .contains("objectcomponents/cape")
             })
     };
-    for (unit, mut cut, skin, children) in &mut units {
+    for (unit, mut cut, skin, children, crumbling) in &mut units {
         for limb in cut.limbs.iter_mut().filter(|l| !l.tried) {
             limb.tried = true;
             let Some(copy_skin) =
@@ -319,9 +324,15 @@ fn build_limb_copies(
                 .id();
             let mut copied = 0;
             for child in children.iter() {
-                let Ok((mesh, parked, material, tag, part)) = parts.get(child) else {
+                let Ok((visibility, mesh, parked, material, tag, part)) = parts.get(child) else {
                     continue;
                 };
+                // Fork: the spare geometry a model keeps hidden (an elemental's extra bracers)
+                // would show on the copy, which draws every part. An elemental takes no stain or
+                // sway, so a part hidden now is the model's own doing.
+                if crumbling && parked.is_none() && *visibility == Visibility::Hidden {
+                    continue;
+                }
                 // A part hidden long enough is parked: its mesh moved off it, so a bloodied or
                 // swaying unit's limb would otherwise copy nothing and vanish.
                 let Some(mesh) = mesh.map(|m| m.0.clone()).or(parked.map(|p| p.0.clone())) else {
