@@ -362,6 +362,21 @@ fn start_ragdolls(
                 &rig.parents,
             );
         }
+        if debris && dumped.insert(net.display_id) {
+            let bones: Vec<String> = rig
+                .binds
+                .iter()
+                .zip(&rig.parents)
+                .enumerate()
+                .map(|(i, (b, p))| format!("{i}:{p}:{:.2},{:.2},{:.2}", b.x, b.y, b.z))
+                .collect();
+            info!(
+                "ragdoll: elemental display {:?} has {} bodies; skeleton: {}",
+                net.display_id,
+                built.as_ref().map_or(0, |p| p.bodies.len()),
+                bones.join(" ")
+            );
+        }
         let Some(mut profile) = built else {
             info!(
                 "ragdoll: unit {unit} (display {:?}) has too few limbs to ragdoll ({} bones)",
