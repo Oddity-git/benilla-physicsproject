@@ -480,8 +480,12 @@ fn start_ragdolls(
             .map_or(STIFFNESS, |v| v.clamp(0.0, 1.0));
         // A heavy killing blow takes limbs off, when the option allows.
         let severed = if debris && dead && knock.is_none() {
-            // Fork: an elemental comes apart entirely, every rock off the hub.
-            (1..profile.bodies.len()).collect()
+            // Fork: an elemental comes apart entirely, every rock and arm off the hub. Only the
+            // bodies on the hub: a piece cut inside another would draw the same skin twice and
+            // stretch it between the two.
+            (1..profile.bodies.len())
+                .filter(|&k| profile.bodies[k].parent == Some(0))
+                .collect()
         } else if dismember && knock.is_none() && !frozen {
             // The Dismemberment Amount slider makes a lighter blow count as a heavier one.
             let ease = cvars

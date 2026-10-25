@@ -423,7 +423,7 @@ pub(super) fn pose_limbs(
                     let mut local = rig.locals[i];
                     // The fold below leaves a limb root at `TINY`, and the pose keeps scale from
                     // frame to frame, so the piece itself is drawn at full size.
-                    if cut.limbs.iter().any(|l| l.root == i) {
+                    if local.scale == Vec3::splat(TINY) && cut.limbs.iter().any(|l| l.root == i) {
                         local.scale = Vec3::ONE;
                     }
                     let local = local.compute_affine();
@@ -474,7 +474,10 @@ pub(super) fn pose_limbs(
             let bind = rig.binds.get(limb.root).copied();
             if let (Some(local), Some(bind)) = (rig.locals.get_mut(limb.root), bind) {
                 local.translation = bind;
-                local.scale = Vec3::splat(TINY);
+                // A bone the model scales to nothing keeps that: it hides spare geometry.
+                if local.scale.max_element() > TINY {
+                    local.scale = Vec3::splat(TINY);
+                }
             }
         }
         rig.pose_dirty = true;
