@@ -359,6 +359,8 @@ added here.
 - Bones without a body ride their nearest bodied ancestor. Bones outside the tree ride the hub.
 
 ### `life.rs` (ragdoll lifecycle)
+- `write_pose` keeps each bone's own scale when it writes a body's pose. Models hide spare
+  geometry on bones scaled to nothing (an elemental's alternate bracers); a unit scale showed it.
 - `SeenAlive` marks units seen alive. Only those ragdoll. A unit that streams in already dead
   keeps its stock Death pose.
 - `start_ragdolls` (Update) creates bodies at the current pose, joints, and the death push and
@@ -685,6 +687,14 @@ Do not describe this one in the README (section 2).
   which the rendered rider frame takes. Runs in PostUpdate before `TransformSystems::Propagate`.
 - At `weaponMotion` 0 the root goes back to its stock spot once and `RiderTilt` is removed. A
   drawn or swapped item loses `RiderTilt`; the move or rebuild already placed its `Transform`.
+
+### `float.rs` (floating in water)
+- `float_bodies` (FixedUpdate): each ragdoll body under the water surface
+  (`WorldPoint::water_surface_at`, the unit's own room claim, so magma and slime do not count) is
+  pushed against gravity by `BUOYANCY 1.6` × how far under it is (0 to 1 over a `BAND 0.3` yd band
+  around its middle), its velocity damped by `WATER_DRAG 2.5`/s and spin by `WATER_SPIN_DRAG 2`/s,
+  and kept awake. A body rests with about `1 / BUOYANCY` of it under. The `MAX_SIM_SECS 12` freeze
+  still ends it.
 
 ### `feet.rs` (foot planting, two-bone IK)
 - Players only (`object_type() == Player`; Mathieu asked for players only after creatures sank

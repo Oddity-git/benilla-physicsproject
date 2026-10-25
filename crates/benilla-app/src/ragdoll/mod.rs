@@ -22,6 +22,7 @@ mod cloak;
 mod deathfx;
 mod dismember;
 mod feet;
+mod float;
 mod frost;
 mod gore;
 mod hitstop;
@@ -51,6 +52,7 @@ impl Plugin for RagdollPlugin {
         gore::plugin(app);
         hitstop::plugin(app);
         feet::plugin(app);
+        float::plugin(app);
         jostle::plugin(app);
         omni::plugin(app);
         knock::plugin(app);

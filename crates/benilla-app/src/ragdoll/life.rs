@@ -762,7 +762,12 @@ fn write_pose(
                 let m = body_model(tf);
                 let local = parent.map_or(m, |p| p.inverse() * m);
                 let (_, r, t) = local.to_scale_rotation_translation();
-                rig.locals[i] = Transform::from_translation(t).with_rotation(r);
+                // The bone keeps its own scale: a model hides its spare parts (an elemental's
+                // other bracers) on bones scaled to nothing, which a unit scale would show.
+                let scale = rig.locals[i].scale;
+                rig.locals[i] = Transform::from_translation(t)
+                    .with_rotation(r)
+                    .with_scale(scale);
                 model[i] = m;
                 continue;
             }
