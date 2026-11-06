@@ -169,6 +169,7 @@ mod tests {
             grounded: true,
             run_mode: true,
             deck: None,
+            final_facing: benilla_protocol::MonsterMoveFacing::None,
         }
     }
 
@@ -244,6 +245,7 @@ mod tests {
             relay: Default::default(),
             last_apply_ms: 0.0,
             last_apply_pos: [0.0; 3],
+            fired_at_ms: None,
         }
     }
 

@@ -101,7 +101,7 @@ the install, and keep local state in `benilla-config/`.
 
 ## 4. Repository layout
 
-- **Upstream base:** upstream `main` at `19af9500` (merged 2026-10-25); before that `5338675f` (2026-10-13) and `2e82d34c`
+- **Upstream base:** upstream release `v0.3.0` (`68734926`, merged 2026-11-06); before that `main` at `19af9500` (2026-10-25), then `5338675f` (2026-10-13) and `2e82d34c`
   (`v0.2.0-116`). The first fork commit is `6ead3cdf` ("Ragdoll step 1").
   `git diff up/main HEAD` (with `up` fetched to the merged commit) shows everything the fork changed.
 - **Fork code:** `crates/benilla-app/src/ragdoll/`, about 5,500 lines in 16 files.

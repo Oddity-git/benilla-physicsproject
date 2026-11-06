@@ -29,6 +29,7 @@ use bevy::prelude::*;
 use crate::go_templates::GameObjectTemplates;
 use crate::net::{Guid, ObjectStore};
 use benilla_assets::{LockRecover, WorldAssets};
+use benilla_world::doodad_anim::CarrierAnimation;
 use benilla_world::ride_frame::RideFrame;
 use benilla_world::vis_chain::VisChainOnly;
 use benilla_world::world_map::CurrentMap;
@@ -61,9 +62,10 @@ impl Plugin for TransportPlugin {
                     .chain()
                     .after(benilla_world::schedule::WorldStage::Net)
                     .before(benilla_world::schedule::WorldStage::Input)
-                    // A script call applies inside its verb, against the decks as they stand
-                    // this frame: before every system that lends the call host.
-                    .before(crate::vm_pass::VmPass::Start),
+                    // A script call after the packets applies inside its verb, against the decks
+                    // as they stand this frame; the input records' calls read them as the last
+                    // frame left them, as the reference's input runs ahead of its frame time.
+                    .before(crate::vm_pass::VmPass::Resume),
             )
             // The ride frame last, after `PlayerControlSet` decides what we stand on; its
             // consumers, the particle and ribbon sims, run in `PostUpdate`.
@@ -418,9 +420,12 @@ fn arm_transports(
         if let Some(timetable) = timetable {
             // Kinematic, not the GO default of Static: it moves every frame, and avian's static
             // tree is tuned for immobile geometry.
-            commands
-                .entity(entity)
-                .insert((Transport::new(Drive::Taxi(timetable)), RigidBody::Kinematic));
+            commands.entity(entity).insert((
+                Transport::new(Drive::Taxi(timetable)),
+                RigidBody::Kinematic,
+                // Nothing played until its model is ready.
+                CarrierAnimation::default(),
+            ));
         }
     }
 }
@@ -444,7 +449,11 @@ fn tick_transports(
         &mut Visibility,
         Option<&mut Position>,
         Option<&mut Rotation>,
-        (Has<TransportVolume>, Option<&ObjectStore>),
+        (
+            Has<TransportVolume>,
+            Option<&ObjectStore>,
+            Option<&mut CarrierAnimation>,
+        ),
     )>,
 ) {
     let Some(current_map) = current_map else {
@@ -460,7 +469,7 @@ fn tick_transports(
         mut visibility,
         position,
         rotation,
-        (loaded, store),
+        (loaded, store, carrier),
     ) in &mut transports
     {
         // A fresh clock is a new object's: the ship kept across a worldport, re-anchored by its
@@ -499,8 +508,12 @@ fn tick_transports(
         }
         // 0x5f50b9: whether no animation had played as the tick began.
         let first = transport.anim.is_none();
-        // 0x5f52bd-0x5f5301: a loaded model plays the phase's animation when it changes.
+        // 0x5f52bd-0x5f5301: a loaded model plays the phase's animation when it changes, on its
+        // doodads (`0x6709f0` → `0x6a24b0`).
         if loaded {
+            if let Some(mut carrier) = carrier.filter(|_| transport.anim != Some(sample.anim)) {
+                carrier.0 = Some(sample.anim.id() as u16);
+            }
             transport.anim = Some(sample.anim);
         }
         // 0x5f5461-0x5f54c2: a new leg is stored, and with the camera's unit aboard and an
@@ -618,9 +631,26 @@ pub(crate) struct TransportRider {
     pub(crate) local_orientation: f32,
 }
 
-/// Compose each observed rider's world pose through its transport's this-frame pose, after
-/// [`tick_transports`], and refresh [`RemoteMotion`]'s WoW pose to match. A rider whose transport
-/// is not streamed keeps its last world pose; the server despawns the pair together.
+/// A rider's world position and facing through its deck's pose as it stands: a unit's position
+/// is its deck-local one through the transport's matrix, read at the call (`0x5f1f10` →
+/// `0x7c4930`, the matrix `0x630ac0`), and its facing the deck-local one plus the deck's yaw.
+pub(crate) fn on_deck(
+    deck: &Transform,
+    local_pos: [f32; 3],
+    local_orientation: f32,
+) -> (Vec3, f32) {
+    let local = benilla_assets::coords::wow_to_bevy(local_pos);
+    (
+        deck.translation + deck.rotation * local,
+        local_orientation + deck.rotation.to_euler(EulerRot::YXZ).0,
+    )
+}
+
+/// Carry each observed rider with its transport's this-frame pose, after [`tick_transports`], and
+/// refresh [`RemoteMotion`]'s WoW pose to match: the deck moves in frame time, and a rider's
+/// position follows it at every read ([`on_deck`]); its packet seats it inside the handler. A
+/// rider whose transport is not streamed keeps its last world pose; the server despawns the pair
+/// together.
 #[allow(clippy::type_complexity)] // one Bevy system's full input set
 fn compose_riders(
     guid_index: Res<crate::net::GuidIndex>,
@@ -642,9 +672,7 @@ fn compose_riders(
         let Ok(boat) = boats.get(boat_entity) else {
             continue;
         };
-        let local = benilla_assets::coords::wow_to_bevy(rider.local_pos);
-        let world = boat.translation + boat.rotation * local;
-        let yaw = rider.local_orientation + boat.rotation.to_euler(EulerRot::YXZ).0;
+        let (world, yaw) = on_deck(boat, rider.local_pos, rider.local_orientation);
         transform.translation = world;
         transform.rotation = Quat::from_rotation_y(yaw);
         if let Some(mut rm) = motion {
@@ -957,6 +985,69 @@ mod tests {
             .resource_mut::<Messages<TransportLegLeft>>()
             .drain()
             .collect()
+    }
+
+    /// `0x5f52ec`-`0x5f5301`: a ship whose model is ready plays its speed curve's phase on its
+    /// doodads (`0x6709f0` → `0x6a24b0`) when the phase changes; one still loading plays nothing.
+    #[test]
+    fn a_ready_ship_plays_its_phase_on_its_doodads() {
+        // One leg of six nodes 100 yd apart with a 10 s stop at the fourth: too short a span to
+        // reach cruise, the ship slows from the start into the stop, then stands.
+        let node = |id: u32| benilla_formats::TaxiPathNode {
+            id,
+            path_id: 1,
+            node_index: id,
+            map_id: 0,
+            pos: [id as f32 * 100.0, 0.0, 0.0],
+            flags: if id == 3 { 2 } else { 0 },
+            delay: if id == 3 { 10 } else { 0 },
+        };
+        let nodes: Vec<_> = (0..6).map(node).collect();
+        let timetable = TransportTimetable::build(&nodes, 30, 1).expect("one leg builds");
+        let first = timetable.sample(1000).anim;
+        let next = (1000..timetable.period_ms)
+            .step_by(100)
+            .find(|&t| timetable.sample(t).anim != first)
+            .expect("a second phase");
+        assert_eq!(
+            (first, timetable.sample(next).anim),
+            (ShipAnim::Decelerate, ShipAnim::Stand)
+        );
+        let phases = |ready: bool| {
+            let mut app = deck_app(0);
+            let mut deck = app.world_mut().spawn((
+                Guid(0xF120_0000_0000_0001),
+                taxi(timetable.clone()),
+                // As `arm_transports` arms a ship.
+                CarrierAnimation::default(),
+                TransportAnchor {
+                    progress_ms: 1000,
+                    at: Instant::now(),
+                },
+                Transform::default(),
+                Visibility::Hidden,
+            ));
+            if ready {
+                deck.insert(TransportVolume::Box([-1.0; 3], [1.0; 3]));
+            }
+            let deck = deck.id();
+            let mut seen = Vec::new();
+            for progress in [1000, next] {
+                app.world_mut()
+                    .get_mut::<TransportAnchor>(deck)
+                    .unwrap()
+                    .progress_ms = progress;
+                app.update();
+                seen.push(app.world().get::<CarrierAnimation>(deck).and_then(|a| a.0));
+            }
+            seen
+        };
+        assert_eq!(
+            phases(true),
+            [Some(0xa4), Some(0)],
+            "slowing, then standing"
+        );
+        assert_eq!(phases(false), [None, None], "not ready");
     }
 
     /// `0x5f5461`-`0x5f54c2`: a leg change on the map we are on, with the camera's unit among

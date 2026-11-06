@@ -22,7 +22,7 @@
 //! but the wire-type remap (`0x49a870`) that would admit other kinds is untraced.
 //!
 //! Deviation: sizes ride the plates' damped diagonal basis ([`plate_basis`]), not the unbounded
-//! reference law, so bubble text and plate text keep one em at every window size.
+//! reference law, because that way bubble text and plate text keep one em at every window size.
 //!
 //! Not built: the reference also ends a bubble whose speaker's model data is not resident
 //! (`0x7103d0`); here a speaker with no model yet only counts as not drawn.
@@ -41,7 +41,7 @@ use crate::vplates::{gx_px, plate_basis, text_px, VPlateSet, VPlates};
 use benilla_world::view::WorldCamera;
 
 /// The two bubble CVars (registrar `0x603280`), booting at the reference's defaults.
-#[derive(Resource)]
+#[derive(Resource, Clone, Copy)]
 pub(crate) struct BubbleConfig {
     /// `ChatBubbles`: say, yell and their monster variants.
     pub(crate) all: bool,
@@ -402,7 +402,10 @@ fn drive_bubbles(
     camera: Query<(&Camera, &Transform), With<WorldCamera>>,
     heights: Query<&StandBoxHeight>,
     time: Res<Time>,
-    window: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    (window, widescreen): (
+        Query<&Window, With<bevy::window::PrimaryWindow>>,
+        Option<Res<crate::video::Widescreen>>,
+    ),
     mut feed: ResMut<BubbleFeed>,
     // Whether the last render drew each speaker (`0x6704c0`, read at `0x4b0cab`).
     drawn: crate::entities::SceneDrawn,
@@ -506,9 +509,14 @@ fn drive_bubbles(
     let viewport = cam
         .and_then(|(c, _)| c.logical_viewport_size())
         .or_else(|| window.map(|w| Vec2::new(w.width(), w.height())));
-    let Some(viewport) = viewport.filter(|v| v.x > 0.0 && v.y > 0.0) else {
+    let Some(cam_viewport) = viewport.filter(|v| v.x > 0.0 && v.y > 0.0) else {
         return;
     };
+    // The bubbles seat on the interface's screen, 4:3 and stretched with `widescreen` 0
+    // ([`crate::ui_script::UiScreen`]), whose diagonal is their gx unit.
+    let ui_screen =
+        crate::ui_script::UiScreen::of(cam_viewport, widescreen.as_deref().is_none_or(|w| w.0));
+    let viewport = ui_screen.size;
     // Everything below is in window px, divided by the seam once for the `WorldFrame`'s units.
     let seam = window.map_or(1.0, |w| crate::ui_script::seam_scale(w.height()));
     let scale = window.map_or(1.0, Window::scale_factor);
@@ -544,7 +552,10 @@ fn drive_bubbles(
                 shown: b.fade.shown,
                 alpha: b.fade.alpha,
                 seat: match seat {
-                    Some((_, p)) => (p.x / seam, (viewport.y - p.y) / seam),
+                    Some((_, p)) => {
+                        let p = ui_screen.point(p);
+                        (p.x / seam, (viewport.y - p.y) / seam)
+                    }
                     // Short of the near plane (behind the camera) the projection writes no point
                     // (`0x483f7a`) and the placement ignores its verdict, seating the zeroed one
                     // (`0x4b14e4`): the text's BOTTOM on the screen's bottom-left corner. Bevy's
@@ -605,7 +616,10 @@ pub(crate) struct BubbleSet;
 pub(crate) struct ChatBubblePlugin;
 
 /// The two bubble CVars' change callback.
-pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut bubbles: ResMut<BubbleConfig>) {
+pub(crate) fn on_cvar(
+    ev: &crate::cvars::CvarChanged,
+    mut bubbles: bevy::prelude::Mut<'_, BubbleConfig>,
+) {
     match ev.key().as_str() {
         "chatbubbles" => bubbles.all = ev.flag(),
         "chatbubblesparty" => bubbles.party = ev.flag(),
@@ -615,7 +629,6 @@ pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut bubbles: ResMut<Bub
 
 impl Plugin for ChatBubblePlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(on_cvar);
         app.init_resource::<BubbleQueue>()
             .init_resource::<BubbleConfig>()
             .init_resource::<Bubbles>()

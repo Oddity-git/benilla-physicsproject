@@ -5,6 +5,7 @@ mod common;
 use benilla_protocol::events::{decode, EntityKind, SessionEvent};
 use benilla_protocol::messages;
 use benilla_protocol::wire::write_packed_guid;
+use benilla_protocol::MonsterMoveFacing;
 use common::hx;
 
 #[test]
@@ -454,7 +455,13 @@ fn unit_living_block_surfaces_the_swim_it_is_already_in() {
             assert_eq!(*orientation, 2.0);
             assert_eq!(
                 mover,
-                &Some(benilla_protocol::MoverState { flags, pitch: -0.4 }),
+                &Some(benilla_protocol::MoverState {
+                    flags,
+                    pitch: -0.4,
+                    time: 0,
+                    fall_time: 0,
+                    jump: None,
+                }),
                 "the live flags word and its swim-pitch tail both reach the app"
             );
             assert_eq!(
@@ -479,7 +486,7 @@ fn a_dry_living_block_has_no_pitch_tail_and_reads_level() {
     body.push(0x20); // LIVING
     let flags: u32 = 0x1; // FORWARD, walking on dry land
     body.extend_from_slice(&flags.to_le_bytes());
-    body.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+    body.extend_from_slice(&123_456u32.to_le_bytes()); // timestamp
     for v in [10.0f32, 20.0, 30.0, 0.5] {
         body.extend_from_slice(&v.to_le_bytes()); // pos + orientation
     }
@@ -494,13 +501,73 @@ fn a_dry_living_block_has_no_pitch_tail_and_reads_level() {
         [SessionEvent::ObjectCreate { mover, speeds, .. }, SessionEvent::ObjectUpdateEnd] => {
             assert_eq!(
                 mover,
-                &Some(benilla_protocol::MoverState { flags, pitch: 0.0 }),
-                "no tail on the wire reads as a level pitch, not a misparse"
+                &Some(benilla_protocol::MoverState {
+                    flags,
+                    pitch: 0.0,
+                    time: 123_456,
+                    fall_time: 0,
+                    jump: None,
+                }),
+                "no tail on the wire reads as a level pitch, and the stamp as the server wrote it"
             );
             assert_eq!(
                 speeds.map(|s| s.walk),
                 Some(2.5),
                 "the speeds land right after fall_time — the tail really was absent"
+            );
+        }
+        other => panic!("expected one ObjectCreate, got {other:?}"),
+    }
+}
+
+/// A create mid-jump carries its fall time and its `JUMPING` tail to the app, which the apply
+/// copies to the mover (`0x618e1b` → `0x7c6490`); the speeds still follow the tail.
+#[test]
+fn a_living_block_mid_jump_surfaces_its_fall_and_launch() {
+    let mut body = 1u32.to_le_bytes().to_vec();
+    body.push(0);
+    body.push(2);
+    write_packed_guid(0xAC, &mut body).unwrap();
+    body.push(3); // TypeId::Unit
+
+    body.push(0x20); // LIVING
+    let flags: u32 = 0x2000 | 0x1; // JUMPING | FORWARD
+    body.extend_from_slice(&flags.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+    for v in [10.0f32, 20.0, 30.0, 0.5] {
+        body.extend_from_slice(&v.to_le_bytes()); // pos + orientation
+    }
+    body.extend_from_slice(&250u32.to_le_bytes()); // fall_time, ms
+    for v in [-7.955_547f32, 0.6, 0.8, 7.0] {
+        body.extend_from_slice(&v.to_le_bytes()); // zspeed, cos, sin, xy speed
+    }
+    for v in [2.5f32, 7.0, 4.5, 4.722_222_3, 2.5, std::f32::consts::PI] {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    body.push(0);
+
+    let packet = messages::parse_server(messages::opcode::SMSG_UPDATE_OBJECT, &body).unwrap();
+    match decode(packet).as_slice() {
+        [SessionEvent::ObjectCreate { mover, speeds, .. }, SessionEvent::ObjectUpdateEnd] => {
+            assert_eq!(
+                mover,
+                &Some(benilla_protocol::MoverState {
+                    flags,
+                    pitch: 0.0,
+                    time: 0,
+                    fall_time: 250,
+                    jump: Some(benilla_protocol::JumpInfo {
+                        zspeed: -7.955_547,
+                        cos_angle: 0.6,
+                        sin_angle: 0.8,
+                        xy_speed: 7.0,
+                    }),
+                }),
+            );
+            assert_eq!(
+                speeds.map(|s| s.walk),
+                Some(2.5),
+                "the speeds follow the tail"
             );
         }
         other => panic!("expected one ObjectCreate, got {other:?}"),
@@ -640,7 +707,8 @@ fn gameobject_create_is_placed_by_the_block_over_its_position_fields() {
 /// The create spline's final-facing bits are tested one by one, each field read in this order when
 /// its bit is set: point (`0x10000`, 12 bytes, `0x47f0bf`), guid (`0x20000`, 8, `0x47f0e8`), angle
 /// (`0x40000`, 4, `0x47f0f9`). The id, timing and path behind them land only if every set bit took
-/// its bytes. Flags `0x50000` is the golden: the point (1, 2, 3), then the angle 1.5.
+/// its bytes. Flags `0x50000` is the golden: the point (1, 2, 3), then the angle 1.5. The facing
+/// kept is the one the path's end reads first (`0x61a882`): the angle, then the guid, then the point.
 #[test]
 fn create_spline_reads_each_final_facing_field_its_bit_names() {
     // A unit create with a LIVING block on a spline: head and move flags, pose, speeds, then
@@ -665,15 +733,20 @@ fn create_spline_reads_each_final_facing_field_its_bit_names() {
     let point = "0000803f0000004000004040";
     let guid = "1122334455667788";
     let angle = "0000c03f";
-    for (name, flags, facing) in [
-        ("point and angle", "00000500", [point, angle].concat()),
-        ("point and guid", "00000300", [point, guid].concat()),
-        ("guid and angle", "00000600", [guid, angle].concat()),
-        ("all three", "00000700", [point, guid, angle].concat()),
-        ("the point alone", "00000100", point.to_string()),
-        ("the guid alone", "00000200", guid.to_string()),
-        ("the angle alone", "00000400", angle.to_string()),
-        ("none", "00000000", String::new()),
+    let (spot, target, turn) = (
+        MonsterMoveFacing::Spot([1.0, 2.0, 3.0]),
+        MonsterMoveFacing::Target(0x8877_6655_4433_2211),
+        MonsterMoveFacing::Angle(1.5),
+    );
+    for (name, flags, facing, want) in [
+        ("point and angle", "00000500", [point, angle].concat(), turn),
+        ("point and guid", "00000300", [point, guid].concat(), target),
+        ("guid and angle", "00000600", [guid, angle].concat(), turn),
+        ("all three", "00000700", [point, guid, angle].concat(), turn),
+        ("the point alone", "00000100", point.to_string(), spot),
+        ("the guid alone", "00000200", guid.to_string(), target),
+        ("the angle alone", "00000400", angle.to_string(), turn),
+        ("none", "00000000", String::new(), MonsterMoveFacing::None),
     ] {
         let packet = messages::parse_server(
             messages::opcode::SMSG_UPDATE_OBJECT,
@@ -692,6 +765,7 @@ fn create_spline_reads_each_final_facing_field_its_bit_names() {
                 assert_eq!(s.time_passed_ms, 3_000, "{name}");
                 assert_eq!(s.duration_ms, 12_000, "{name}");
                 assert_eq!(s.path.len(), 3, "{name}");
+                assert_eq!(s.facing, want, "{name}: the facing the path ends on");
                 assert_eq!(
                     *display_id,
                     Some(1234),

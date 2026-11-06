@@ -459,12 +459,19 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("SoundListenerAtCharacter", "1"),
     // `EmoteSounds` (`0x4573b9`): the received text-emote voice kit, and only that.
     same("EmoteSounds", "1"),
+    // `MapWaterSounds` (`0x462ac9`, record `[0xb2306c]`, handler `0x462af0`): 0 hard-stops the four
+    // liquid loops and keeps the driver `0x462b50` from arming any (`liquid_loop`).
+    same("MapWaterSounds", "1"),
     // `SoundZoneMusicNoDelay` (`0x4578b3`): `next_track_time`'s immediate path.
     same("SoundZoneMusicNoDelay", "0"),
     // `assistAttack` (`0x48fc50`, record `[0xb4d8f8]`): `/assist` also starts the swing. The "3"
     // beside it is the next registration's, `minimapZoom`: stock `/assist` selects without
     // swinging.
     same("assistAttack", "0"),
+    // `targetNearestDistance` (`0x48fda4`, record `[0xb4e2a8]`, callback `0x490720`): the TAB range
+    // ([`crate::target::TabRange`]).
+    same("targetNearestDistance", "41.000000")
+        .checked(benilla_ui::script::check_target_nearest_distance),
     // ── Mouse-look speed, per axis ───────────────────────────────────────────────────────────────
     //
     // `cameraYawMoveSpeed` is the MOUSE_LOOK_SPEED slider (`UIOptionsFrame.lua:89`); a nil there
@@ -480,11 +487,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("cameraDistanceMoveSpeed", "8.33").checked(benilla_ui::script::check_camera_decay),
     // MOUSE_SENSITIVITY (`UIOptionsFrame.lua:87`): FrameXML's spelling of the binary's `mouseSpeed`
     // (`0x402c7b`); lookups are case-insensitive (`CVar::Lookup 0x63de30`), here as there. The
-    // reference's default is `SPI_GETMOUSESPEED × 0.1`, "1.0" on stock Windows, and its record
-    // `[0x882704]` has no reader: the slider sets the OS pointer speed (`0x402ec0`, [0.1, 2.0]).
-    // The default matches; Deviation: here the dial multiplies the camera's own rate, because
+    // reference's default is `SPI_GETMOUSESPEED × 0.1` (`0x42cd60`) formatted `%1.1f` (`0x82e994`,
+    // `0x402c4d`-`0x402c7b`): "1.0" on a stock OS (speed 10). Its record `[0x882704]` has no reader:
+    // the slider sets the OS pointer speed (`0x402ec0`, [0.1, 2.0]).
+    // The default is that string; Deviation: here the dial multiplies the camera's own rate, because
     // benilla does not change the OS pointer speed, a system-wide setting.
-    same("mousespeed", "1"),
+    same("mousespeed", "1.0"),
     // The zoom-out limit is `cameraDistanceMax × cameraDistanceMaxFactor`, held to [0, 50]
     // (`0x5112d6`). `cameraDistanceMax` (`0x50beb2`, default `0x84fbd0`) has no panel row; its
     // validator `0x50b310` refuses a value outside [0, 50]. The factor is MAX_FOLLOW_DIST
@@ -507,10 +515,18 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // `cameraCustomViewSmoothing` (`0x50bad0`, read at `0x50fc33`): with it set, a customised view
     // still takes the auto-return.
     same("cameraCustomViewSmoothing", "0"),
-    // `UIOptionsFrame.lua:353` names `cameraPitchSmoothSpeed`, registered "45.0" (`0x50b90b`) with
-    // the same validator, and `SetCVar` raises on a name no CVar has (`0x488c53`). `FollowRig` has
-    // one rate, so nothing reads it.
+    // A timed view's pitch rate (`0x512935`), which `UIOptionsFrame.lua:353` also writes,
+    // registered "45.0" (`0x50b90b`) with the same validator.
     same("cameraPitchSmoothSpeed", "45.0").checked(benilla_ui::script::check_camera_rate),
+    // A timed view's distance rate (`0x5121be`), registered "8.33" (`0x50b8a2`), `0x50c040`.
+    same("cameraDistanceSmoothSpeed", "8.33").checked(benilla_ui::script::check_camera_decay),
+    // The style a view verb passes `0x512e90` (`0x50b5db`), registered "1" (`0x50b972`): 1 timed,
+    // 2 instant, and any other seats nothing.
+    same("cameraViewBlendStyle", "1"),
+    // One arm's duration bound (`0x510f4d`, `0x513255`), registered "0.1" and "2.0" (`0x50bf81`,
+    // `0x50bfa4`), `0x50bfe0`, which orders nothing between the two.
+    same("cameraSmoothTimeMin", "0.1").checked(benilla_ui::script::check_camera_time),
+    same("cameraSmoothTimeMax", "2.0").checked(benilla_ui::script::check_camera_time),
     // `cameraPivot` `[0xbe10a4]` "1" (`0x50bda3`), smart pivot: gate `0x510690`, routing
     // `0x50fee0`, release `0x5107f0`; ours is `player::camera_dynamics::SmartPivot`.
     same("cameraPivot", "1"),
@@ -680,13 +696,24 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // Not one of `hwDetect`'s sixteen (`[0x639a60, 0x639b80)` never reads `0xc7f2e4`), so the
     // registered "1", off, stands.
-    same("anisotropic", "1"),
+    same("anisotropic", "1").checked(benilla_ui::script::check_anisotropic),
     // The four video CVars the stock window's verbs read and write (`benilla_ui` `video_pairs`);
     // benilla has no mechanism behind any of them. `shadowLevel` (`0x6885bc`, "1", flags 1,
     // callback `0x688c10`, record `[0xc7f350]`) is behind `Get/SetTerrainMip` as `1 − level`: the
     // callback refuses above 1 and prints "Shadow mip level changed upon restart.", and the
     // terrain's shadow-map mip (`0x66f877`) reads it at load. `hwDetect` leaves it at 1.
     same("shadowLevel", "1").checked(benilla_ui::script::check_shadow_level),
+    // `shadowLOD` (`0x6d8157`, "1", record `[0x86f5b4]`, handler `0x6d8450`): the blob-shadow entry
+    // `0x6d78f0` draws only at 1. The handler refuses outside 0..=1 and says "Shadow LOD set to %d".
+    same("shadowLOD", "1").checked(benilla_ui::script::check_shadow_lod),
+    // `shadowBias` (`0x6d817d`, "0.1", record `[0xcea620]`, handler `0x6d8530`): the decal draw
+    // `0x6d7480` (the selection ring and the blob shadow) biases depth by `2 * bias / 32767` while
+    // it is nonzero. The handler refuses outside 0..=1 and says "Shadow bias set to %f".
+    same("shadowBias", "0.1").checked(benilla_ui::script::check_shadow_bias),
+    // `violenceLevel` (`0x6c5ae1`, flags 0, record `[0xce8534]`): registered at the locale's cap
+    // from the table `0x86c3f8` (`0x6c5aa0`), "2" but koKR's "1". The callback `0x6c5af0` stores
+    // the level clamped to the cap; the blood spurt indexes `UnitBloodLevels` by it (`0x60a39d`).
+    same_by_locale("violenceLevel", "2", &[(KO_KR, "1")]),
     // `doodadAnim` (`0x6884d8`, "1", flags 1, callback `0x688a10`, record `[0xc7f354]`), behind
     // `Get/SetDoodadAnim`: the callback toggles bit `0x8000` of `[0xc7b2a4]` and calls `0x6953d0`,
     // a bare `ret`, so no animation reads it. `hwDetect` sets 0 or 1 by CPU tier.
@@ -697,8 +724,9 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("texLodBias", "0.0").checked(benilla_ui::script::check_tex_lod_bias),
     // `baseMip` (`0x6887aa`, "0", flags 1, callback `0x689090`, record `[0xc7f2f0]`), behind
     // `Get/SetBaseMip` as `1 − level`: the callback refuses outside [0, 1] ("BaseMip must be 0 or
-    // 1") and sets the device's first uploaded mip level (`0x589bf0`, read at `0x59f6ce`). benilla
-    // uploads every level; the write is kept and has no effect. `hwDetect` leaves it at 0.
+    // 1") and sets the device's first uploaded mip level (`0x589bf0`, read at `0x59f6d1`, on
+    // Direct3D `0x5a08fc`). benilla uploads every level; the write is kept and has no effect.
+    // `hwDetect` leaves it at 0.
     same("baseMip", "0").checked(benilla_ui::script::check_base_mip),
     // `spellEffectLevel` (`0x688900`: name `0x869324`, default `0x843068` "2", flags 1, callback
     // `0x689510`, record `[0xc7f2a4]`), the Spell Detail slider (`OptionsFrame.lua:32`). The
@@ -721,7 +749,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
          `SET weatherDensity \"3\"` (K = 1.0) — so 3 is the value a benilla-vs-reference \
          side-by-side is correct at, and the registered 2 would thin every rate to 0.66 against \
          the only client we compare with. The slider is how a player takes it back down",
-    ),
+    )
+    .checked(benilla_ui::script::check_weather_density),
     // `gamma` (`0x402d70`: name `0x82e924` "Gamma", default `0x82e92c` "1.0", flags 0, callback
     // `0x4034d0`). The reference uploads `pow(i/255, gamma)` (`0x591680`) through
     // `SetDeviceGammaRamp`, except when windowed (`byte[dev+0x20b]`). Deviation: benilla, which
@@ -785,9 +814,13 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // World LOD: bit 2 of `[0xc7b2a4]`, which gates the doodad LOD distance test at `0x6afb11`. No
     // effect here: benilla has no doodad LOD swap, as `lodDist` above has no row.
     same("lod", "1"),
+    // `movie` (`0x402bf5`: name `0x82e74c`, "1", flags 0, record `[0x8826e0]`), Show movie on
+    // startup: the startup puts the intro movies up while it is 1, setting it to "0"
+    // (`0x402b3b`-`0x402b65`, `ui_script::glue::startup_screen`).
+    same("movie", "1"),
     // `movieSubtitle` (`0x402c18`: name `0x82e9d8`, "0", flags 0, record `[0x882640]`), Cinematic
-    // Subtitles: the pre-rendered movies' subtitles, read by the glue's `GetMovieSubtitles`
-    // (`0x46dbc0`). No effect here: benilla plays no pre-rendered movie.
+    // Subtitles: the pre-rendered movies' subtitles, which the glue's `GetMovieSubtitles`
+    // (`0x46dbc0`) hands the movie frame's `EnableSubtitles` (`MovieFrame.lua:35`).
     same("movieSubtitle", "0"),
     // `useWeatherShaders` (`0x67b81d`: name `0x868598`, "1", flags 0, no callback, record
     // `[0xc7b588]`), Weather Shaders: read in each precipitation effect's constructor (`0x67480f`,
@@ -844,16 +877,6 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0",
         "benilla's own — 1.12 has no player-side perf log; its nearest thing is the \
          Ctrl+R framerate label, a number with no file behind it",
-    ),
-    // `violenceLevel` (0 none, 1 green, 2 true colors): the reference defaults it to its region's
-    // maximum (`0x6c5aa0`, table `0x86c3f8`, clamped by the setter `0x6c5af0`), 2 for enUS, and
-    // registers no CVar a player can move. benilla's Blood dropdown sets it. The knobs are the
-    // melee spurt (`creature_anim::blood`) and the ragdoll gore (`ragdoll::gore`).
-    ours(
-        "violenceLevel",
-        "2",
-        "benilla's own — the reference fixes the gore level by region (2 for enUS) and \
-         offers no setting",
     ),
     // benilla's own: ragdolls lose limbs on heavy killing blows (`ragdoll::life`).
     ours(

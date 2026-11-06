@@ -20,7 +20,10 @@ use benilla_protocol::guid;
 use benilla_protocol::messages::ObjectFields;
 
 use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects};
-use crate::query_cache::{Ask, QueryCache, Refused};
+use crate::query_cache::{Ask, QueryCache};
+
+mod live;
+pub(crate) use live::NameLive;
 
 /// The creature template's `type_flags` dword from `SMSG_CREATURE_QUERY_RESPONSE`, cached by the
 /// reference at `[CGUnit+0xb30] + 0x14`. Adjacent bits mean unrelated things, and the reference
@@ -64,12 +67,21 @@ pub(crate) struct NameCache {
     creatures: QueryCache<u32, CreatureRecord>,
     /// No negative entry: the server answers for a live pet or says nothing.
     pets: QueryCache<u32, String>,
-    /// Bumped by every landed answer, a refusal that took a record away and the pet-rename
-    /// eviction, never by an ask: the gated feeds re-run when it moves.
-    generation: u64,
-    /// The creature entries in the order their records landed, for a reader that keeps its own
-    /// place ([`Self::creatures_landed_since`]); a `u32` a landing, never trimmed.
-    creature_landings: Vec<u32>,
+    /// The callbacks a player-name lookup that missed registered (`0x55f080`), by the guid it
+    /// asked for, each once: the dedupe flag (`0x52af55`). Locked, so a build's lookup registers
+    /// through a shared read.
+    player_waits: std::sync::Mutex<Vec<(u64, NameCallback)>>,
+}
+
+/// A callback a player-name lookup registers on its miss, which the answer runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameCallback {
+    /// The corpse plate's owner (`0x52af77` with `CGTooltip::OnCorpseOwnerName` `0x52afe0`).
+    CorpsePlate,
+    /// `UnitName` on a guid it holds no unit for, once the party pet record misses too
+    /// (`0x5171d7`-`0x5171f5`), with `0x517290`: on a found name, `NotifyUnitNameUpdate`
+    /// (`0x491a00`) over the guid, held or not.
+    UnitName,
 }
 
 /// One cached creature template head.
@@ -164,6 +176,36 @@ impl NameCache {
     /// object is `None` without a query.
     pub(crate) fn resolve(&self, objects: &Objects, guid_val: u64, ask: Ask<'_>) -> Option<&str> {
         self.resolve_unit(guid_val, objects.store(guid_val), ask)
+    }
+
+    /// A lookup of `guid`'s name that missed registered `callback`, once (`0x55f080` with the
+    /// dedupe flag).
+    pub(crate) fn wait_for_player(&self, guid: u64, callback: NameCallback) {
+        let mut waits = self
+            .player_waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !waits.contains(&(guid, callback)) {
+            waits.push((guid, callback));
+        }
+    }
+
+    /// The answer for `guid` landed, or refused it: the callbacks waiting on it, in the order they
+    /// asked, spent either way.
+    pub(crate) fn take_player_waits(&mut self, guid: u64) -> Vec<NameCallback> {
+        let waits = self
+            .player_waits
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut taken = Vec::new();
+        waits.retain(|&(g, cb)| {
+            let hit = g == guid;
+            if hit {
+                taken.push(cb);
+            }
+            !hit
+        });
+        taken
     }
 
     /// The player-name cache by guid, whatever the guid is: the reference's `0x55f080` on
@@ -287,28 +329,31 @@ impl NameCache {
             Some(t) => self.player_traits.insert(guid, t),
             None => self.player_traits.remove(&guid),
         };
-        // A refusal redisplays only a name it took away: the status-0 callback `0x5fb840` does
-        // nothing (`0x5fb84b`).
-        let moved = if name.is_empty() {
-            self.players.refuse(guid) == Refused::Record
+        if name.is_empty() {
+            self.players.refuse(guid);
         } else {
             self.players.insert(guid, name);
-            true
-        };
-        if moved {
-            self.generation = self.generation.wrapping_add(1);
         }
     }
 
     /// The reference's world-session wipe (`0x555740`; `0x5557ad call 0x560400` for the player
     /// cache): every `DBCache` whose persistence byte `[cache+0x39]` is 0 is cleared, which is
     /// `'WNAM'` (player names, ctor `0x554cd0`), `'WGLD'`, `'WPNM'` (pet names) and `'WPTN'`.
-    /// Called at world entry, before the login seeds our own name.
+    /// Called at world entry, before the login seeds our own name. The player cache's nodes go
+    /// with their callbacks, none of them run (`0x560400`), so no wait outlives the session.
     pub(crate) fn clear_world_session(&mut self) {
         self.players.clear();
         self.player_traits.clear();
         self.pets.clear();
-        self.generation = self.generation.wrapping_add(1);
+        self.free_store_callbacks();
+    }
+
+    /// The teardown's free of the lookups' callbacks, running none (`0x55f990`).
+    pub(crate) fn free_store_callbacks(&mut self) {
+        self.player_waits
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// The creature-template store, the one [`crate::wdb`] saves.
@@ -320,11 +365,6 @@ impl NameCache {
         &mut self.creatures
     }
 
-    /// The landed-answer counter.
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// `(race, class, gender)` for a player guid the name query has answered for.
     pub(crate) fn player_traits(&self, guid: u64) -> Option<(u8, u8, u8)> {
         self.player_traits.get(&guid).copied()
@@ -333,53 +373,28 @@ impl NameCache {
     /// Record a pet-name answer, keyed by pet number.
     pub(crate) fn insert_pet(&mut self, pet_number: u32, name: String) {
         self.pets.insert(pet_number, name);
-        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Forget a pet's name and its in-flight mark so the next resolve asks again: a rename
     /// arrives only as a bumped `UNIT_FIELD_PET_NAME_TIMESTAMP`, never as the name.
     pub(crate) fn forget_pet(&mut self, pet_number: u32) {
         self.pets.evict(pet_number);
-        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Record a creature-name answer; `None` is a refusal (an entry the server flagged unknown).
-    /// A refusal redisplays only a record it took away: the status-0 callback `0x604660` finds
-    /// no record and sets nothing (`0x60469c`).
     pub(crate) fn insert_creature(&mut self, entry: u32, record: Option<CreatureRecord>) {
-        let moved = match record {
-            Some(record) => {
-                self.creatures.insert(entry, record);
-                self.creature_landings.push(entry);
-                true
+        match record {
+            Some(record) => self.creatures.insert(entry, record),
+            None => {
+                self.creatures.refuse(entry);
             }
-            None => self.creatures.refuse(entry) == Refused::Record,
-        };
-        if moved {
-            self.generation = self.generation.wrapping_add(1);
         }
-    }
-
-    /// The creature entries that landed after a reader's place `seen`, and its new place.
-    pub(crate) fn creatures_landed_since(&self, seen: usize) -> (&[u32], usize) {
-        let landed = self.creature_landings.get(seen..).unwrap_or_default();
-        (landed, self.creature_landings.len())
-    }
-
-    /// Every cached creature's entry and name.
-    pub(crate) fn creature_names(&self) -> impl Iterator<Item = (u32, &str)> {
-        self.creatures.iter().map(|(&e, r)| (e, r.name.as_str()))
     }
 
     /// Whether the server refused the player's name, an empty name answered for the guid, and
     /// nothing has asked for it since.
     pub(crate) fn player_answered_unknown(&self, guid: u64) -> bool {
         self.players.answered_unknown(guid)
-    }
-
-    /// Whether the server refused `entry` and nothing has asked for it since.
-    pub(crate) fn creature_answered_unknown(&self, entry: u32) -> bool {
-        self.creatures.answered_unknown(entry)
     }
 
     /// The cached subname, the title line under a creature's name.
@@ -400,18 +415,12 @@ impl NameCache {
         Some(self.creatures.get(entry)?.creature_type)
     }
 
-    /// Forget the in-flight asks a disconnect may have dropped; player and creature names stay,
-    /// pet names go with the spawns they named.
+    /// Forget the in-flight player-name asks a disconnect may have dropped; player names stay, pet
+    /// names go with the spawns they named. The creature store is saved, so [`crate::wdb`] clears
+    /// its asks.
     pub(crate) fn clear_pending(&mut self) {
         self.players.clear_pending();
-        self.creatures.clear_pending();
         self.pets.clear();
-    }
-}
-
-impl crate::query_cache::AskOnce for NameCache {
-    fn clear_pending(&mut self) {
-        NameCache::clear_pending(self);
     }
 }
 
@@ -421,7 +430,6 @@ impl NameCache {
     pub(crate) fn invalidate_player(&mut self, guid: u64) {
         self.players.evict(guid);
         self.player_traits.remove(&guid);
-        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -430,7 +438,7 @@ pub(crate) mod net {
     use benilla_protocol::{SessionEvent, SessionEventKind};
     use bevy::prelude::*;
 
-    use super::{CreatureRecord, NameCache};
+    use super::{CreatureRecord, NameCache, NameCallback};
     use crate::field_watch::{id, FieldNotice, NoticeLane};
     use crate::net::{GuidIndex, NetHandlerApp, ObjectStore};
 
@@ -480,9 +488,10 @@ pub(crate) mod net {
     }
 
     /// The name callback `0x5fb840` of a unit the answer names: for a found name (`0x5fb84b`) of a
-    /// held unit (`0x5fb86a`), `UNIT_NAME_UPDATE` through `0x491a00`; and the chat's `0x49ccc0`,
-    /// which shows the lines that waited on the name. The callbacks are the lookups that missed,
-    /// so an answer for a name the cache already holds runs none.
+    /// held unit (`0x5fb86a`), `UNIT_NAME_UPDATE` through `0x491a00`; the chat's `0x49ccc0`,
+    /// which shows the lines that waited on the name, and the trade initiate's `0x5d4080`; and the
+    /// waits a lookup registered ([`NameCallback`]). The callbacks are the lookups that missed, so
+    /// an answer for a name the cache already holds runs none.
     fn on_player_name(
         In(ev): In<SessionEvent>,
         mut names: ResMut<NameCache>,
@@ -491,6 +500,12 @@ pub(crate) mod net {
         chat: Option<Res<crate::ui_chat::ChatLog>>,
         // The auction lists whose getters missed a name (`0x4cf167`, `0x4cf1c8`).
         house: Option<ResMut<crate::ui_auction::HouseLane>>,
+        // The battleground's callbacks, which run for a refusal too.
+        mut battlefield: crate::ui_battlefield::BattlefieldNameAnswers,
+        // The meeting stone's member lines and the duel's held challenge, refusals too.
+        mut dialogs: crate::ui_dialog_verbs::DialogNameAnswers,
+        // The trade initiates' lines, which a refusal spends silently (`0x5d4080`).
+        mut trade: crate::ui_trade::TradeNameAnswers,
     ) {
         if let SessionEvent::PlayerName {
             guid,
@@ -501,8 +516,15 @@ pub(crate) mod net {
         } = ev
         {
             // A guid already cached has no lookup waiting, so no callback runs.
-            let found = !name.is_empty() && names.players.get(guid).is_none();
+            let waited = names.players.get(guid).is_none();
+            let found = !name.is_empty() && waited;
+            let callbacks = names.take_player_waits(guid);
             player_name(guid, name, race, class, gender, &mut names);
+            if waited {
+                battlefield.answered(guid, &names);
+                dialogs.answered(guid, &names);
+                trade.answered(guid, &names);
+            }
             if found {
                 if let Some(chat) = &chat {
                     chat.answer_landed(crate::ui_chat::Answer::Player(guid));
@@ -512,10 +534,23 @@ pub(crate) mod net {
                 }
             }
             if found && units.holds(guid) {
-                notices.write(FieldNotice::Signal {
-                    guid,
-                    id: id::UNIT_NAME_UPDATE,
-                });
+                notices.write_batch(name_answered(guid));
+            }
+            // The lookups' own callbacks, in the order they asked, each for a found name only.
+            for callback in callbacks.into_iter().filter(|_| found) {
+                match callback {
+                    // `0x52affc`.
+                    NameCallback::CorpsePlate => notices.write(FieldNotice::CorpsePlate),
+                    // `0x51729a` → `0x491a00`: the refresh for a unit held (`0x491a23`), the
+                    // signal to every token naming the guid whatever (`0x491a3c`).
+                    NameCallback::UnitName if units.holds(guid) => {
+                        notices.write_batch(name_update(guid));
+                    }
+                    NameCallback::UnitName => notices.write(FieldNotice::Signal {
+                        guid,
+                        id: id::UNIT_NAME_UPDATE,
+                    }),
+                }
             }
         }
     }
@@ -533,10 +568,7 @@ pub(crate) mod net {
             pet_name(pet_number, name, &mut names);
             if found && pet_number != 0 {
                 for guid in units.matching(|s| s.0.unit_pet_number() == pet_number) {
-                    notices.write(FieldNotice::Signal {
-                        guid,
-                        id: id::UNIT_NAME_UPDATE,
-                    });
+                    notices.write_batch(name_answered(guid));
                 }
             }
         }
@@ -582,19 +614,41 @@ pub(crate) mod net {
             );
             if found {
                 for guid in units.matching(|s| s.0.object_entry() == Some(entry)) {
-                    notices.write_batch([
-                        FieldNotice::Signal {
-                            guid,
-                            id: id::UNIT_NAME_UPDATE,
-                        },
-                        FieldNotice::Signal {
-                            guid,
-                            id: id::UNIT_CLASSIFICATION_CHANGED,
-                        },
-                    ]);
+                    notices.write_batch(name_answered(guid));
+                    notices.write(FieldNotice::Signal {
+                        guid,
+                        id: id::UNIT_CLASSIFICATION_CHANGED,
+                    });
                 }
             }
         }
+    }
+
+    /// `NotifyUnitNameUpdate` (`0x491a00`) on a held unit: the tooltip's refresh (`0x491a27`) and
+    /// the name's gate (`0x491a2e` → `0x607050`), then `UNIT_NAME_UPDATE` (`0x491a3c`).
+    fn name_update(guid: u64) -> [FieldNotice; 3] {
+        [
+            FieldNotice::TooltipUnit { guid },
+            FieldNotice::Plate {
+                guid,
+                call: crate::vplates::PlateCall::Gate,
+            },
+            FieldNotice::Signal {
+                guid,
+                id: id::UNIT_NAME_UPDATE,
+            },
+        ]
+    }
+
+    /// A name or creature answer's callback on a held unit (`0x5fb840`, `0x604660`): its plate
+    /// released (`0x5fb86e`, `0x6046c1`), then the name update, whose gate binds it again with the
+    /// answer's name (`0x5fb875`, `0x6046d1`).
+    fn name_answered(guid: u64) -> impl Iterator<Item = FieldNotice> {
+        std::iter::once(FieldNotice::Plate {
+            guid,
+            call: crate::vplates::PlateCall::Release,
+        })
+        .chain(name_update(guid))
     }
 
     fn on_invalidate_player(In(ev): In<SessionEvent>, mut names: ResMut<NameCache>) {
@@ -742,6 +796,21 @@ pub(crate) mod net {
             FieldNotice::Signal { guid, id }
         }
 
+        /// An answer's callback on the held unit `guid`: its plate released, the tooltip's refresh
+        /// (`0x4919d0`), the plate's gate, then the name signal.
+        fn answered(guid: u64) -> [FieldNotice; 4] {
+            use crate::vplates::PlateCall::{Gate, Release};
+            [
+                FieldNotice::Plate {
+                    guid,
+                    call: Release,
+                },
+                FieldNotice::TooltipUnit { guid },
+                FieldNotice::Plate { guid, call: Gate },
+                signal(guid, 183),
+            ]
+        }
+
         fn creature(entry: u32, name: Option<&str>) -> SessionEvent {
             SessionEvent::CreatureName {
                 entry,
@@ -769,13 +838,14 @@ pub(crate) mod net {
             assert_eq!(
                 notices(&mut app),
                 [
-                    signal(WOLF_B, 183),
-                    signal(WOLF_B, 187),
-                    signal(WOLF_A, 183),
-                    signal(WOLF_A, 187),
-                    signal(PET, 183),
-                    signal(PET, 187)
+                    answered(WOLF_B).to_vec(),
+                    vec![signal(WOLF_B, 187)],
+                    answered(WOLF_A).to_vec(),
+                    vec![signal(WOLF_A, 187)],
+                    answered(PET).to_vec(),
+                    vec![signal(PET, 187)],
                 ]
+                .concat()
             );
             app.world_mut()
                 .run_system_once_with(on_creature_name, creature(300, None))
@@ -805,7 +875,7 @@ pub(crate) mod net {
             app.world_mut()
                 .run_system_once_with(on_player_name, player(PLAYER, "Brisca"))
                 .unwrap();
-            assert_eq!(notices(&mut app), [signal(PLAYER, 183)]);
+            assert_eq!(notices(&mut app), answered(PLAYER));
             app.world_mut()
                 .run_system_once_with(on_player_name, player(PLAYER, "Brisca"))
                 .unwrap();
@@ -829,7 +899,7 @@ pub(crate) mod net {
                     },
                 )
                 .unwrap();
-            assert_eq!(notices(&mut app), [signal(PET, 183)]);
+            assert_eq!(notices(&mut app), answered(PET));
             app.world_mut()
                 .run_system_once_with(
                     on_pet_name,
@@ -857,42 +927,6 @@ mod tests {
     fn commands() -> (NetCommands, crossbeam_channel::Receiver<ClientCommand>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         (NetCommands(tx), rx)
-    }
-
-    /// An ask must not move the counter, or an outstanding query would hold every gated feed open.
-    #[test]
-    fn the_generation_counts_landings_never_asks() {
-        let (cmds, _rx) = commands();
-        let mut cache = NameCache::default();
-        let g0 = cache.generation();
-
-        let player = compose(0, 0, 7);
-        assert_eq!(cache.resolve_unit(player, None, Ask::New(&cmds)), None);
-        assert_eq!(
-            cache.generation(),
-            g0,
-            "the miss asked, and asking is not a landing"
-        );
-
-        cache.insert_player(player, "Benilla".into(), None);
-        let landed = cache.generation();
-        assert_ne!(g0, landed, "the answer landing is the edge");
-
-        assert_eq!(
-            cache.resolve_unit(player, None, Ask::New(&cmds)),
-            Some("Benilla")
-        );
-        assert_eq!(cache.generation(), landed, "a cache hit moves nothing");
-
-        cache.insert_pet(137, "Voidwalker".into());
-        let pet = cache.generation();
-        assert_ne!(landed, pet);
-        cache.forget_pet(137);
-        assert_ne!(
-            pet,
-            cache.generation(),
-            "the rename eviction is a landing-shaped edge"
-        );
     }
 
     /// A summoned pet asks `CMSG_PET_NAME_QUERY` by the pet number in its guid; its entry slot
@@ -962,8 +996,14 @@ mod tests {
         cache.insert_player(0x11, "Moamtester".into(), Some((1, 2, 0)));
         cache.insert_pet(7, "Rex".into());
         cache.insert_creature(69, Some(record("Stable Master")));
+        cache.wait_for_player(0x22, NameCallback::UnitName);
 
         cache.clear_world_session();
+
+        assert!(
+            cache.take_player_waits(0x22).is_empty(),
+            "the waits went with the cache"
+        );
 
         assert_eq!(cache.resolve_unit(0x11, None, Ask::Read), None);
         assert_eq!(cache.player_traits(0x11), None);
@@ -998,12 +1038,7 @@ mod tests {
         );
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)), "no ask");
 
-        let before = cache.generation();
         cache.invalidate_player(0x11);
-        assert!(
-            cache.generation() != before,
-            "an eviction is a landed change"
-        );
         assert_eq!(
             cache.player_traits(0x11),
             None,
@@ -1069,16 +1104,10 @@ mod tests {
             rx.try_recv(),
             Ok(ClientCommand::NameQuery { guid }) if guid == g
         ));
-        let before = cache.generation();
         cache.insert_player(g, String::new(), None); // server: unknown guid
         assert!(
             cache.players.answered_unknown(g),
             "the waiters read unknown"
-        );
-        assert_eq!(
-            cache.generation(),
-            before,
-            "nothing redisplays: `0x5fb840` ignores status 0"
         );
         assert_eq!(cache.resolve_unit(g, None, Ask::New(&cmds)), None);
         assert!(
@@ -1143,37 +1172,33 @@ mod tests {
     #[test]
     fn a_refusal_nobody_asked_for_marks_nothing() {
         let mut cache = NameCache::default();
-        let before = cache.generation();
         cache.insert_creature(4321, None);
         assert!(!cache.creatures.answered_unknown(4321));
-        assert_eq!(cache.generation(), before);
     }
 
-    /// `0x556f35` frees a valid node too, and what the readers showed changes.
+    /// `0x556f35` frees a valid node too.
     #[test]
-    fn a_refusal_of_a_held_record_takes_it_away_and_redisplays() {
+    fn a_refusal_of_a_held_record_takes_it_away() {
         let mut cache = NameCache::default();
         cache.insert_creature(55, Some(record("Kobold")));
-        let before = cache.generation();
         cache.insert_creature(55, None);
         assert!(cache.creature_record(55).is_none());
-        assert_ne!(cache.generation(), before);
     }
 
     #[test]
     fn clear_pending_allows_a_reconnect_reask() {
         let (cmds, rx) = commands();
         let mut cache = NameCache::default();
-        let g = compose(guid::HIGH_UNIT, 100, 1);
+        let g = compose(guid::HIGH_PLAYER, 100, 1);
 
-        assert_eq!(cache.resolve_unit(g, None, Ask::New(&cmds)), None);
+        assert_eq!(cache.resolve_player(g, Ask::New(&cmds)), None);
         let _ = rx.try_recv();
         // A disconnect dropped the answer.
         cache.clear_pending();
-        assert_eq!(cache.resolve_unit(g, None, Ask::New(&cmds)), None);
+        assert_eq!(cache.resolve_player(g, Ask::New(&cmds)), None);
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientCommand::CreatureQuery { entry: 100, .. })
+            Ok(ClientCommand::NameQuery { guid }) if guid == g
         ));
     }
 

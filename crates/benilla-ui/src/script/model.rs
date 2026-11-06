@@ -4,12 +4,12 @@ use crate::layout::{LayoutInput, LayoutSolver, Rect};
 use crate::widget::{FrameHandle, RegionHandle, WidgetArena};
 
 use super::{
-    auction, backdrop, bank, camera_view, char_stats, chat_window, colorselect, container, craft,
-    cursor, death, gossip, guild, item_calls, item_text, loot, loot_roll, macros, mail, merchant,
-    parse_unit_token, party, petition, pvp, quest, quest_log, reputation, simplehtml, skills,
-    slider, social, spellbook, stable, taxi, trade, tradeskill, trainer, weapon_enchant,
-    ActionSlot, AuraState, FontObject, ItemTemplateView, MusicRequest, PlayerReqState, RegionData,
-    ScriptValue, SoundRequest, UnitBase, UnitState, UnitTokenParse,
+    auction, backdrop, bank, char_stats, chat_window, colorselect, container, craft, cursor, death,
+    gossip, guild, item_text, loot, loot_roll, macros, mail, merchant, parse_unit_token, party,
+    petition, pvp, quest, quest_log, reputation, simplehtml, skills, slider, social, spellbook,
+    stable, taxi, trade, tradeskill, trainer, weapon_enchant, ActionSlot, AuraState, FontObject,
+    ItemTemplateView, MusicRequest, PlayerReqState, RegionData, ScriptValue, SoundRequest,
+    UnitBase, UnitState, UnitTokenParse,
 };
 
 // ── The Rust-side model ──
@@ -87,29 +87,17 @@ pub(crate) fn node_deferred(
     }
 }
 
-/// What the Lua error handler is called with for one caught error: the value an error carries,
-/// its bytes as Lua wrote them, or a host's own text.
-#[derive(Clone, Debug)]
-pub(crate) enum HandlerArg {
-    Text(String),
-    Error(mlua::Error),
-}
-
-impl HandlerArg {
-    /// The one argument, in `lua`.
-    pub(crate) fn value(self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
-        Ok(match self {
-            HandlerArg::Text(t) => mlua::Value::String(lua.create_string(t)?),
-            HandlerArg::Error(e) => match e.lua_value(lua) {
-                Some(v) => v,
-                None => mlua::Value::String(lua.create_string(e.lua_bytes(lua))?),
-            },
-        })
-    }
-}
-
 /// The Rust-side model behind the Lua VM, in `lua.app_data`. It holds no Lua handles, each of
 /// which is a collector root.
+/// The fields of the top's stored mouse event (`[root+0x1104]`) its readers take: the button
+/// (`+0x1108`) and the point (`+0x1118`, `+0x111c`) a move is compared with (`0x766122`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StoredMouseEvent {
+    /// The press's button by name; `None` for a move's, which carries 0.
+    pub(crate) button: Option<String>,
+    pub(crate) at: (f32, f32),
+}
+
 #[derive(Clone)]
 pub(crate) struct Model {
     /// Which FrameScript state this VM is: it picks the event table and the frame types.
@@ -156,6 +144,8 @@ pub(crate) struct Model {
     /// 1 for a non-empty path: without a font backend nothing failed, and addons revert their font
     /// on a nil.
     pub(crate) font_probe: Option<FontProbe>,
+    /// The movie frames' reader, subtitle flags and playing movies ([`super::movieframe`]).
+    pub(crate) movies: super::movieframe::Movies,
     /// Saved-variables folders, one `<Addon>.lua` each: the account's, then this character's.
     pub(crate) addons_saved_account: Option<std::path::PathBuf>,
     pub(crate) addons_saved_character: Option<std::path::PathBuf>,
@@ -362,6 +352,8 @@ pub(crate) struct Model {
     /// `0x7663e6` to the capture, else the hovered frame, so a chorded press keeps the capture;
     /// cleared at `0x7664bb` once no button is down. A title-region press captures nothing.
     pub(crate) mouse_capture: Option<FrameHandle>,
+    /// The last press the world input hook `0x492b50` ate, so the world frame never saw it.
+    pub(crate) press_hooked: bool,
     /// Per frame, when its last single `OnClick` fired: the client's `[CButton+0x334]`, the whole
     /// double-click state. It has no button identity (left then right makes a double), is zeroed
     /// when a double fires, and nothing else clears it, not hide, disable or the cursor leaving.
@@ -377,9 +369,6 @@ pub(crate) struct Model {
 
     /// Script errors caught from `pcall`'d handlers, drained by the host each frame.
     pub(crate) errors: Vec<String>,
-    /// Errors owed to `geterrorhandler()`, which the reference calls on each caught error; one the
-    /// handler itself raises skips this queue, which stops the recursion.
-    pub(crate) pending_error_dispatch: Vec<HandlerArg>,
     /// The session's retained diagnostic log, deduplicated and bounded; `errors` drains each frame.
     pub(crate) diagnostics: super::diagnostics::DiagnosticLog,
     /// Non-fatal warnings for the host, such as a dropped `inherits=` template.
@@ -398,23 +387,20 @@ pub(crate) struct Model {
     /// Each unit token's state as pushed this frame, keyed lowercased because 1.12's resolver
     /// (`0x515970`) matches with `SStrCmpI`: read it only through `unit`, where the fold lives.
     pub(crate) units_by_lower: HashMap<String, UnitState>,
-    /// The snapshot of each unit a `target` chain can end on, by guid, which the app pushes for
-    /// [`super::UnitGuids::chain_ends`]: a token with a hop that no push names reads its
+    /// The snapshot of a unit by guid, a no-host fallback a harness seats
+    /// ([`super::UiScript::set_unit_by_guid`]): a token with a hop that no push names reads its
     /// resolved guid's entry here.
     pub(crate) units_by_guid: HashMap<u64, UnitState>,
     /// Every unit `TargetByName` can pick, by guid, as the app's by-name scan sees it this frame:
     /// the binding resolves against it so the rest of its chunk reads the new selection.
     pub(crate) name_candidates: HashMap<u64, super::NameCandidate>,
-    /// A selection call moved the `"target"` view inside a chunk; the app's unit feed re-pushes
-    /// `"target"` from the committed selection, whatever its memo holds.
-    pub(crate) target_view_moved: bool,
     /// The player's auras in the reference cache's insertion order (`0xbc6040`), durations joined:
     /// the `GetPlayerBuff` family's list.
     pub(crate) player_auras: Vec<AuraState>,
     /// Every unit's auras by guid, the player's too, ascending aura slot: one list per unit,
     /// whatever token names it.
     pub(crate) unit_auras: HashMap<u64, super::UnitAuraList>,
-    /// The unit-token resolver's inputs (`0x515970`), which the aura bindings resolve through.
+    /// The unit-token resolver's no-host stand-in and its mouseover global (`0x515970`).
     pub(crate) unit_guids: super::UnitGuids,
     /// The player's active tracking aura, behind `GetTrackingTexture`.
     pub(crate) tracking: Option<super::aura::TrackingState>,
@@ -422,11 +408,6 @@ pub(crate) struct Model {
     /// or the targeting cursor made while it was out, and the handlers an engine step fired then
     /// ([`super::host::holding`]), for it to run as soon as it is back.
     pub(crate) script_calls: Vec<super::calls::Waiting>,
-    /// What deferred stretches left waiting, parked by key until the app runs them
-    /// ([`super::UiScript::park_since`]).
-    pub(crate) parked: HashMap<u64, Vec<super::calls::Waiting>>,
-    /// The next key [`Self::parked`] hands out.
-    pub(crate) next_parked: u64,
     /// How many drains of [`Self::script_calls`] are running, each inside a call the one outside
     /// it applied ([`super::calls::submit`]).
     pub(crate) call_depth: u8,
@@ -437,13 +418,8 @@ pub(crate) struct Model {
     pub(crate) call_raises: super::calls::CallRaises,
     /// The binding functions' queue and mouselook state.
     pub(crate) input: super::input_verbs::InputState,
-    /// The selection a script call last moved to and signalled `PLAYER_TARGET_CHANGED` for inside
-    /// itself, for the unit feed to take as heard ([`super::UiScript::announce_selection`]).
-    pub(crate) announced_selection: Option<Option<u64>>,
     /// The protected-action gate's input events ([`super::protected`]).
     pub(crate) protected: super::protected::Flags,
-    /// `DropItemOnUnit` tokens (`0x48d960`), gated by the app; a refusal silently keeps the item.
-    pub(crate) drop_item_on_unit: Vec<String>,
 
     /// The joined channels, in join order: the numbers `GetChannelName` answers.
     pub(crate) joined_channels: Vec<Option<super::channel::JoinedChannel>>,
@@ -453,8 +429,9 @@ pub(crate) struct Model {
     pub(crate) ready_check: party::ReadyCheckState,
     /// Saved raid lockouts from `SMSG_RAID_INSTANCE_INFO`, which outlive any roster change.
     pub(crate) saved_instances: Vec<party::SavedInstanceInfo>,
-    /// `SetRaidRosterSelection`'s raid row index, client-side only.
-    pub(crate) raid_selection: i64,
+    /// `SetRaidRosterSelection`'s member guid (`[0xb713e8]`), client-side only; 0 selects none.
+    /// A `/reload` carries it into the next VM ([`super::UiScript::take_raid_selection`]).
+    pub(crate) raid_selection: u64,
     /// `GetTime()`'s session seconds, which only the host moves ([`super::UiScript::tick`],
     /// [`super::UiScript::set_now`]); off `_G`, as the reference's clock is the OS tick count.
     pub(crate) now: f64,
@@ -481,6 +458,9 @@ pub(crate) struct Model {
     /// `SetLookingForGroup` writes and `GetLookingForGroup` reads; the reference's slots stay 0.
     pub(crate) lfg_slots: [u32; 3],
     pub(crate) lfg_comment: String,
+    /// The looking-for-group result list `MSG_LOOKING_FOR_GROUP`'s reply writes, and its title
+    /// waits.
+    pub(crate) lfg_store: super::lfg::LfgStore,
     /// Guild roster, ranks, MOTD and info, sorted and filtered by the app, which holds the toggles.
     pub(crate) guild: guild::GuildState,
     /// The roster module's own cells and the rank editor's unsaved edits, apart from `guild` so a
@@ -499,6 +479,8 @@ pub(crate) struct Model {
     pub(crate) known_languages: Vec<String>,
     /// `Languages.dbc`'s `(ID, Name_lang)` rows in file order, whatever the character knows.
     pub(crate) language_table: Vec<(u32, String)>,
+    /// The `ChrRaces` and `ChrClasses` rows an item's race and class lines walk.
+    pub(crate) item_req_names: super::tooltip_item::names::ItemReqNames,
     pub(crate) zone_channel_catalog: Vec<super::channel::ZoneChannelRow>,
     /// The recruitment auto-join latch `[0x843608]`: 0 `STANDARD`, 1 `AUTO` (`0x49ea70` maps any
     /// other word to 1). Boots at 1, as the reference writes `AUTO` for an untouched option.
@@ -510,17 +492,13 @@ pub(crate) struct Model {
     pub(crate) guild_recruitment_plan: super::channel::RecruitmentPlan,
     /// Lua changed the recruitment mode: the chat cache's dirty signal.
     pub(crate) guild_recruitment_changed: bool,
-    /// `LoggingChat` and `LoggingCombat`'s flags, and their change cue.
+    /// `LoggingChat` and `LoggingCombat`'s flags.
     pub(crate) logging_chat: bool,
     pub(crate) logging_combat: bool,
-    pub(crate) logging_changed: bool,
     /// A user-placed frame moved or resized, or `SetUserPlaced` ran: the layout cache's save cue.
     pub(crate) user_placed_changed: bool,
     /// The default chat language; `None` is no player, so `GetDefaultLanguage()` returns nothing.
     pub(crate) default_language: Option<String>,
-    /// `SetView`, `SaveView`, `ResetView`, `NextView`, `PrevView` and `FlipCameraYaw` calls; the
-    /// views reach Lua only as CVars, `cameraView` and `camera{Distance,Pitch,Yaw}{,A..D}`.
-    pub(crate) camera_view_requests: Vec<camera_view::CameraViewRequest>,
     /// The glue core's slots and request queue; empty in an in-game VM.
     pub(crate) glue: super::glue_core::GlueCore,
     /// `PLAYER_LOGIN`'s one-shot, the reference's `[0xb4e260]`: armed by the UI load, spent by
@@ -533,8 +511,8 @@ pub(crate) struct Model {
     /// An inspect-honor query is out (`0xb71fcc`); `RequestInspectHonorData` (`0x4c80a0`) refuses
     /// while set. Cleared by a reply (`0x4c6f4c`) or by the app clearing the slot (`0x4c6f9d`).
     pub(crate) inspect_honor_pending: bool,
-    /// `ShowingHelm()`: `PLAYER_FLAGS`' `HIDE_HELM` bit as pushed, set ahead on `ShowHelm` because
-    /// the wire verb is a blind toggle. Starts shown, as a fresh character's flags are 0.
+    /// `ShowingHelm()` with no host free to ask: `PLAYER_FLAGS`' `HIDE_HELM` bit clear, as
+    /// pushed. Starts shown, as a fresh character's flags are 0.
     pub(crate) helm_shown: bool,
     /// `ShowingCloak()`, the same for `HIDE_CLOAK`.
     pub(crate) cloak_shown: bool,
@@ -587,7 +565,7 @@ pub(crate) struct Model {
     pub(crate) current_resolution: Option<usize>,
     /// What this device and presentation path offer, behind `GetVideoCaps`.
     pub(crate) video_caps: super::cvars::VideoCaps,
-    /// `RestartGx()` calls, the video window's apply button.
+    /// The `gxRestart` runs no call took, a bare VM's, for the host's frame drain.
     pub(crate) restart_gx_asks: u32,
 
     /// Globals `RegisterForSave` declared, in order: written at logout and read back at load.
@@ -619,11 +597,6 @@ pub(crate) struct Model {
     pub(crate) macros_dirty: bool,
     /// Bumped by every seed and change, for readers that must not drain `macros_dirty`.
     pub(crate) macros_generation: u64,
-    /// Bumped by every `EditMacro` that names a macro, whose worker `0x4f1280` ends in the action
-    /// bar's usable refresh (`0x4f132e`).
-    pub(crate) macro_edits: u64,
-    /// The load's derivations the table owes the app since its last take.
-    pub(crate) macro_derives: macros::MacroDerives,
     /// Each macro's cached cast by id, derived in the verbs and the app's pass; an absent macro
     /// reads unbound.
     pub(crate) macro_bindings: HashMap<u32, macros::MacroBinding>,
@@ -688,19 +661,21 @@ pub(crate) struct Model {
     /// `HasFullControl`, the reference's `[0xb4b3e4]`: set by `SMSG_CLIENT_CONTROL_UPDATE` for the
     /// player, boots 1, and every cast, item and cursor gate refuses at 0.
     pub(crate) player_control: bool,
+    /// `+0x1c70` bit 0 of the player: far sight is on (`CMSG_FAR_SIGHT` 1 sent), which
+    /// `HasFullControl` refuses (`0x51a142`).
+    pub(crate) far_sight_on: bool,
     /// The on-use spells that pass the item dispatcher's control gate without control of the
     /// character (`0x5d8ec0`-`0x5d8f6a`), fed by the app.
     pub(crate) control_bypass: HashSet<u32>,
 
-    /// Bag contents by API bag id (0 is the backpack).
+    /// A harness's copy of the bags by API bag id (0 is the backpack), read only with no host to
+    /// ask ([`super::held`]).
     pub(crate) containers: HashMap<i64, container::ContainerState>,
-    /// Per `(bag, slot)`, `(start, duration, enabled)` in `GetTime` seconds, stamped at push.
-    pub(crate) container_cooldowns: HashMap<(i64, u32), (f64, f64, bool)>,
-    /// The same triple for a worn item, by live-API slot id (1..=19); the cooldown query is keyed
-    /// by the item's entry (`0x6e2ed0`), so a worn trinket answers as a bagged one does. Kept off
-    /// the doll snapshot, which is pushed on change.
+    /// A harness's copy of the same triple for a worn item, by live-API slot id (1..=19), read
+    /// only with no host to ask; the cooldown query is keyed by the item's entry (`0x6e2ed0`), so
+    /// a worn trinket answers as a bagged one does.
     pub(crate) worn_cooldowns: HashMap<usize, (f64, f64, bool)>,
-    /// `HasKey()`: a keys-family item in equipment, bags, bank or keyring; gates the keyring UI.
+    /// A harness's `HasKey()`, read only with no host to ask ([`super::held::has_key`]).
     pub(crate) has_key: bool,
     /// What the cursor carries; nothing moves locally, the server's updates settle the bags.
     pub(crate) cursor: Option<cursor::CursorPayload>,
@@ -711,9 +686,6 @@ pub(crate) struct Model {
     /// The world pick under the cursor (`[this+0x350]`): a world click drops no payload on an
     /// object, only an item on terrain, and anything over nothing.
     pub(crate) world_pick: cursor::WorldPick,
-    /// The item calls the verb segment running now filed, which its binding hands the host as the
-    /// segment ends ([`item_calls::submit_item_calls`]).
-    pub(crate) item_calls: Vec<item_calls::ItemCall>,
     /// Targeting wants an item (`0x6e6330`): a bag or paper-doll click becomes a pick.
     pub(crate) item_pick_armed: bool,
     /// Targeting wants a location (`0x6e6320`, the word's `0x60`): a minimap click casts at the
@@ -740,6 +712,9 @@ pub(crate) struct Model {
     /// apart from `drag` as in the reference: a `StartMoving` or `StartSizing` outlives the button,
     /// since mouse-up's auto-stop skips a Lua drag.
     pub(crate) moving: Option<super::object::FrameMove>,
+    /// The strata of the frames whose rect a resolve stored anew, bit per [`crate::order::Strata::index`]: each
+    /// such store runs `0x764a20` (`0x76b648`), which [`super::UiScript::resolve_layout`] applies.
+    pub(crate) rects_moved: u16,
     /// `SetLayoutMode`'s value, the root's `+0xcf8` (0 at start, `0x7642a5`): while non-zero, a
     /// press with Control or Alt held is a layout drag (`0x766301`).
     pub(crate) layout_mode: i32,
@@ -765,13 +740,8 @@ pub(crate) struct Model {
 
     /// The open vendor's stock, the `BuyMerchantItem` calls and whether `CloseMerchant` ran.
     pub(crate) merchant: Option<merchant::MerchantState>,
-    /// `GetRepairAllCost`'s total; 0 unless a repairer is open.
-    pub(crate) repair_all_cost: u32,
     /// The repair costs `SetInventoryItem` and `SetBagItem` return.
     pub(crate) repair_costs: merchant::RepairCosts,
-    /// The buys a drop verb made of a held vendor row, into a slot or a bag, handed to the host as
-    /// the verb returns ([`merchant::MerchantCall::BuyInSlot`], [`merchant::MerchantCall::BuyIntoBag`]).
-    pub(crate) merchant_drops: Vec<merchant::MerchantCall>,
     /// Repair mode (`InRepairMode`).
     pub(crate) repair_mode: bool,
 
@@ -789,9 +759,6 @@ pub(crate) struct Model {
     pub(crate) trainer_filter: u32,
     /// The profession build's pending count (`0xbde048`).
     pub(crate) trade_skill_pending: u32,
-    /// The product records the builds missed, one per miss, each waiting with the callback
-    /// `0x4fc8e0` (`0x4fcd32`).
-    pub(crate) trade_skill_build_waits: Vec<u32>,
     /// Collapsed skill-line ids, kept across a re-push and cleared when the trainer closes.
     pub(crate) trainer_collapsed: HashSet<u32>,
     /// The skill-line filter `ds:0xb73a20`: bit n set shows header group n, every bit on a list.
@@ -848,6 +815,10 @@ pub(crate) struct Model {
     pub(crate) craft: Option<craft::CraftState>,
     /// The window is open (`[0xbdcfb8]`), which a close alone zeroes (`0x4f5fe0`).
     pub(crate) craft_open: bool,
+    /// The names of the spells in the player's four effect slots (`CGPlayer_C+0x1d10`,
+    /// `0x5ea360`), which `GetCraftName` reads at the open marker (`[0xbdcfb8]`, 0 closed); `None`
+    /// is nil.
+    pub(crate) craft_slot_names: [Option<String>; 4],
     /// The selected spell id (`0xbdcfbc`), 0 for none, which a header or an index past the rows
     /// stores (`0x4f6050`); the index answers by finding its row (`0x4f6080`).
     pub(crate) craft_selection: u32,
@@ -903,12 +874,11 @@ pub(crate) struct Model {
 
     /// The auction house's lists and session as the app last pushed them, `None` until this VM's
     /// first push, and the auction calls. `auction_selected` is each list's selected auction id, 0
-    /// for none (`0x4cfda0`/`0x4cfec0`); `auction_can_query` is the 5 s throttle.
+    /// for none (`0x4cfda0`/`0x4cfec0`).
     pub(crate) auction: Option<auction::AuctionState>,
-    /// The Browse tab's class tree, pushed once per login.
+    /// The Browse tab's class tree, seeded once per VM.
     pub(crate) auction_item_classes: Vec<auction::AuctionCategory>,
     pub(crate) auction_selected: [u32; 3],
-    pub(crate) auction_can_query: bool,
     /// The sell slot's item, resolved to its guid when `StartAuction` fires.
     pub(crate) auction_sell_item: Option<cursor::CursorItem>,
 
@@ -933,11 +903,8 @@ pub(crate) struct Model {
     /// table, which the next open clears).
     pub(crate) trade_offered: [Option<cursor::CursorItem>; super::trade::TRADE_SLOTS],
 
-    /// The open questgiver panel, and whether `CloseQuest` ran.
+    /// The questgiver panel's cells a harness set, which the getters read with no host lent.
     pub(crate) quest: Option<quest::QuestState>,
-    /// The levels of the last greeting's two pools (`0xbde690`, `0xbdfe60`), which outlive the
-    /// panel until the next list fills them.
-    pub(crate) quest_pool_levels: quest::PoolLevels,
 
     /// Death countdowns and offers.
     pub(crate) death: death::DeathUiState,
@@ -946,24 +913,15 @@ pub(crate) struct Model {
     pub(crate) quest_log: quest_log::QuestLogState,
     pub(crate) quest_log_selection: u32,
     pub(crate) quest_log_abandon_mark: u32,
+    /// The selected quest's minimap blip (static slot 0).
+    pub(crate) quest_blip: Option<quest_log::QuestBlip>,
     /// Item id to its tooltip view.
     pub(crate) item_templates: HashMap<u32, ItemTemplateView>,
-    /// Item ids asked for and missing, for the app to answer: a lookup with a callback, which
-    /// asks the server.
-    pub(crate) item_stat_asks: HashSet<u32>,
     /// Item ids `GetItemInfo` read and missing: its lookup passes no callback (`0x48e185`), so
     /// the app answers from its cache only.
     pub(crate) item_stat_reads: HashSet<u32>,
     /// Set id to its tooltip set block (`0x854b1c`), and the misses asked for.
     pub(crate) item_sets: HashMap<u32, super::ItemSetView>,
-    pub(crate) item_set_asks: HashSet<u32>,
-    /// Guids an item build looked up in the name cache and missed, for the app to ask: the
-    /// creator's and the giver's lookups pass a callback (`0x52e204`, `0x52e29d`) at every build,
-    /// and a hovered bag or paper-doll slot's `OnUpdate` builds again each frame.
-    pub(crate) item_name_asks: HashSet<u64>,
-    /// Charter item guids whose build missed the petition record or its owner's name, for the
-    /// app to ask: both lookups pass a callback (`0x52b93b`, `0x52b9d2`) at every build.
-    pub(crate) petition_asks: HashSet<u64>,
     /// `ItemRandomProperties` id to its view, pushed whole at startup: a clicked tooltip cannot
     /// repaint on a late answer. The reference reads its loaded store `0xc0dbd4` (`0x52c991`).
     pub(crate) random_properties: HashMap<u32, super::RandomPropertyView>,
@@ -993,6 +951,12 @@ pub(crate) struct Model {
     pub(crate) aura_tooltip_asks: HashSet<super::AuraKey>,
     /// The tooltips whose spell or aura render missed its view, re-rendered when the app answers.
     pub(crate) spell_tooltip_waits: HashMap<FrameHandle, super::tooltip_spell::ViewWait>,
+    /// Each tooltip's last fresh spell build, kept until its next clear for the rebuild an item
+    /// answer runs (`+0x39c`, `+0x3b0`, `0x52f820`).
+    pub(crate) spell_builds: HashMap<FrameHandle, super::tooltip_spell::SpellBuild>,
+    /// The item records each tooltip's spell builds missed, the answer's cookie; an answer is
+    /// taken whether or not the tooltip still keeps a spell.
+    pub(crate) spell_item_waits: HashMap<FrameHandle, Vec<u32>>,
     /// Each tooltip's last item build, kept until its next clear for the rebuild a cache answer
     /// runs (`+0x380`..`+0x440`, `0x52e530`).
     pub(crate) item_builds: HashMap<FrameHandle, super::tooltip_item::build::ItemBuild>,
@@ -1001,6 +965,9 @@ pub(crate) struct Model {
     pub(crate) item_cache_waits: HashMap<FrameHandle, Vec<super::tooltip_item::build::CacheWait>>,
     /// The misses of the item build under way, handed to its tooltip as it ends.
     pub(crate) item_cache_misses: Vec<super::tooltip_item::build::CacheWait>,
+    /// The item records a tooltip kept a wait on since the last ask, each asked of the item cache
+    /// with the tooltips' callback ([`super::ItemCallback::Tooltip`]) once the borrow drops.
+    pub(crate) tooltip_record_asks: Vec<u32>,
     /// The quest-log groups' `(ZoneOrSort, name)`, sorted by `0x4de8f0` (`0xbb7040`): a row's
     /// group ordinal is its place here.
     pub(crate) quest_log_headers: Vec<(i32, String)>,
@@ -1058,6 +1025,10 @@ pub(crate) struct Model {
 
     /// `GetBillingTimeRested()` (`0x48ec50`) in minutes from `SMSG_AUTH_RESPONSE`, unconverted.
     pub(crate) billing_time_rested: u32,
+    /// `GetBillingTimeRemaining()`'s minutes (`+0x1af4`, `0x46dbf0`) from the same group.
+    pub(crate) billing_time_remaining: u32,
+    /// The plan flags (`+0x1afc`) `GetBillingPlan()` decodes (`0x46dc40`).
+    pub(crate) billing_plan_flags: u8,
     /// `InCinematic()`. While set, `StaticPopup_Show` refuses any dialog without
     /// `interruptCinematic` (`StaticPopup.lua:1454`).
     pub(crate) in_cinematic: bool,
@@ -1066,11 +1037,12 @@ pub(crate) struct Model {
     pub(crate) exhaustion: HashMap<u8, (String, f64)>,
 
     /// The paper doll's combat stats, `None` until the first push.
-    pub(crate) player_combat_stats: Option<char_stats::UnitCombatStats>,
+    pub(crate) player_combat_stats: Option<super::stat_read::UnitCombatStats>,
     pub(crate) inventory_slots: char_stats::InventorySlots,
     /// The six bank-bag slots, ids 64..=69, fed from the player descriptor's guids.
     pub(crate) bank_bag_slots: char_stats::BankBagSlots,
-    /// `GetInventoryAlertStatus` in `0x806eb8` order; every push fires `UPDATE_INVENTORY_ALERTS`.
+    /// The 12 alert statuses `GetInventoryAlertStatus` reads (`0xb71f60`), in `0x806eb8` order, as
+    /// the last recompute left them ([`super::UiScript::recompute_inventory_alerts`]).
     pub(crate) inventory_alerts: [u8; 12],
     /// Main- and off-hand temporary enchants in `GetWeaponEnchantInfo`'s order, pushed each frame.
     pub(crate) weapon_enchants: [Option<weapon_enchant::WeaponEnchant>; 2],
@@ -1079,8 +1051,6 @@ pub(crate) struct Model {
     /// slots 1..=19 as the doll numbers them: the slot getters' other-unit leg (`0x4c8420` →
     /// `0x5f0d60`).
     pub(crate) visible_equipment: HashMap<u64, char_stats::InventorySlots>,
-    /// `DressUpModel` `SetUnit`, `Dress`, `Undress` and `TryOn` calls, applied in call order.
-    pub(crate) dressup_intents: Vec<super::dressup::DressUpIntent>,
     /// Tabard designs per `TabardModel`, the app's preview five, the host facts and queued calls.
     pub(crate) tabard_designs: HashMap<crate::widget::FrameHandle, [i32; 5]>,
     pub(crate) tabard_preview: Option<[i32; 5]>,
@@ -1140,6 +1110,8 @@ pub(crate) struct Model {
     pub(crate) worldmap: super::worldmap::WorldMapState,
     /// Nameplate `Button`s under `WorldFrame`, never shrunk, visible to `GetChildren()`.
     pub(crate) nameplates: super::nameplate::NamePlates,
+    /// The units' watch lists in link order ([`super::unit_watch`]).
+    pub(crate) unit_watches: super::unit_watch::UnitWatches,
     /// Chat bubble `Frame`s under `WorldFrame`, pooled the same way.
     pub(crate) chat_bubbles: super::chat_bubble::ChatBubbles,
     /// The world-state readout's rows, gated and resolved by the app.
@@ -1161,6 +1133,11 @@ pub(crate) struct Model {
     pub(crate) item_locks: std::collections::HashSet<u64>,
     /// The last cursor position in UI space (logical px, y-up), behind `GetCursorPosition()`.
     pub(crate) cursor_pos: (f32, f32),
+    /// The last mouse event the top stored (`[root+0x1104]`), as the focus change's release reads
+    /// it ([`super::UiScript::focus_world_frame`]): a press stores its own at its handler's top
+    /// (`0x76631b`), a move to a new point its own (`0x76615f`), whose button is 0, and a release
+    /// or a wheel notch stores nothing.
+    pub(crate) stored_event: StoredMouseEvent,
 
     /// The minimap's process-wide statics (zoom cells, indoor byte, mask), shared by every
     /// Minimap frame of this VM.
@@ -1173,8 +1150,8 @@ pub(crate) struct Model {
     /// `"player"` pushes that carry it: corrected, never blanked. A per-login rebuild is unseen, as
     /// its verbs exist only in game (`0x850438`), not at the glue screen (`0x46abb0`).
     pub(crate) player_record: super::PlayerRecord,
-    /// `GetBindLocation()`, the bind point's area name: `""` before it lands, never nil.
-    pub(crate) bind_location: String,
+    /// `GetBindLocation()`, the bind point's area name; `None` answers the `HOME_INN` text.
+    pub(crate) bind_location: Option<String>,
     /// `GMTicketCategory.dbc` `(id, name)` rows in file order; the ids are wire values.
     pub(crate) gm_ticket_categories: Vec<(u32, String)>,
     /// `CheckBinderDist()`: the innkeeper's question is live and in range; false hides its dialog.
@@ -1188,6 +1165,23 @@ pub(crate) struct Model {
 }
 
 impl Model {
+    /// The `LoggingChat` (`combat` false) or `LoggingCombat` flag.
+    pub(crate) fn logging(&self, combat: bool) -> bool {
+        if combat {
+            self.logging_combat
+        } else {
+            self.logging_chat
+        }
+    }
+
+    pub(crate) fn set_logging(&mut self, combat: bool, on: bool) {
+        if combat {
+            self.logging_combat = on;
+        } else {
+            self.logging_chat = on;
+        }
+    }
+
     /// The profession windows open (`[0xbde040]`, `[0xbdcfb8]`): the trade skill's line and the
     /// craft's type while each window is open, which a close zeroes (`0x4fc870`, `0x4f5fe0`).
     pub(crate) fn open_professions(&self) -> super::OpenProfessions {
@@ -1217,9 +1211,14 @@ impl Model {
             .unwrap_or_else(|| std::rc::Rc::new(super::NoNameLists))
     }
 
-    /// The text a `SetText` stores (`0x771d80` with its expand flag): the separator pass
-    /// `0x771c50` while `SetEuropeanNumbers` holds the switch (`0x771d9f`), else the text itself.
+    /// The text a `SetText` stores (`0x771d80` with its expand flag): the grammar escapes `|1` and
+    /// `|2` rewritten (`0x7716f0`, no locale gate), then the separator pass `0x771c50` while
+    /// `SetEuropeanNumbers` holds the switch (`0x771d9f`).
     pub(crate) fn localized_text(&self, text: String) -> String {
+        let text = match crate::strings::expand_grammar_escapes(&text) {
+            std::borrow::Cow::Borrowed(_) => text,
+            std::borrow::Cow::Owned(rewritten) => rewritten,
+        };
         if self.european_numbers {
             crate::strings::swap_number_separators(&text)
         } else {
@@ -1232,27 +1231,19 @@ impl Model {
         self.fonts.block_of(name)
     }
 
-    /// Records a caught script error for the host, the retained log and the Lua error handler: `log`
-    /// is the decorated text the host and the retained log keep, `handler` the one value the error
-    /// handler is called with. An error raised by the handler itself goes to `errors` directly,
-    /// which stops the recursion.
-    pub(crate) fn record_script_error(&mut self, log: String, handler: String) {
-        self.record_error(log, HandlerArg::Text(handler));
-    }
-
-    /// A script error whose log row is `log` and whose handler hears `handler`.
-    pub(crate) fn record_error(&mut self, log: String, handler: HandlerArg) {
+    /// Records a caught script error for the host and the retained log. The Lua error handler has
+    /// heard it already, at the raise, through the runner's error function
+    /// ([`super::stdlib::error_function`]); an error no script raised reaches no handler.
+    pub(crate) fn record_error(&mut self, log: String) {
         self.diagnostics
             .record(super::diagnostics::DiagnosticKind::Error, &log);
-        self.pending_error_dispatch.push(handler);
         self.errors.push(log);
     }
 
-    /// [`Self::record_script_error`] for an error mlua caught: the log keeps mlua's `Display` (its
-    /// word and traceback), the handler gets the error value itself, as `lua_pcall` hands its
-    /// error function the value raised (`0x703b40`).
+    /// [`Self::record_error`] for an error mlua caught: the log keeps mlua's `Display` (its word
+    /// and traceback).
     pub(crate) fn record_lua_error(&mut self, e: &mlua::Error) {
-        self.record_error(e.to_string(), HandlerArg::Error(e.clone()));
+        self.record_error(e.to_string());
     }
 
     /// Records a non-fatal warning for the host's terminal and the retained diagnostic log.
@@ -1268,11 +1259,48 @@ impl Model {
         self.warnings.push(msg);
     }
 
-    /// The state of the unit `token` names, as the `Unit*` getters read it: the snapshot the app
-    /// pushed under the token, else, for a token with a `target` hop or for `target` itself, what
-    /// the getters read for the guid it resolves to.
-    pub(crate) fn unit(&self, token: &str) -> Option<&UnitState> {
+    /// The state of the unit `token` names off the snapshots alone: the snapshot the app pushed
+    /// under the token, else, for a token with a `target` hop or for `target` itself, what the
+    /// getters read for the guid the resolver's stand-in names. A getter reads it through
+    /// [`super::unit::view`], which resolves at the call.
+    pub(crate) fn snapshot_unit(&self, token: &str) -> Option<&UnitState> {
         self.pushed_unit(token).or_else(|| self.chained_unit(token))
+    }
+
+    /// What the getters read for `guid`, the unit a token names at the call where its own push
+    /// names another (the resolver's guid, then each getter's lookup, `0x468460`): while it is
+    /// `held`, a chain end's snapshot, else a token's push of it, else its by-name candidate's,
+    /// else the unit as its guid alone; with no object, the app's no-object entry, else its guid
+    /// alone, whose name the name cache answers (`0x5171eb`). The group's records of it are the
+    /// host's to read (`0x496400`, `0x496420`).
+    pub(crate) fn unit_of_guid(&self, guid: u64, held: bool) -> std::borrow::Cow<'_, UnitState> {
+        use std::borrow::Cow;
+        let found = if held {
+            self.units_by_guid
+                .get(&guid)
+                .filter(|u| u.has_object)
+                .or_else(|| {
+                    // Of several tokens naming the unit, the first by name.
+                    self.units_by_lower
+                        .iter()
+                        .filter(|(_, u)| u.guid == guid && u.has_object)
+                        .min_by(|a, b| a.0.cmp(b.0))
+                        .map(|(_, u)| u)
+                })
+                .or_else(|| self.name_candidates.get(&guid).map(|c| &c.state))
+        } else {
+            self.units_by_guid.get(&guid)
+        };
+        match found {
+            Some(u) => Cow::Borrowed(u),
+            None => Cow::Owned(UnitState {
+                exists: held,
+                has_object: held,
+                is_connected: held,
+                guid,
+                ..Default::default()
+            }),
+        }
     }
 
     /// The snapshot pushed under `token` itself, folded as 1.12's resolver `0x515970` folds
@@ -1289,24 +1317,15 @@ impl Model {
     /// The unit a token with a `target` hop and no push of its own names, or `target` itself while
     /// the selection's object is not held (the app pushes `"target"` for a held one): the
     /// resolver's guid (`0x515970`, which the getters call before their own object lookup,
-    /// `0x468460`), then what each getter reads for that guid. A held unit's snapshot first; with
-    /// no object, the group row naming the guid, whose own token's push carries its records
-    /// (`0x496400`, `0x496420`) and the roster's `UnitExists` (`0x491900`), so a party member out
-    /// of range shows on the target frame; off the roster, the app's no-object entry, a name from
-    /// the name cache (`0x5171eb`) and nothing more. Any other token without a hop is the app's to
-    /// push, base by base, and reads nothing here.
+    /// `0x468460`), then what each getter reads for that guid: a held unit's snapshot, else the
+    /// app's no-object entry, a name from the name cache (`0x5171eb`) and nothing more. A group
+    /// member's records are the host's to read (`0x496400`, `0x496420`). Any other token without
+    /// a hop is the app's to push, base by base, and reads nothing here.
     fn chained_unit(&self, token: &str) -> Option<&UnitState> {
         match parse_unit_token(token) {
             UnitTokenParse::Unit { base, hops } if hops > 0 || base == UnitBase::Target => {
                 let guid = self.unit_guids.resolve_unit(base, hops)?;
-                match self.units_by_guid.get(&guid) {
-                    Some(held) if held.has_object => Some(held),
-                    unheld => self
-                        .unit_guids
-                        .roster_token(guid)
-                        .and_then(|t| self.pushed_unit(&t))
-                        .or(unheld),
-                }
+                self.units_by_guid.get(&guid)
             }
             _ => None,
         }
@@ -1330,6 +1349,7 @@ impl Model {
             texture_size_probe: None,
             cursor_size_probe: None,
             font_probe: None,
+            movies: Default::default(),
             addons_saved_account: None,
             addons_saved_character: None,
             framexml_templates: Default::default(),
@@ -1389,6 +1409,7 @@ impl Model {
             minimap_blip: None,
             mouse_down_on: HashMap::new(),
             mouse_capture: None,
+            press_hooked: false,
             last_click: HashMap::new(),
             pending_size_changed: Vec::new(),
             content_writes: Vec::new(),
@@ -1401,7 +1422,6 @@ impl Model {
             layout_chain: None,
             layout_screen: None,
             errors: Vec::new(),
-            pending_error_dispatch: Vec::new(),
             diagnostics: Default::default(),
             warnings: Vec::new(),
             // 1024x768 until the host calls `set_screen_size`; y-up `[bottom, left, top, right]`.
@@ -1416,21 +1436,16 @@ impl Model {
             units_by_lower: HashMap::new(),
             units_by_guid: HashMap::new(),
             name_candidates: HashMap::new(),
-            target_view_moved: false,
             player_auras: Vec::new(),
             unit_auras: HashMap::new(),
             unit_guids: Default::default(),
             tracking: None,
             script_calls: Vec::new(),
-            parked: HashMap::new(),
-            next_parked: 0,
             call_depth: 0,
             kept_calls: None,
             call_raises: Default::default(),
             input: Default::default(),
             protected: Default::default(),
-            announced_selection: None,
-            drop_item_on_unit: Vec::new(),
             joined_channels: Vec::new(),
             party: party::PartyState::default(),
             ready_check: party::ReadyCheckState::default(),
@@ -1448,6 +1463,7 @@ impl Model {
             lfg_dungeons: Vec::new(),
             lfg_slots: [0; 3],
             lfg_comment: String::new(),
+            lfg_store: Default::default(),
             guild: guild::GuildState::default(),
             guild_cells: guild::GuildCells::default(),
             petition: petition::PetitionState::default(),
@@ -1458,6 +1474,7 @@ impl Model {
             chat_colors_changed: false,
             known_languages: Vec::new(),
             language_table: Vec::new(),
+            item_req_names: Default::default(),
             zone_channel_catalog: Vec::new(),
             guild_recruitment_mode: 1,
             guild_recruitment_cascade: false,
@@ -1465,10 +1482,8 @@ impl Model {
             guild_recruitment_changed: false,
             logging_chat: false,
             logging_combat: false,
-            logging_changed: false,
             user_placed_changed: false,
             default_language: None,
-            camera_view_requests: Vec::new(),
             glue: Default::default(),
             player_login_armed: false,
             honor: None,
@@ -1506,8 +1521,6 @@ impl Model {
             macros: macros::MacroState::default(),
             macros_dirty: false,
             macros_generation: 0,
-            macro_edits: 0,
-            macro_derives: Default::default(),
             macro_bindings: HashMap::new(),
             macro_icons: Vec::new(),
             macro_icon_source: None,
@@ -1535,15 +1548,14 @@ impl Model {
             shapeshift_forms: Vec::new(),
             pet_bar: super::pet::PetBarState::default(),
             player_control: true,
+            far_sight_on: false,
             control_bypass: HashSet::new(),
             containers: HashMap::new(),
-            container_cooldowns: HashMap::new(),
             worn_cooldowns: HashMap::new(),
             has_key: false,
             cursor: None,
             cursor_grid: false,
             world_pick: cursor::WorldPick::default(),
-            item_calls: Vec::new(),
             item_pick_armed: false,
             location_pick_armed: false,
             pending_wrap: None,
@@ -1553,6 +1565,7 @@ impl Model {
             drag_registered: HashMap::new(),
             drag: None,
             moving: None,
+            rects_moved: 0,
             layout_mode: 0,
             european_numbers: false,
             locale: 0,
@@ -1562,9 +1575,7 @@ impl Model {
             color_drag: None,
             gossip: None,
             merchant: None,
-            repair_all_cost: 0,
             repair_costs: Default::default(),
-            merchant_drops: Vec::new(),
             repair_mode: false,
             stable: Default::default(),
             bank: None,
@@ -1572,7 +1583,6 @@ impl Model {
             trainer_selection: None,
             trainer_filter: 7,
             trade_skill_pending: 0,
-            trade_skill_build_waits: Vec::new(),
             trainer_collapsed: HashSet::new(),
             trainer_line_filter: u32::MAX,
             trainer_rows: Vec::new(),
@@ -1595,6 +1605,7 @@ impl Model {
             trade_skill_repeat_count: 0,
             craft: None,
             craft_open: false,
+            craft_slot_names: Default::default(),
             craft_selection: 0,
             craft_rows: Vec::new(),
             craft_visible: 0,
@@ -1620,7 +1631,6 @@ impl Model {
             auction: None,
             auction_item_classes: Vec::new(),
             auction_selected: [0; 3],
-            auction_can_query: true,
             auction_sell_item: None,
             trade: None,
             trade_partner: 0,
@@ -1629,20 +1639,16 @@ impl Model {
             trade_place_seq: 0,
             trade_offered: Default::default(),
             quest: None,
-            quest_pool_levels: Default::default(),
             death: death::DeathUiState::default(),
             quest_log: quest_log::QuestLogState::default(),
             quest_log_selection: 0,
             quest_log_abandon_mark: 0,
+            quest_blip: None,
             item_templates: HashMap::new(),
             item_sets: HashMap::new(),
-            item_set_asks: HashSet::new(),
-            item_name_asks: HashSet::new(),
-            petition_asks: HashSet::new(),
             random_properties: HashMap::new(),
             enchant_names: HashMap::new(),
             known_spells: HashSet::new(),
-            item_stat_asks: HashSet::new(),
             item_stat_reads: HashSet::new(),
             player_req: PlayerReqState::default(),
             lock_rows: HashMap::new(),
@@ -1655,9 +1661,12 @@ impl Model {
             aura_tooltips: HashMap::new(),
             aura_tooltip_asks: HashSet::new(),
             spell_tooltip_waits: HashMap::new(),
+            spell_builds: HashMap::new(),
+            spell_item_waits: HashMap::new(),
             item_builds: HashMap::new(),
             item_cache_waits: HashMap::new(),
             item_cache_misses: Vec::new(),
+            tooltip_record_asks: Vec::new(),
             quest_log_headers: Vec::new(),
             quest_store: Default::default(),
             quest_log_collapsed: HashSet::new(),
@@ -1669,17 +1678,19 @@ impl Model {
             shown_chat_lines: Vec::new(),
             worldmap: super::worldmap::WorldMapState::default(),
             nameplates: super::nameplate::NamePlates::default(),
+            unit_watches: Default::default(),
             chat_bubbles: super::chat_bubble::ChatBubbles::default(),
             worldstate: super::worldstate::WorldStateUiState::default(),
             pending_events: Vec::new(),
             verb_events: None,
             item_locks: std::collections::HashSet::new(),
             cursor_pos: (0.0, 0.0),
+            stored_event: StoredMouseEvent::default(),
             minimap: crate::widget::MinimapStatics::default(),
             screenshot_asks: 0,
             realm_name: String::new(),
             player_record: super::PlayerRecord::default(),
-            bind_location: String::new(),
+            bind_location: None,
             gm_ticket_categories: Vec::new(),
             binder_pending: false,
             summon_confirm: super::summon::SummonConfirmUiState::default(),
@@ -1698,6 +1709,8 @@ impl Model {
             partial_play_time: false,
             no_play_time: false,
             billing_time_rested: 0,
+            billing_time_remaining: 0,
+            billing_plan_flags: 0,
             in_cinematic: false,
             exhaustion: [
                 (1, ("Rested".to_string(), 2.0)),
@@ -1714,7 +1727,6 @@ impl Model {
             inventory_alerts: [0; 12],
             weapon_enchants: [None; 2],
             visible_equipment: HashMap::new(),
-            dressup_intents: Vec::new(),
             tabard_designs: HashMap::new(),
             tabard_preview: None,
             tabard_host: Default::default(),
@@ -1798,9 +1810,7 @@ impl Model {
         {
             return;
         }
-        let changed = self.arena.frame(h).is_some_and(|f| f.scale != scale);
-        self.arena.set_scale(h, scale);
-        if changed {
+        if self.arena.set_scale(h, scale, force) {
             // The effective scale cascades down the subtree, an input of each frame's node.
             self.touch_layout_subtree(h);
             self.touch_measure_all();
@@ -2312,6 +2322,7 @@ impl Model {
     /// The layout step of a write to region `rh`'s shown bit that `set_region_hidden` could not
     /// wrap, given whether it drew before.
     pub(crate) fn note_region_draw(&mut self, rh: RegionHandle, drew: bool) {
+        self.note_region_registered(rh, drew, false);
         let now = self.region_draws(rh);
         if drew == now || self.region_owner_loading(rh) {
             return;
@@ -2320,6 +2331,16 @@ impl Model {
             self.undefer_region(rh);
         } else {
             self.defer_region(rh);
+        }
+    }
+
+    /// The draw place of region `rh` after a write that may register it (`0x77fcb0`), given
+    /// whether it drew before and whether the write unregistered it first (a new layer,
+    /// `0x77fdb1`): one that draws now and did not, or was relinked, takes its layer list's tail
+    /// (`0x76a860`). The load window does not gate the link, only the deferral (`0x77fcd7`).
+    pub(crate) fn note_region_registered(&mut self, rh: RegionHandle, drew: bool, relinked: bool) {
+        if self.region_draws(rh) && (!drew || relinked) {
+            self.arena.restamp_region(rh);
         }
     }
 

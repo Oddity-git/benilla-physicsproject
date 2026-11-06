@@ -12,11 +12,11 @@ use bevy::prelude::*;
 
 use super::impact::{receive_swing, stop_swing, ImpactSinks};
 use super::{
-    Engaged, EnvDamageTable, KitPush, MountFlourish, PendingImpacts, PlaySeq, SheathRequest,
-    SwingImpact, SwingMessage,
+    AttackSeam, Engaged, EnvDamageTable, KitPush, MountFlourish, PendingImpacts, PlaySeq,
+    SheathRequest, SwingImpact, SwingMessage,
 };
 use crate::net::{AiReactionMessage, EmoteKind, EmoteMessage, GuidIndex, NetHandlerApp, SelfGuid};
-use crate::swing_refusal::SwingRefusalEdge;
+use crate::swing_refusal::{SwingRefusal, SwingRefusalEdge};
 use crate::ui_action::{UiError, UiErrorKeys};
 
 /// Register the layer's handlers, from [`super::CreatureAnimPlugin`].
@@ -82,12 +82,26 @@ fn on_ai_reaction(
     }
 }
 
-fn on_swing_refusal(In(ev): In<SessionEvent>, mut edges: MessageWriter<SwingRefusalEdge>) {
-    match ev {
-        SessionEvent::AttackSwingError(e) => attack_swing_error(e, &mut edges),
-        SessionEvent::CancelCombat => cancel_combat(&mut edges),
-        _ => {}
-    }
+/// The refusals' arms, applied inside their packets ([`crate::swing_refusal`]): the latch, or the
+/// server's silent stop (`0x625ab8`, `0x5e7dd0`) with what StopAttack runs.
+fn on_swing_refusal(
+    In(ev): In<SessionEvent>,
+    time: Res<Time>,
+    // Absent in a harness without the refusal plugin.
+    refusal: Option<ResMut<SwingRefusal>>,
+    mut seam: AttackSeam,
+) {
+    let edge = match ev {
+        SessionEvent::AttackSwingError(e) => attack_swing_error(e),
+        SessionEvent::CancelCombat => cancel_combat(),
+        _ => return,
+    };
+    crate::swing_refusal::apply(
+        edge,
+        refusal.map(|r| r.into_inner()),
+        time.elapsed(),
+        Some(&mut seam),
+    );
 }
 
 fn on_feign_death_resisted(In(ev): In<SessionEvent>, errors: Res<UiErrorKeys>) {
@@ -145,37 +159,68 @@ fn on_attacker_state(
     self_guid: Res<SelfGuid>,
     mut swings: MessageWriter<SwingMessage>,
     mut sheaths: MessageWriter<SheathRequest>,
-    mut edges: MessageWriter<SwingRefusalEdge>,
+    refusal: Option<ResMut<SwingRefusal>>,
     mut pending: ResMut<PendingImpacts>,
     mut sinks: ImpactSinks,
     mut play_seq: ResMut<PlaySeq>,
+    stop: (
+        Res<crate::net::NetCommands>,
+        ResMut<super::AttackStopInFlight>,
+        Query<&Transform>,
+    ),
     tutorials: Option<Res<crate::tutorial::Tutorials>>,
+    // The self-defence acquire the swing owes, absent in a harness without the target plugin.
+    acquires: Option<ResMut<crate::target::OwedSelects>>,
+    // The attacker's auto-move, which the swing ends, and the lane its `AUTOFOLLOW_END` goes on.
+    mut auto_move: (
+        crate::player::AutoMoveStop,
+        Option<ResMut<crate::field_watch::NoticeLane>>,
+    ),
 ) {
     if let SessionEvent::AttackerState(s) = ev {
+        let attacker = s.attacker;
         attacker_state(
             tutorials.as_deref(),
+            acquires.map(|a| a.into_inner()),
             s,
             &index,
             &self_guid,
             &mut swings,
             &mut sheaths,
-            &mut edges,
+            refusal.map(|r| r.into_inner()),
             &mut pending,
             &mut sinks,
             play_seq.next(),
+            stop,
         );
+        // A held attacker's auto-move other than mode 2, the facing turn, ends (`0x625a03`-
+        // `0x625a21` → `StopAutoMove(1, 1)`), after the self-defence acquire (`0x6259fe`) and ahead
+        // of the packet's line (`0x625a2c`); it acts only on the active mover, so only on our own
+        // swing.
+        if index.0.contains_key(&attacker) {
+            let (stop, lane) = &mut auto_move;
+            stop.stop_unless_facing_turn(attacker, lane.as_deref_mut());
+        }
     }
 }
 
 fn on_environmental_damage_log(
     In(ev): In<SessionEvent>,
     index: Res<GuidIndex>,
+    stores: Query<&crate::net::ObjectStore>,
     table: Option<Res<EnvDamageTable>>,
     mut play_seq: ResMut<PlaySeq>,
     mut out: MessageWriter<KitPush>,
 ) {
     if let SessionEvent::EnvironmentalDamageLog(e) = ev {
-        environmental_damage_log(e, &index, table.as_deref(), &mut play_seq, &mut out);
+        environmental_damage_log(
+            e,
+            &index,
+            &stores,
+            table.as_deref(),
+            &mut play_seq,
+            &mut out,
+        );
     }
 }
 
@@ -239,14 +284,14 @@ fn attack_stop(
 }
 
 /// The server refused our swing (`SMSG_ATTACKSWING_*`); [`crate::swing_refusal`] owns the rest.
-fn attack_swing_error(error: AttackSwingError, edges: &mut MessageWriter<SwingRefusalEdge>) {
-    edges.write(SwingRefusalEdge::Refused(error));
+fn attack_swing_error(error: AttackSwingError) -> SwingRefusalEdge {
+    SwingRefusalEdge::Refused(error)
 }
 
 /// `SMSG_CANCEL_COMBAT`: the server stopped our attack. The reference's handler `0x5e7dd0` is the
 /// refusal family's fourth arm verbatim.
-fn cancel_combat(edges: &mut MessageWriter<SwingRefusalEdge>) {
-    edges.write(SwingRefusalEdge::CombatCancelled);
+fn cancel_combat() -> SwingRefusalEdge {
+    SwingRefusalEdge::CombatCancelled
 }
 
 /// `SMSG_FEIGN_DEATH_RESISTED`: one red "Resisted" line and nothing else. The reference's handler
@@ -276,26 +321,66 @@ fn ai_reaction(
     }
 }
 
+/// The tail of `0x5ea800` after the latch clear: with the victim at or beyond four melee reaches
+/// (`0x5ea880`-`0x5ea8a4`), `SendAttackStop` (`0x5ea8a8` → `0x624370`) sends `CMSG_ATTACKSTOP`
+/// and sets `me`'s stop in flight. The squared distance is 3D, between the two units' positions.
+fn stop_on_far_victim(
+    me: Entity,
+    them: Entity,
+    stores: &Query<&crate::net::ObjectStore>,
+    places: &Query<&Transform>,
+    net: &crossbeam_channel::Sender<crate::net::ClientCommand>,
+    stop_word: &mut super::AttackStopInFlight,
+) {
+    let (Ok(t), Ok(m), Ok(tp), Ok(mp)) = (
+        stores.get(them),
+        stores.get(me),
+        places.get(them),
+        places.get(me),
+    ) else {
+        return;
+    };
+    let d2 = tp.translation.distance_squared(mp.translation);
+    if super::swing_beyond_stop_reach(d2, crate::target::cursor_mode::melee_reach(t, m)) {
+        let _ = net.send(crate::net::ClientCommand::AttackStop);
+        stop_word.set(me);
+    }
+}
+
 /// One melee swing (`SMSG_ATTACKERSTATEUPDATE`): the attacker's swing plays now and the victim's
 /// feedback waits for the clip's attack-hit key (`0x6247d0`); the combat-log line and its
 /// `COMBAT_TEXT_UPDATE` word come off the same packet in [`crate::combat_log`], after this.
 fn attacker_state(
     tutorials: Option<&crate::tutorial::Tutorials>,
+    acquires: Option<&mut crate::target::OwedSelects>,
     s: AttackerState,
     index: &GuidIndex,
     self_guid: &SelfGuid,
     swings: &mut MessageWriter<SwingMessage>,
     sheaths: &mut MessageWriter<SheathRequest>,
-    edges: &mut MessageWriter<SwingRefusalEdge>,
+    refusal: Option<&mut SwingRefusal>,
     pending: &mut PendingImpacts,
     sinks: &mut ImpactSinks,
     seq: u64,
+    (net, mut stop_word, places): (
+        Res<crate::net::NetCommands>,
+        ResMut<super::AttackStopInFlight>,
+        Query<&Transform>,
+    ),
 ) {
     let victim = index.0.get(&s.victim).copied();
     // Our landed swing clears the refusal latch (`0x6259b6` → `0x5ea800` → `0x5ecdb0(0)`) when we
-    // are the attacker (`0x5fa6d0`) and the victim resolves; sent from here to keep packet order.
+    // are the attacker (`0x5fa6d0`) and the victim resolves.
     if self_guid.0 == Some(s.attacker) && victim.is_some() {
-        edges.write(SwingRefusalEdge::Landed);
+        crate::swing_refusal::apply(
+            SwingRefusalEdge::Landed,
+            refusal,
+            std::time::Duration::ZERO,
+            None,
+        );
+        if let (Some(me), Some(them)) = (index.0.get(&s.attacker).copied(), victim) {
+            stop_on_far_victim(me, them, &sinks.stores, &places, &net.0, &mut stop_word);
+        }
     }
     if benilla_assets::trace::enabled() {
         benilla_assets::trace::line(
@@ -339,6 +424,16 @@ fn attacker_state(
         };
         receive_swing(swing, pending, sinks);
         swings.write(swing);
+        // A swing at us selects its attacker when nothing is selected (`0x6259c9`-`0x6259fe`),
+        // after the victim's feedback and ahead of the packet's line (`0x625a2c`).
+        if self_guid.0 == Some(s.victim) && victim.is_some() {
+            if let Some(acquires) = acquires {
+                acquires.push(crate::target::OwedSelect::Acquire(
+                    e,
+                    crate::target::Acquire::Attacker,
+                ));
+            }
+        }
     } else if swing.victim.is_some_and(|v| {
         // The unresolved-attacker leg (`0x625823` → `0x625a3e`) calls the gated dispatcher
         // (`0x625a6d` → `0x624530`), so the lootable gate applies here too.
@@ -402,21 +497,28 @@ fn play_spell_visual(
             entity: e,
             kit_id,
             seq: play_seq.next(),
+            at: Some(crate::lanes::stamp()),
         });
     }
 }
 
 /// `SMSG_ENVIRONMENTALDAMAGELOG`'s visual (`0x624fcc` in `0x624f30`): the damage type's kit plays
-/// on the victim like any kit push (`0x60edf0`). The packet plays no sound: a fall's pain grunt
-/// is the client's own landing predictor (`0x602d00`, `creature_anim::env_damage`).
+/// on the victim like any kit push (`0x60edf0`), but only on a victim the packet's handler finds
+/// as a unit (`0x62565c`, type mask 8). The packet plays no sound: a fall's pain grunt is the
+/// client's own landing predictor (`0x602d00`, `creature_anim::env_damage`).
 fn environmental_damage_log(
     e: EnvironmentalDamageLog,
     index: &GuidIndex,
+    stores: &Query<&crate::net::ObjectStore>,
     table: Option<&EnvDamageTable>,
     play_seq: &mut PlaySeq,
     out: &mut MessageWriter<KitPush>,
 ) {
-    if let Some(&ent) = index.0.get(&e.victim) {
+    let unit = index
+        .0
+        .get(&e.victim)
+        .filter(|_| crate::ui_chat::combat::holds_unit(e.victim, index, stores));
+    if let Some(&ent) = unit {
         if let Some(kit_id) = table.and_then(|t| t.0.kit_id(e.damage_type)) {
             debug!(
                 "net: environmental damage on {:#x} (type {}, {} dmg) → kit {kit_id}",
@@ -426,6 +528,7 @@ fn environmental_damage_log(
                 entity: ent,
                 kit_id,
                 seq: play_seq.next(),
+                at: Some(crate::lanes::stamp()),
             });
         }
     }
@@ -451,6 +554,50 @@ fn mount_special(
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
+
+    /// `0x62565c` looks the victim up with type mask 8 and calls `0x624f30`, whose tail plays the
+    /// type's kit (`0x624fcc`), only for a unit it finds: a held game object or a guid not held
+    /// plays none, and a hit of all zeros on a unit still plays its kit.
+    #[test]
+    fn an_environmental_kit_needs_a_held_unit() {
+        const UNIT: u64 = 1;
+        const TRAP: u64 = 2;
+        const FALL_KIT: u32 = 1066;
+        let kits = |victim: u64, damage: u32| {
+            let mut world = World::new();
+            world.init_resource::<PlaySeq>();
+            world.init_resource::<Messages<KitPush>>();
+            world.insert_resource(EnvDamageTable(
+                benilla_formats::EnvironmentalDamageTable::from_kits([0, 0, FALL_KIT, 0, 0, 0]),
+            ));
+            let mut index = GuidIndex::default();
+            for (guid, mask) in [(UNIT, 0x9), (TRAP, 0x21)] {
+                let e = world
+                    .spawn(crate::net::ObjectStore(
+                        benilla_protocol::ObjectFields::from_pairs(&[(2, mask)]),
+                    ))
+                    .id();
+                index.0.insert(guid, e);
+            }
+            world.insert_resource(index);
+            let packet = SessionEvent::EnvironmentalDamageLog(EnvironmentalDamageLog {
+                victim,
+                damage_type: 2,
+                damage,
+                absorb: 0,
+                resist: 0,
+            });
+            world
+                .run_system_once_with(on_environmental_damage_log, packet)
+                .unwrap();
+            let mut pushed = world.resource_mut::<Messages<KitPush>>();
+            pushed.drain().map(|k| k.kit_id).collect::<Vec<_>>()
+        };
+        assert_eq!(kits(UNIT, 245), [FALL_KIT]);
+        assert_eq!(kits(UNIT, 0), [FALL_KIT], "a hit of all zeros");
+        assert!(kits(TRAP, 245).is_empty(), "a game object");
+        assert!(kits(3, 245).is_empty(), "not held");
+    }
 
     /// `SMSG_ATTACKSTART` engages the attacker and leaves its precast: of the precast's clears,
     /// only the local StartAttack's reaches the bit (`0x5ecd87`), none the packet's handler.
@@ -481,5 +628,42 @@ mod tests {
             .unwrap();
         assert!(world.get::<Engaged>(e).is_some());
         assert_eq!(world.get::<super::super::Precast>(e), Some(&precast));
+    }
+
+    /// A landed swing at a victim `d` yards away stops our attack from four melee reaches out
+    /// (`0x5ea880`-`0x5ea8a4`): default reaches 1.5 + 1.5 + 4/3 sit under the floor of 5, so the limit is 20.
+    #[test]
+    fn a_landed_swing_stops_the_attack_from_four_reaches_out() {
+        use crate::net::{ClientCommand, ObjectStore};
+        for (d, stops) in [(19.9_f32, false), (20.1, true), (40.0, true), (3.0, false)] {
+            let mut world = World::new();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            world.init_resource::<super::super::AttackStopInFlight>();
+            let me = world
+                .spawn((ObjectStore::default(), Transform::from_xyz(0.0, 0.0, 0.0)))
+                .id();
+            let them = world
+                .spawn((
+                    ObjectStore::default(),
+                    Transform::from_xyz(d * 0.6, d * 0.48, d * 0.64),
+                ))
+                .id();
+            world
+                .run_system_once(
+                    move |stores: Query<&ObjectStore>,
+                          places: Query<&Transform>,
+                          mut word: ResMut<super::super::AttackStopInFlight>| {
+                        stop_on_far_victim(me, them, &stores, &places, &tx, &mut word);
+                    },
+                )
+                .unwrap();
+            let sent: Vec<ClientCommand> = rx.try_iter().collect();
+            assert_eq!(sent.len(), usize::from(stops), "{d} yd: {sent:?}");
+            assert_eq!(
+                world.resource::<super::super::AttackStopInFlight>().of(me),
+                stops,
+                "{d} yd: the stop in flight"
+            );
+        }
     }
 }

@@ -72,7 +72,7 @@ fn minimap_zoom_buttons_resync_when_switching_inside_and_outside() {
 }
 
 /// Stock `MiniMapTrackingFrame` (`Minimap.xml:109-174`) follows `GetTrackingTexture()` on
-/// `PLAYER_AURAS_CHANGED`, which the aura feed fires beside `UNIT_AURA`.
+/// `PLAYER_AURAS_CHANGED`, which the aura watcher fires beside `UNIT_AURA`.
 #[test]
 fn tracking_frame_follows_get_tracking_texture_across_player_auras_changed() {
     let _data = benilla_formats::wow_data_or_skip!();
@@ -674,6 +674,7 @@ fn the_stock_minimaps_arrows_are_its_children_s_panes_above_its_own_draw() {
             cameras: 0,
         },
     );
+    s.centre_minimap_player_arrows();
     s.set_minimap_player_facing(0.5);
     s.set_minimap_arrows(
         &[MinimapRimArrow {

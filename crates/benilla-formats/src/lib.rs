@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use benilla_dbc::{DbcParser, FieldType, Schema, SchemaField};
 
 /// The BLP texel forms, re-exported for [`BlpMipChain::texels`].
-pub use benilla_blp::BlpTexels;
+pub use benilla_blp::{full_mip_count, BlpTexels};
 
 mod chain;
 pub use chain::{Chain, ChainEntry};
@@ -240,8 +240,9 @@ pub use spells::{
     ATTR_NOT_IN_COMBAT, ATTR_ONLY_STEALTHED, COMBAT_REACH_ADD, MELEE_RANGE_FLOOR,
     MOVING_BONUS_FLAGS, MOVING_RANGE_BONUS, ON_NEXT_SWING_RANGE, SPELL_ATTR_IS_TRADESKILL,
     SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_ENCHANT_ITEM, SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY,
-    SPELL_EFFECT_LEARN_PET_SPELL, SPELL_EFFECT_LEARN_SPELL, SPELL_EFFECT_PROSPECTING,
-    SPELL_EFFECT_SKILL_STEP, SPELL_EFFECT_SKINNING, SPELL_EFFECT_TRADE_SKILL,
+    SPELL_EFFECT_LANGUAGE, SPELL_EFFECT_LEARN_PET_SPELL, SPELL_EFFECT_LEARN_SPELL,
+    SPELL_EFFECT_PROSPECTING, SPELL_EFFECT_SKILL_STEP, SPELL_EFFECT_SKINNING,
+    SPELL_EFFECT_TRADE_SKILL,
 };
 mod skill_lines;
 pub use skill_lines::{
@@ -488,10 +489,29 @@ pub fn blp_mips_to_png(blp_bytes: &[u8], out: &Path) -> Result<Vec<BlpMipStats>>
     blp_mip_stats(blp_bytes)
 }
 
+/// Whether the device texture path makes a texture of this size on a device that halves nothing
+/// (`0x448b60`): `0x448450` makes none for a side that is not a power of two or is 1024 or more
+/// (`0x4484ae`-`0x4484d0`), and a side of 16 or less goes to `GxTexCreate` (`0x58ab10`), which
+/// refuses one below 8 (`0x58ab40`, `0x58ab4c`). A side of 0 is refused there.
+pub fn makes_device_texture(width: u32, height: u32) -> bool {
+    let fits = |n: u32| n.is_power_of_two() && (8..1024).contains(&n);
+    fits(width) && fits(height)
+}
+
+/// A side of 0 makes no texture: it passes the power-of-two test (`0x4484ae`) and `GxTexCreate`
+/// refuses a side below 8 (`0x58ab40`, `0x58ab4c`). A zero extent would panic the device here.
+fn refuse_zero_side(width: u32, height: u32) -> Result<()> {
+    if width == 0 || height == 0 {
+        anyhow::bail!("a BLP of {width}x{height} makes no texture");
+    }
+    Ok(())
+}
+
 /// Decode a BLP's level 0 to RGBA8: `(width, height, pixels)`.
 pub fn blp_to_rgba(blp_bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let decoded =
         benilla_blp::decode(blp_bytes).map_err(|e| anyhow::anyhow!("decoding BLP: {e}"))?;
+    refuse_zero_side(decoded.width, decoded.height)?;
     let level0 = decoded
         .mips
         .into_iter()
@@ -577,6 +597,7 @@ pub fn read_texture_native_chain(chain: &mut Chain, path: &str) -> Result<BlpMip
 /// Decode every authored level of an in-memory BLP to `Rgba8Unorm`, as stored.
 pub fn blp_bytes_to_mip_chain(bytes: &[u8]) -> Result<BlpMipChain> {
     let decoded = benilla_blp::decode(bytes).map_err(|e| anyhow::anyhow!("decoding BLP: {e}"))?;
+    refuse_zero_side(decoded.width, decoded.height)?;
     // A no-mipmaps BLP counts 0 levels, yet `decode` always fills `mips[0]`: take at least one.
     let (width, height, count) = (
         decoded.width,
@@ -603,6 +624,7 @@ pub fn blp_bytes_to_mip_chain(bytes: &[u8]) -> Result<BlpMipChain> {
 pub fn blp_bytes_to_native_chain(bytes: &[u8]) -> Result<BlpMipChain> {
     let decoded =
         benilla_blp::decode_native(bytes).map_err(|e| anyhow::anyhow!("decoding BLP: {e}"))?;
+    refuse_zero_side(decoded.width, decoded.height)?;
     // At least one level, as in `blp_bytes_to_mip_chain`.
     let (width, height, count) = (
         decoded.width,
@@ -841,6 +863,24 @@ mod tests {
             b[84 + i * 4..88 + i * 4].copy_from_slice(&s.to_le_bytes());
         }
         b
+    }
+
+    /// A BLP with a side of 0 decodes to an empty level but makes no texture (`0x58ab40`,
+    /// `0x58ab4c`), so no zero extent reaches the device.
+    #[test]
+    fn a_zero_sided_blp_makes_no_texture() {
+        let mut offsets = [0u32; 16];
+        let mut sizes = [0u32; 16];
+        offsets[0] = 148;
+        sizes[0] = 8;
+        for (w, h) in [(0, 4), (4, 0), (0, 0)] {
+            let mut b = blp2_header(2, 0, 0, 0, w, h, offsets, sizes);
+            b.extend_from_slice(&[0; 8]);
+            assert!(benilla_blp::decode(&b).is_ok(), "{w}x{h}");
+            assert!(blp_to_rgba(&b).is_err(), "{w}x{h}");
+            assert!(blp_bytes_to_mip_chain(&b).is_err(), "{w}x{h}");
+            assert!(blp_bytes_to_native_chain(&b).is_err(), "{w}x{h}");
+        }
     }
 
     /// `has_mipmaps = 0` counts 0 levels, and consumers index `mips[0]`.

@@ -1,5 +1,5 @@
-//! The requirement and identity lines: the area and map of a zone-bound item, the known-recipe
-//! line, and the honor rank and medal requirements.
+//! The requirement and identity lines: the race and class lines, the area and map of a zone-bound
+//! item, the known-recipe line, and the honor rank and medal requirements.
 
 use std::collections::HashSet;
 
@@ -26,6 +26,69 @@ fn render(s: &mut UiScript, id: u32) -> Vec<(String, [f32; 4])> {
 
 fn texts(lines: &[(String, [f32; 4])]) -> Vec<&str> {
     lines.iter().map(|(t, _)| t.as_str()).collect()
+}
+
+/// The race and class lines name the tables' rows at the install's locale (`0x52ce89`, `0x52cf01`,
+/// `0x52d0cb`, `0x52d20e`). Masks of at most one bit each give one `RACE_CLASS_ONLY` line
+/// (`0x52ce24`, `0x52ce3c`); otherwise each table gives its own, the races first (`0x52d186`,
+/// `0x52d2c4`), only for a mask that leaves out one of its rows (`0x52cfa0`-`0x52d045`), white when
+/// the player's own row is listed and red when not.
+#[test]
+fn the_race_and_class_lines_read_the_tables() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_item_req_names(
+        vec![
+            (1, "Humain".into()),
+            (2, "Orc".into()),
+            (9, "Gobelin".into()),
+        ],
+        vec![(1, "Guerrier".into()), (8, "Mage".into())],
+    );
+    s.set_player_req_state(PlayerReqState {
+        level: 60,
+        class_id: 1,
+        race_id: 1,
+        ..Default::default()
+    });
+    let mut req_lines = |id: u32, races: i32, classes: i32| {
+        s.set_item_template(
+            id,
+            ItemTemplateView {
+                name: "Item".into(),
+                allowable_race: races,
+                allowable_class: classes,
+                ..Default::default()
+            },
+        );
+        render(&mut s, id)
+            .into_iter()
+            .filter(|(t, _)| {
+                t.starts_with("[ONLY") || t.starts_with("[RACES") || t.starts_with("[CLASSES")
+            })
+            .collect::<Vec<_>>()
+    };
+    let line = |t: &str, color| vec![(t.to_string(), color)];
+    assert_eq!(req_lines(9001, 1, 1), line("[ONLY Humain Guerrier]", WHITE));
+    assert_eq!(req_lines(9002, 2, 1), line("[ONLY Orc Guerrier]", RED));
+    assert_eq!(req_lines(9003, 1, 0), line("[ONLY Humain ]", WHITE));
+    assert!(req_lines(9004, 0, 0).is_empty());
+    // The eight playable races' mask leaves out this table's ninth row, and -1 covers the classes.
+    assert_eq!(
+        req_lines(9005, 0xff, -1),
+        line("[RACES Humain, Orc]", WHITE)
+    );
+    assert!(req_lines(9006, 0b1_0000_0011, -1).is_empty());
+    // A class mask of two bits is the list arm, and this one covers both class rows.
+    assert_eq!(req_lines(9007, 0b10, 0b1000_0001), line("[RACES Orc]", RED));
+    assert_eq!(
+        req_lines(9008, 0b11, 0b11),
+        [
+            ("[RACES Humain, Orc]".to_string(), WHITE),
+            ("[CLASSES Guerrier]".to_string(), WHITE)
+        ]
+    );
+    assert!(s.take_errors().is_empty(), "{:?}", s.take_errors());
 }
 
 /// A zone-bound item names its area (`+0x1c8`, the `AreaTable` name at `+0x2c`) and its map
@@ -131,6 +194,64 @@ fn already_known_tests_the_taught_spell_and_its_higher_ranks() {
         None,
         "the pet's book is not the player's"
     );
+    assert!(s.take_errors().is_empty(), "{:?}", s.take_errors());
+}
+
+/// A host answering the pet's book with `.0`, as the app's pet family does.
+struct PetBookHost(PetBookState);
+
+impl CallHost for PetBookHost {
+    fn apply(&mut self, _: &mut UiScript, _: ScriptCall) -> Option<CallTail> {
+        None
+    }
+
+    fn read_live(&mut self, ask: &mut live::LiveAsk<'_>) -> bool {
+        ask.answer(|_: &PetBookNow| Some(self.0.clone()))
+    }
+}
+
+/// A pet teach's known test reads the pet's book as it stands (`0x52d5ad` → `0x60c740`): the
+/// host's, where the VM's copy holds nothing, and the host's empty one over a stale copy.
+#[test]
+fn a_pet_teach_reads_the_pets_book_as_it_stands() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_item_template(
+        9503,
+        ItemTemplateView {
+            name: "Grimoire of Firebolt".into(),
+            quality: 1,
+            teaches: Some(TaughtSpell {
+                ranks: vec![3110],
+                pet: true,
+            }),
+            ..Default::default()
+        },
+    );
+    let known = |s: &mut UiScript, book: Vec<u32>| {
+        let mut host = PetBookHost(PetBookState {
+            token: Some("DEMON".into()),
+            slots: book
+                .into_iter()
+                .map(|spell_id| SpellSlotView {
+                    spell_id,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+        s.hosted(&mut host, |s| render(s, 9503))
+            .iter()
+            .any(|(t, c)| t == "[ITEM_SPELL_KNOWN]" && *c == RED)
+    };
+    assert!(known(&mut s, vec![3110]), "the host's book knows it");
+    s.set_pet_book(PetBookState {
+        token: Some("DEMON".into()),
+        slots: vec![SpellSlotView {
+            spell_id: 3110,
+            ..Default::default()
+        }],
+    });
+    assert!(!known(&mut s, Vec::new()), "the host's book, not the copy");
     assert!(s.take_errors().is_empty(), "{:?}", s.take_errors());
 }
 
@@ -296,4 +417,70 @@ fn a_required_spell_is_met_by_any_known_rank() {
     assert_eq!(line(&mut s).1, WHITE, "a later rank");
     assert!(usable(&mut s));
     assert!(s.take_errors().is_empty(), "{:?}", s.take_errors());
+}
+
+/// A host that holds no active player: the requirement head answers none, every other question is
+/// declined.
+struct NoPlayer;
+
+impl CallHost for NoPlayer {
+    fn apply(&mut self, _: &mut UiScript, _: ScriptCall) -> Option<CallTail> {
+        None
+    }
+
+    fn read_live(&mut self, ask: &mut live::LiveAsk<'_>) -> bool {
+        ask.answer(|_: &ReqHeadQuery| Some(None))
+    }
+}
+
+/// With no active player held the getters answer the reference's fixed values, never the VM's
+/// copy: the green range 0 (`0x4e17f8`), no combo points (`0x51a1bd` → `0x51a261`), a merchant row
+/// usable (`0x4fb293` → `0x4fb2f0`), `UnitLevel` past the hostile-level rule (`0x518055`), and the
+/// item build hidden (`0x52b699`).
+#[test]
+fn with_no_player_held_the_getters_answer_the_references_fixed_values() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    // Ravager wants level 37.
+    s.set_item_template(871, super::axe());
+    // The copy, which each answer below would read: a level-3 rogue on five points.
+    s.set_player_req_state(PlayerReqState {
+        level: 3,
+        class_id: 4,
+        race_id: 1,
+        ..Default::default()
+    });
+    s.set_combo_points(5, 0);
+    // Hostile and ten levels above the copy's player.
+    s.set_unit(
+        "target",
+        Some(UnitState {
+            exists: true,
+            level: 13,
+            reaction: 2,
+            ..Default::default()
+        }),
+    );
+    s.set_merchant(Some(MerchantState {
+        items: vec![MerchantItem {
+            item_id: 871,
+            name: Some("Ravager".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    const CHUNK: &str = r#"
+        local a = ReqSlot or CreateFrame("Button", "ReqSlot")
+        a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+        local tt = TT or CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
+        tt:SetOwner(a, "ANCHOR_RIGHT")
+        SetItemByIdForTest(tt, 871)
+        local _, _, _, _, _, usable = GetMerchantItemInfo(1)
+        return GetQuestGreenRange(), GetComboPoints(), usable and 1 or 0, UnitLevel("target"),
+            tt:IsShown() and 1 or 0
+    "#;
+    let copy: (i64, i64, i64, i64, i64) = s.eval(CHUNK).unwrap();
+    assert_eq!(copy, (4, 5, 0, -1, 1), "the copy's level-3 rogue");
+    let none: (i64, i64, i64, i64, i64) = s.hosted(&mut NoPlayer, |s| s.eval(CHUNK).unwrap());
+    assert_eq!(none, (0, 0, 1, 13, 0), "no active player");
 }

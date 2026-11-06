@@ -55,16 +55,19 @@ pub fn math_pow() -> crate::heap::NativeFn {
     |vm, n| bin(vm, n, pow)
 }
 
-/// 5.1's `RADIANS_PER_DEGREE`, `PI/180.0`.
+/// `PI/180.0`, the double at `0x822d30`, which `math_rad` multiplies by (`0x7fb17d`).
 const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
 
-/// `math_deg`: a division by `RADIANS_PER_DEGREE`, which rounds otherwise than Rust's
-/// `to_degrees` (a product with `180/PI`) for about one value in nine.
+/// `180.0/PI`, the double at `0x822d28` (57.29577951308232), which `math_deg` multiplies by
+/// (`0x7fb14d`); a division by `RADIANS_PER_DEGREE` rounds otherwise for about one value in nine.
+const DEGREES_PER_RADIAN: f64 = 180.0 / std::f64::consts::PI;
+
+/// `math_deg` (`0x7fb140`).
 fn deg(x: f64) -> f64 {
-    x / RADIANS_PER_DEGREE
+    x * DEGREES_PER_RADIAN
 }
 
-/// `math_rad`: a product with `RADIANS_PER_DEGREE`.
+/// `math_rad` (`0x7fb170`).
 fn rad(x: f64) -> f64 {
     x * RADIANS_PER_DEGREE
 }
@@ -128,8 +131,9 @@ fn pow(a: f64, b: f64) -> f64 {
 
 /// The client's `fmod` (`__CIfmod`, `0x73f90a`), `fprem` with the sign of the dividend, behind
 /// the operand classes of `__cintrindisp2` (`0x7436c0`, its table at `0x875eb0`): an infinite
-/// divisor is a domain error, the indefinite (`0x743ad6`), where C's answers the dividend, and a
-/// zero dividend over a finite divisor is `fldz` (`0x743a38`), so `fmod(-0, 2)` is `+0`.
+/// divisor is a domain error, the indefinite (`0x743ad6`), where C's answers the dividend, a
+/// zero dividend over a non-zero finite divisor is `fldz` (`0x743a38`), so `fmod(-0, 2)` is `+0`,
+/// and zero over zero is the indefinite again (`0x743ad6`).
 fn fmod(a: f64, b: f64) -> f64 {
     if b.is_infinite() {
         f64::NAN
@@ -225,7 +229,8 @@ fn max(vm: &mut Vm, nargs: usize) -> R<usize> {
 /// `RAND_MAX` is 32767. The client's state is the main thread's, seeded with the millisecond
 /// clock before `WinMain` (`0x5b800b` → `0x5d1c70`, `srand` at `0x5d1c8b`). Deviation: the
 /// client's one process-wide stream is shared with its engine draws; here each VM holds its own,
-/// seeded from the wall clock when it is built, so a fork or a clone draws its own sequence.
+/// seeded from the wall clock when it is built, because that way a fork or a clone draws its own
+/// sequence.
 #[derive(Clone)]
 pub(crate) struct CrtRand(u32);
 

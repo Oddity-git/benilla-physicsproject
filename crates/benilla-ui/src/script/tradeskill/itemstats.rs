@@ -4,9 +4,11 @@
 //! (`|cffff2020`, `0x84e4e0`; `|r`, `0x844538`) instead of coloured. The vocabulary tables are
 //! the tooltip's ([`crate::script::tooltip_item::names`]).
 
-use crate::script::item_stats::{ItemTemplateView, PlayerReqState};
+use crate::script::item_stats::ItemTemplateView;
+#[cfg(test)]
+use crate::script::item_stats::PlayerReqState;
 use crate::script::tooltip_item::names::{
-    ceil_max, floor_min, full_mask, invtype_key, school_key, stat_key, CLASS_NAMES, RACE_NAMES,
+    ceil_max, floor_min, invtype_key, race_class_lines, school_key, stat_key, ItemReqNames,
 };
 use crate::strings::{fill, Arg};
 
@@ -44,8 +46,9 @@ fn sign(v: i32) -> String {
 /// `""` for a missing key (`FrameScript_GetText`, `0x703bf0`).
 pub(super) fn item_stat_lines(
     v: &ItemTemplateView,
-    req: &PlayerReqState,
+    req: &dyn crate::script::ReqRead,
     me: PlayerFacts,
+    names: &ItemReqNames,
     get: &dyn Fn(&str) -> String,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -90,7 +93,7 @@ pub(super) fn item_stat_lines(
     // subclass line too when the player lacks that one as well (`0x4fe23b`..`0x4fe288`).
     let mut slot_ok = true;
     let mut sub_ok = true;
-    if let Some(&mask) = req.proficiency.get(&v.class).filter(|&&m| m != 0) {
+    if let Some(mask) = req.proficiency(v.class).filter(|&m| m != 0) {
         if mask & 1u32.wrapping_shl(v.subclass) == 0 {
             match v.proficiency_prereq {
                 Some(alt) if v.class == 2 => {
@@ -224,65 +227,20 @@ pub(super) fn item_stat_lines(
         return out;
     }
 
-    // Race and class restrictions (`0x4fe9e8`). Each mask with at most one bit set is a single
-    // race and class: one `RACE_CLASS_ONLY` line naming both, red unless the player is that race
-    // and class. Otherwise a mask that leaves out a playable race, or any class, lists the ones it
-    // allows, red unless the player is among them.
-    let races = v.allowable_race;
-    let classes = v.allowable_class;
-    if races & races.wrapping_sub(1) == 0 && classes & classes.wrapping_sub(1) == 0 {
-        let mut names = String::new();
-        let mut ok = true;
-        if let Some(&(id, name)) = RACE_NAMES
-            .iter()
-            .find(|&&(id, _)| races & (1i32.wrapping_shl(id - 1)) != 0)
-        {
-            names = format!("{name} ");
-            ok &= req.race_id == id;
-        }
-        if let Some(&(id, name)) = CLASS_NAMES
-            .iter()
-            .find(|&&(id, _)| classes & (1i32.wrapping_shl(id - 1)) != 0)
-        {
-            names.push_str(name);
-            ok &= req.class_id == id;
-        }
-        if !names.is_empty() {
-            out.push(red_unless(
-                ok,
-                &fill(&get("RACE_CLASS_ONLY"), &[Arg::S(&names)]),
-            ));
-        }
-    } else {
-        let list = |ids: &[(u32, &str)], mask: i32, player: u32| -> Option<(String, bool)> {
-            let allowed: Vec<(u32, &str)> = ids
-                .iter()
-                .copied()
-                .filter(|&(id, _)| mask & (1i32.wrapping_shl(id - 1)) != 0)
-                .collect();
-            let text = allowed
-                .iter()
-                .map(|&(_, n)| n)
-                .collect::<Vec<_>>()
-                .join(", ");
-            (!text.is_empty()).then(|| (text, allowed.iter().any(|&(id, _)| id == player)))
-        };
-        if races & full_mask(&RACE_NAMES) != full_mask(&RACE_NAMES) {
-            if let Some((text, ok)) = list(&RACE_NAMES, races, req.race_id) {
-                out.push(red_unless(
-                    ok,
-                    &fill(&get("ITEM_RACES_ALLOWED"), &[Arg::S(&text)]),
-                ));
-            }
-        }
-        if classes & full_mask(&CLASS_NAMES) != full_mask(&CLASS_NAMES) {
-            if let Some((text, ok)) = list(&CLASS_NAMES, classes, req.class_id) {
-                out.push(red_unless(
-                    ok,
-                    &fill(&get("ITEM_CLASSES_ALLOWED"), &[Arg::S(&text)]),
-                ));
-            }
-        }
+    // Race and class restrictions (`0x4fe9e8`..`0x4fef07`), each red unless the player meets it.
+    let head = req.head();
+    let race_class = race_class_lines(
+        names,
+        v.allowable_race,
+        v.allowable_class,
+        head.race_id,
+        head.class_id,
+    );
+    for line in &race_class {
+        out.push(red_unless(
+            line.ok,
+            &fill(&get(line.key), &[Arg::S(&line.text)]),
+        ));
     }
 
     // Levels: the item level rides the required level's test (`0x4fef07`), and the minimum only
@@ -291,7 +249,7 @@ pub(super) fn item_stat_lines(
         out.push(fill(&get("ITEM_LEVEL"), &[Arg::D(v.item_level.into())]));
         if v.required_level > 1 {
             out.push(red_unless(
-                req.level >= v.required_level,
+                req.head().level >= v.required_level,
                 &fill(&get("ITEM_MIN_LEVEL"), &[Arg::D(v.required_level.into())]),
             ));
         }
@@ -310,7 +268,7 @@ pub(super) fn item_stat_lines(
         } else {
             fill(&get("ITEM_REQ_SKILL"), &[Arg::S(name)])
         };
-        let total = req.skills.get(&v.required_skill).copied().unwrap_or(0);
+        let total = req.skill(v.required_skill).unwrap_or(0);
         out.push(red_unless(v.required_skill_rank > total, &line));
     }
 
@@ -338,7 +296,7 @@ pub(super) fn item_stat_lines(
         }
         .unwrap_or_else(|| get(&key));
         out.push(red_unless(
-            u32::from(req.honor_rank) >= rank,
+            u32::from(req.head().honor_rank) >= rank,
             &fill(&get("ITEM_REQ_SKILL"), &[Arg::S(&title)]),
         ));
     }
@@ -402,7 +360,8 @@ mod tests {
 
     fn lines(v: &ItemTemplateView, req: &PlayerReqState, me: PlayerFacts) -> Vec<String> {
         let table = strings();
-        item_stat_lines(v, req, me, &|k| {
+        let names = crate::script::tooltip_item::names::stock_req_names();
+        item_stat_lines(v, req, me, &names, &|k| {
             table.get(k).copied().unwrap_or("").to_string()
         })
     }
@@ -595,6 +554,36 @@ mod tests {
         );
     }
 
+    /// The lines name `ChrRaces` and `ChrClasses` at the install's locale (`0x4fea5b`, `0x4fee1c`),
+    /// and a mask covers a table when it holds that table's rows (`0x4febc2`, `0x4fec02`): a row
+    /// past the eight playable races keeps their mask from covering it.
+    #[test]
+    fn the_lines_name_and_count_the_tables_rows() {
+        let (req, me) = human_warrior();
+        let table = strings();
+        let names = ItemReqNames {
+            races: vec![
+                (1, "Humain".into()),
+                (2, "Orc".into()),
+                (9, "Gobelin".into()),
+            ],
+            classes: vec![(1, "Guerrier".into())],
+        };
+        let with = |races: i32, classes: i32| {
+            let v = ItemTemplateView {
+                allowable_race: races,
+                allowable_class: classes,
+                ..Default::default()
+            };
+            item_stat_lines(&v, &req, me, &names, &|k| {
+                table.get(k).copied().unwrap_or("").to_string()
+            })
+        };
+        assert_eq!(with(1, 1), ["Humain Guerrier Only."]);
+        assert_eq!(with(0xff, -1), ["Races: Humain, Orc"]);
+        assert!(with(0b1_0000_0011, -1).is_empty(), "every row of the table");
+    }
+
     /// A weapon whose subclass has a prerequisite reds the class line, and the subclass line too
     /// when the player lacks the prerequisite as well; without one only the subclass line reds.
     #[test]
@@ -704,6 +693,7 @@ mod tests {
     #[test]
     fn the_binding_answers_zero_values_or_one_string_per_line() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         let table = strings();
         s.run(
             &table
@@ -743,10 +733,11 @@ mod tests {
         }
         // A recipe with no product is no item, and asks nothing.
         assert_eq!(s.arity("GetTradeSkillItemStats(3)").unwrap(), 0);
-        assert!(s.take_item_stat_asks().is_empty());
-        // An uncached template: zero values, and the template is asked for.
+        assert!(s.take_trade_skill_item_waits().is_empty());
+        // An uncached template, not in flight: zero values, and the template is asked for with
+        // the callback inside the call (`0x4fdf95`).
         assert_eq!(s.arity("GetTradeSkillItemStats(2)").unwrap(), 0);
-        assert_eq!(s.take_item_stat_asks(), [5000]);
+        assert_eq!(s.take_trade_skill_item_waits(), [5000]);
         s.set_item_template(
             5000,
             ItemTemplateView {

@@ -485,13 +485,11 @@ impl Relations<'_> {
 /// forced. The lookup `0x4d6490` returns the stored rank verbatim (`0x4d64b3`).
 ///
 /// Deviation: the rank is held to 7, the top of the ring scale's eight entries (`0..=7`), where the
-/// reference keeps any value; a server rank past 7 would index outside our palette.
+/// reference keeps any value, because a server rank past 7 would index outside our palette.
 pub(crate) fn forced_rank(reputations: &Reputations, faction: u32) -> Option<u8> {
     reputations
-        .forced
-        .iter()
-        .find(|&&(id, _)| id == faction)
-        .map(|&(_, rank)| rank.min(7) as u8)
+        .forced_rank(faction)
+        .map(|rank| rank.min(7) as u8)
 }
 
 /// Whether we are at war with the `Faction.dbc` faction a template names (`0x4d61b0`, bit 1 of its
@@ -637,13 +635,7 @@ impl RelationWorld<'_, '_> {
             || self.roster.as_ref().is_some_and(|r| r.is_changed())
     }
 
-    /// Whether a creature record arrived since the system last ran: a record carries the
-    /// VISIBLE_TO_GHOSTS bit [`RelUnit::with_record`] reads.
-    pub(crate) fn records_changed(&self) -> bool {
-        self.names.as_ref().is_some_and(|n| n.is_changed())
-    }
-
-    /// The party slots and raid roster as the frame began.
+    /// The party slots and raid roster as the feed last published them.
     pub(crate) fn roster(&self) -> Option<&GroupRoster> {
         self.roster.as_deref()
     }
@@ -723,7 +715,9 @@ pub(crate) fn corpse_friendly(
     reaction.unwrap_or(Reaction::Neutral) >= Reaction::Friendly
 }
 
+#[cfg(test)]
 mod snapshot;
+#[cfg(test)]
 pub(crate) use snapshot::RelationSnapshot;
 
 #[cfg(test)]

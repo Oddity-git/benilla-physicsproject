@@ -1,9 +1,10 @@
 use std::io::{self, Read};
 
 use crate::messages::movement::{
-    TransportPose, MOVEMENT_FLAG_JUMPING, MOVEMENT_FLAG_ON_TRANSPORT,
+    JumpInfo, TransportPose, MOVEMENT_FLAG_JUMPING, MOVEMENT_FLAG_ON_TRANSPORT,
     MOVEMENT_FLAG_SPLINE_ELEVATION, MOVEMENT_FLAG_SPLINE_ENABLED, MOVEMENT_FLAG_SWIMMING,
 };
+use crate::messages::MonsterMoveFacing;
 use crate::wire::{
     capacity_hint, read_f32_le, read_packed_guid, read_u32_le, read_u64_le, read_u8, Vector3d,
 };
@@ -70,15 +71,29 @@ pub struct CreateSpline {
     pub cyclic: bool,
     /// `MoveSplineFlag::Runmode`; its absence forces walk mode on.
     pub run_mode: bool,
+    /// The final facing the spline ends on (`MoveSplineFlag` final point, target or angle), which
+    /// the reference reads in that order (`0x47f0bf`, `0x47f0e8`, `0x47f0f9`); `None` when none is
+    /// set, and the unit then keeps the direction of its last leg.
+    pub facing: MonsterMoveFacing,
 }
 
-/// A `LIVING` block's live mover state: the `MOVEMENTFLAGS` word and the swim pitch that rides it.
+/// A `LIVING` block's live mover state: the `MOVEMENTFLAGS` word, the swim pitch and the fall that
+/// ride it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoverState {
     /// The raw `MOVEMENTFLAGS` word (`CMovement+0x40`).
     pub flags: u32,
     /// Swim pitch in radians, +up; on the wire only with `MOVEFLAG_SWIMMING`, else `0.0`.
     pub pitch: f32,
+    /// The status's stamp, on the server's ms clock (`MovementInfo::stime`, `Object.cpp:194`):
+    /// the unit's last move's arrival there, or a second past the create when it has sent none
+    /// (`Object.cpp:517-521`). The create seeds its mover's replay chain with it (`0x618c5e`).
+    pub time: u32,
+    /// The ms the unit has been airborne (`MovementInfo::fallTime`), which the apply copies to the
+    /// mover under `JUMPING` (`0x618e1b` → `0x7c6490`, status `+0x38` to `+0x78`).
+    pub fall_time: u32,
+    /// The `JUMPING` tail, the launch the same apply copies (`+0x3c` to `+0x48`).
+    pub jump: Option<JumpInfo>,
 }
 
 /// The decoded fields of a movement block; the rest is read and discarded to stay aligned.
@@ -111,7 +126,7 @@ impl MovementBlock {
 
         if update_flag & UPDATE_FLAG_LIVING != 0 {
             let flags = read_u32_le(r)?;
-            let _timestamp = read_u32_le(r)?;
+            let time = read_u32_le(r)?;
             let living_position = Vector3d::read(r)?;
             let living_orientation = read_f32_le(r)?;
             position = Some((living_position, living_orientation));
@@ -129,13 +144,24 @@ impl MovementBlock {
             } else {
                 0.0
             };
-            mover = Some(MoverState { flags, pitch });
-            let _fall_time = read_f32_le(r)?;
-            if flags & MOVEMENT_FLAG_JUMPING != 0 {
-                for _ in 0..4 {
-                    let _ = read_f32_le(r)?; // z_speed, cos_angle, sin_angle, xy_speed
-                }
-            }
+            let fall_time = read_u32_le(r)?;
+            let jump = if flags & MOVEMENT_FLAG_JUMPING != 0 {
+                Some(JumpInfo {
+                    zspeed: read_f32_le(r)?,
+                    cos_angle: read_f32_le(r)?,
+                    sin_angle: read_f32_le(r)?,
+                    xy_speed: read_f32_le(r)?,
+                })
+            } else {
+                None
+            };
+            mover = Some(MoverState {
+                flags,
+                pitch,
+                time,
+                fall_time,
+                jump,
+            });
             if flags & MOVEMENT_FLAG_SPLINE_ELEVATION != 0 {
                 let _ = read_f32_le(r)?;
             }
@@ -148,15 +174,17 @@ impl MovementBlock {
                 let spline_flags = read_u32_le(r)?;
                 // The final facing, three independent reads in the reference's order: a point
                 // (`0x47f0bf`), a guid (`0x47f0e8`), an angle (`0x47f0f9`). vmangos writes at most
-                // one (`packet_builder.cpp:162-167`); a unit on a path faces along it.
+                // one (`packet_builder.cpp:162-167`); the unit turns to it where the path ends.
+                let mut facing = MonsterMoveFacing::None;
                 if spline_flags & SPLINE_FLAG_FINAL_POINT != 0 {
-                    let _ = Vector3d::read(r)?;
+                    let spot = Vector3d::read(r)?;
+                    facing = MonsterMoveFacing::Spot([spot.x, spot.y, spot.z]);
                 }
                 if spline_flags & SPLINE_FLAG_FINAL_TARGET != 0 {
-                    let _ = read_u64_le(r)?;
+                    facing = MonsterMoveFacing::Target(read_u64_le(r)?);
                 }
                 if spline_flags & SPLINE_FLAG_FINAL_ANGLE != 0 {
-                    let _ = read_f32_le(r)?;
+                    facing = MonsterMoveFacing::Angle(read_f32_le(r)?);
                 }
                 let time_passed_ms = read_u32_le(r)?;
                 let duration_ms = read_u32_le(r)?;
@@ -178,6 +206,7 @@ impl MovementBlock {
                     flying: spline_flags & SPLINE_FLAG_FLYING != 0,
                     cyclic: spline_flags & SPLINE_FLAG_CYCLIC != 0,
                     run_mode: spline_flags & SPLINE_FLAG_RUNMODE != 0,
+                    facing,
                 });
             }
         } else if update_flag & UPDATE_FLAG_HAS_POSITION != 0 {

@@ -1,14 +1,14 @@
 //! The chat window's packet handlers: the spoken line, and the notices and answers that print as
 //! chat. `SMSG_NOTIFICATION` and `SMSG_AREA_TRIGGER_MESSAGE` are `UIErrorsFrame` toasts instead,
-//! queued on [`UiErrorTexts`].
+//! on the ui-error lane ([`UiErrorKeys`]).
 
-use benilla_protocol::messages::{ChatMessage, CHAT_MSG_WHISPER};
+use benilla_protocol::messages::{ChatMessage, CHAT_MSG_RAID_BOSS_WHISPER, CHAT_MSG_WHISPER};
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use bevy::prelude::*;
 
 use super::{Broadcast, ChatLog};
-use crate::net::{ClientCommand, NetCommands, NetHandlerApp, PlayedTimeAnswer, ServerSaidMessage};
-use crate::ui_action::{UiErrorKeys, UiErrorTexts};
+use crate::net::{ClientCommand, NetCommands, NetHandlerApp, ServerSaidMessage};
+use crate::ui_action::UiErrorKeys;
 use crate::ui_social::SocialState;
 
 /// Register the chat window's handlers and its session-end listener, the channel list's among
@@ -29,7 +29,16 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::PlayedTime, on_played_time)
         .net_handler(K::ChannelNotify, on_channel_notify)
         .net_handler(K::RandomRoll, on_random_roll)
+        .net_handler(K::Connected, latch_on_connect)
         .net_handler(K::Disconnected, on_session_end);
+}
+
+/// The world session's start finds the display latch set (`[0x8435fc]` is 1 from start-up, and
+/// every leave of the world sets it again).
+fn latch_on_connect(In(ev): In<SessionEvent>, log: Res<ChatLog>) {
+    if let SessionEvent::Connected { .. } = ev {
+        log.latch();
+    }
 }
 
 fn on_chat(
@@ -52,8 +61,8 @@ fn on_whisper_refusal(In(ev): In<SessionEvent>, errors: Res<UiErrorKeys>) {
     }
 }
 
-/// The four world broadcasts and a transfer abort's line, parked for [`super::broadcast`]'s
-/// resolve pass.
+/// The four world broadcasts and a transfer abort's line, on the chat lane at the packet's place,
+/// resolved where they fire ([`super::broadcast`]).
 fn on_broadcast(In(ev): In<SessionEvent>, chat_log: Res<ChatLog>) {
     let b = match ev {
         SessionEvent::ZoneUnderAttack { area_id } => Broadcast::ZoneUnderAttack { area_id },
@@ -68,21 +77,21 @@ fn on_broadcast(In(ev): In<SessionEvent>, chat_log: Res<ChatLog>) {
     broadcast(b, &chat_log);
 }
 
-fn on_toast(In(ev): In<SessionEvent>, mut errors: ResMut<UiErrorTexts>) {
+fn on_toast(In(ev): In<SessionEvent>, errors: Res<UiErrorKeys>) {
     match ev {
-        SessionEvent::Notification { text } => notification(text, &mut errors),
-        SessionEvent::AreaTriggerMessage { text } => area_trigger_message(text, &mut errors),
+        SessionEvent::Notification { text } => notification(text, &errors),
+        SessionEvent::AreaTriggerMessage { text } => area_trigger_message(text, &errors),
         _ => {}
     }
 }
 
-/// Fill the mailbox `feed::played_time_bridge` fires as `TIME_PLAYED_MSG`, the handler's one
-/// event (`0x4018df`): the reference prints nothing to chat itself (its lines go to the console,
-/// `0x401878`-`0x4018c8`), and the stock `ChatFrame_DisplayTimePlayed` prints the answer
-/// (`ChatFrame.lua:1279`).
-fn on_played_time(In(ev): In<SessionEvent>, mut answer: ResMut<PlayedTimeAnswer>) {
-    if let SessionEvent::PlayedTime { total, level } = ev {
-        answer.0 = Some((total, level));
+/// `SMSG_PLAYED_TIME` (`0x401850`): `TIME_PLAYED_MSG` at the packet, on the notice lane
+/// (`0x4018df`), the handler's one event. The reference prints nothing to chat itself (its lines go
+/// to the console, `0x401878`-`0x4018c8`), and the stock `ChatFrame_DisplayTimePlayed` prints the
+/// answer (`ChatFrame.lua:1279`). Absent in a harness without the notice lane.
+fn on_played_time(In(ev): In<SessionEvent>, lane: Option<ResMut<crate::field_watch::NoticeLane>>) {
+    if let (SessionEvent::PlayedTime { total, level }, Some(mut lane)) = (ev, lane) {
+        lane.write(crate::field_watch::FieldNotice::PlayedTime { total, level });
     }
 }
 
@@ -119,6 +128,22 @@ fn on_session_end(
     rosters.clear();
 }
 
+/// The ignore gate of the player-chat path (`FriendList::IsIgnored` at `0x49d72d`): a sender on
+/// the list is dropped unless its chat tag is GM (`0x49d736`, tag 3), and a dropped whisper
+/// (type 6, `0x49d73c`) sends `CMSG_CHAT_IGNORED` (`0x49d74e` → `0x49d4b0`), so the sender hears
+/// "is ignoring you". A GM-tagged line passes whatever its type. Whether the line is dropped.
+fn drops_ignored(m: &ChatMessage, social: &SocialState, net_commands: &NetCommands) -> bool {
+    if !social.is_ignored(m.sender_guid) || m.chat_tag == benilla_protocol::messages::chat_tag::GM {
+        return false;
+    }
+    if m.chat_type == CHAT_MSG_WHISPER {
+        let _ = net_commands.0.send(ClientCommand::ChatIgnored {
+            guid: m.sender_guid,
+        });
+    }
+    true
+}
+
 /// A spoken line (`SMSG_MESSAGECHAT`). System lines (`0x0A`), the server's answers to GM
 /// commands, log at `info!` and go out as [`ServerSaidMessage`]; other chat logs at `debug!`.
 fn chat(
@@ -131,11 +156,10 @@ fn chat(
     // Addon traffic: 1.12 has no addon opcode or chat type, so `LANG_ADDON` on any lane is the
     // whole test (`0x49a89e`, in the display function `0x49a870`). The line never renders
     // (`0x49a970`); it fires `CHAT_MSG_ADDON` once the sender's name resolves (`0x49d7ba`,
-    // `0x49ccc0`). An ignored sender's fires nothing, as the reference drops ignored lines first
-    // (`0x49d72d`), and needs no `CMSG_CHAT_IGNORED`: vmangos refuses addon whispers
-    // (`ChatHandler.cpp:84-103`).
+    // `0x49ccc0`). No language test precedes the ignore gate (`0x49d72d`), so an addon line meets
+    // it as any line does ([`drops_ignored`]).
     if m.is_addon() {
-        if !social.is_ignored(m.sender_guid) {
+        if !drops_ignored(&m, social, net_commands) {
             debug!(
                 "net: addon chat [{:#04x}] from {:#x}: {:?} (suppressed — not a chat line)",
                 m.chat_type, m.sender_guid, m.text
@@ -167,14 +191,17 @@ fn chat(
             &format!("[{:#04x}] {}", m.chat_type, m.text.replace('\n', " ⏎ ")),
         );
     }
-    // An ignored speaker is dropped silently (`FriendList::IsIgnored`, `0x5ae5a0`); a dropped
-    // whisper also sends `CMSG_CHAT_IGNORED`, so the sender hears "is ignoring you".
-    if social.is_ignored(m.sender_guid) {
-        if m.chat_type == CHAT_MSG_WHISPER {
-            let _ = net_commands.0.send(ClientCommand::ChatIgnored {
-                guid: m.sender_guid,
-            });
+    // Type 0x59 takes its own branch (`0x49d60c`): the line is dropped silently when the guid it
+    // carries is ignored (`0x49d671` → `IsIgnored 0x5ae5a0`), else the type becomes 6 (`0x49d67e`),
+    // a plain whisper (`CHAT_MSG_WHISPER`, `0x8062e0`) with its inline sender name.
+    let mut m = m;
+    if m.chat_type == CHAT_MSG_RAID_BOSS_WHISPER {
+        if social.is_ignored(m.target_guid) {
+            return;
         }
+        m.chat_type = CHAT_MSG_WHISPER;
+    }
+    if drops_ignored(&m, social, net_commands) {
         return;
     }
     chat_log.push_wire(m);
@@ -197,17 +224,17 @@ fn chat_wrong_faction(errors: &crate::ui_action::UiErrorKeys) {
 /// `SMSG_NOTIFICATION` (`0x1cb`, handler `0x401800`): the red `UIErrorsFrame` line,
 /// `UI_ERROR_MESSAGE` from `0x4945b0(text, 1)`, never a chat line. vmangos sends `.gm on` as both
 /// a system line and a notification (`Objects/Player.cpp:2676-2677`).
-fn notification(text: String, errors: &mut UiErrorTexts) {
-    // The reference also logs it to the console (`0x63cd00`).
+fn notification(text: String, errors: &UiErrorKeys) {
+    // The reference also logs it to the console (`0x63cd00`), after the line (`0x40183b`).
     info!("net: notification — {text}");
-    errors.error(text);
+    errors.error_text(text);
 }
 
 /// An area trigger's refusal (`SMSG_AREA_TRIGGER_MESSAGE`, `0x2b8`, arm `0x48f8ff` of
 /// `0x48f690`): the yellow `UIErrorsFrame` line, `UI_INFO_MESSAGE` from `0x4945b0(text, 0)`.
-fn area_trigger_message(text: String, errors: &mut UiErrorTexts) {
+fn area_trigger_message(text: String, errors: &UiErrorKeys) {
     info!("net: area-trigger message — {text}");
-    errors.info(text);
+    errors.info_text(text);
 }
 
 /// Park a world broadcast for `ui_chat::broadcast`'s resolve pass, logged: a defense broadcast
@@ -269,14 +296,163 @@ mod tests {
         world.resource::<ChatLog>().pending_len()
     }
 
-    /// `SMSG_PLAYED_TIME` (`0x401850`) fills the mailbox `TIME_PLAYED_MSG` fires from (`0x4018df`)
-    /// and prints nothing to chat itself: its own lines go to the console (`0x401878`-`0x4018c8`),
-    /// and the stock `ChatFrame_DisplayTimePlayed` is the answer's one printer.
+    /// A raid boss whisper (type 0x59) is a plain whisper after the parser (`0x49d67e`): the
+    /// `CHAT_MSG_WHISPER` event, the inline sender name kept, and no `CMSG_CHAT_IGNORED`. A line
+    /// whose carried guid is ignored drops silently (`0x49d671`).
+    #[test]
+    fn a_raid_boss_whisper_is_queued_as_a_whisper_unless_its_guid_is_ignored() {
+        use benilla_protocol::messages::CHAT_MSG_RAID_BOSS_WHISPER;
+        let boss = ChatMessage {
+            chat_type: CHAT_MSG_RAID_BOSS_WHISPER,
+            sender_guid: 0,
+            target_guid: 0x77,
+            sender_name: Some("Ragnaros".into()),
+            ..a_party_line(0, "Too soon!")
+        };
+        for ignored in [false, true] {
+            let mut world = World::new();
+            world.init_resource::<Messages<ServerSaidMessage>>();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            world.insert_resource(NetCommands(tx));
+            let mut social = SocialState::default();
+            if ignored {
+                social.ignore_for_test(0x77);
+            }
+            world.insert_resource(social);
+            world.insert_resource(ChatLog::default());
+            let m = boss.clone();
+            world
+                .run_system_once(
+                    move |chat_log: Res<ChatLog>,
+                          social: Res<SocialState>,
+                          net_commands: Res<NetCommands>,
+                          mut server_said: MessageWriter<ServerSaidMessage>| {
+                        chat(
+                            m.clone(),
+                            &chat_log,
+                            &social,
+                            &net_commands,
+                            &mut server_said,
+                        );
+                    },
+                )
+                .unwrap();
+            let wire = world.resource::<ChatLog>().pending_wire();
+            if ignored {
+                assert!(wire.is_empty(), "dropped");
+            } else {
+                assert_eq!(wire.len(), 1);
+                assert_eq!(wire[0].chat_type, CHAT_MSG_WHISPER);
+                assert_eq!(wire[0].sender_name.as_deref(), Some("Ragnaros"));
+                assert_eq!(
+                    crate::ui_chat::event::kind_of_wire(wire[0].chat_type),
+                    Some(crate::ui_chat::ChatEventKind::Whisper)
+                );
+            }
+            assert!(rx.try_iter().next().is_none(), "no CMSG_CHAT_IGNORED");
+        }
+    }
+
+    /// One line from sender 0x21 through [`chat`] with that sender ignored: the chat log, and the
+    /// commands that went on the wire.
+    fn from_an_ignored_sender(m: ChatMessage) -> (World, Vec<ClientCommand>) {
+        let mut world = World::new();
+        world.init_resource::<Messages<ServerSaidMessage>>();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        world.insert_resource(NetCommands(tx));
+        let mut social = SocialState::default();
+        social.ignore_for_test(0x21);
+        world.insert_resource(social);
+        world.insert_resource(ChatLog::default());
+        world
+            .run_system_once(
+                move |chat_log: Res<ChatLog>,
+                      social: Res<SocialState>,
+                      net_commands: Res<NetCommands>,
+                      mut server_said: MessageWriter<ServerSaidMessage>| {
+                    chat(
+                        m.clone(),
+                        &chat_log,
+                        &social,
+                        &net_commands,
+                        &mut server_said,
+                    );
+                },
+            )
+            .unwrap();
+        (world, rx.try_iter().collect())
+    }
+
+    /// The ignore gate (`0x49d72d`, `0x49d736`, `0x49d73c`): an ignored sender is dropped unless
+    /// tagged GM, and only a dropped whisper draws `CMSG_CHAT_IGNORED`.
+    #[test]
+    fn an_ignored_gm_passes_and_only_an_ignored_whisper_draws_the_reply() {
+        use benilla_protocol::messages::chat_tag;
+        let line = |chat_type: u8, tag: u8| ChatMessage {
+            chat_type,
+            chat_tag: tag,
+            ..a_party_line(0, "hi")
+        };
+        for (chat_type, tag, delivered, replies) in [
+            (CHAT_MSG_PARTY, chat_tag::NONE, false, false),
+            (CHAT_MSG_WHISPER, chat_tag::NONE, false, true),
+            (CHAT_MSG_WHISPER, chat_tag::DND, false, true),
+            (CHAT_MSG_PARTY, chat_tag::GM, true, false),
+            (CHAT_MSG_WHISPER, chat_tag::GM, true, false),
+        ] {
+            let (world, sent) = from_an_ignored_sender(line(chat_type, tag));
+            assert_eq!(
+                world.resource::<ChatLog>().pending_wire().len(),
+                usize::from(delivered),
+                "type {chat_type:#x} tag {tag}: delivered"
+            );
+            assert_eq!(
+                sent.len(),
+                usize::from(replies),
+                "type {chat_type:#x} tag {tag}: wire {sent:?}"
+            );
+            if replies {
+                assert!(matches!(sent[0], ClientCommand::ChatIgnored { guid: 0x21 }));
+            }
+        }
+    }
+
+    /// An addon line meets the same gate: no language test precedes it (`0x49d72d`).
+    #[test]
+    fn an_addon_line_meets_the_ignore_gate_like_any_other() {
+        use benilla_protocol::messages::chat_tag;
+        let addon = |chat_type: u8, tag: u8| ChatMessage {
+            chat_type,
+            chat_tag: tag,
+            ..a_party_line(LANGUAGE_ADDON, "Quiver\tVERSION:3.1.4")
+        };
+        let (world, sent) = from_an_ignored_sender(addon(CHAT_MSG_PARTY, chat_tag::NONE));
+        assert!(world.resource::<ChatLog>().pending_addons().is_empty());
+        assert!(sent.is_empty());
+        let (world, sent) = from_an_ignored_sender(addon(CHAT_MSG_PARTY, chat_tag::GM));
+        assert_eq!(world.resource::<ChatLog>().pending_addons().len(), 1);
+        assert!(sent.is_empty());
+        // A whisper-typed addon line is dropped and answered as a whisper is (`0x49d73c`).
+        let (world, sent) = from_an_ignored_sender(addon(CHAT_MSG_WHISPER, chat_tag::NONE));
+        assert!(world.resource::<ChatLog>().pending_addons().is_empty());
+        assert!(matches!(
+            sent[..],
+            [ClientCommand::ChatIgnored { guid: 0x21 }]
+        ));
+        let (world, sent) = from_an_ignored_sender(addon(CHAT_MSG_WHISPER, chat_tag::GM));
+        assert_eq!(world.resource::<ChatLog>().pending_addons().len(), 1);
+        assert!(sent.is_empty());
+    }
+
+    /// `SMSG_PLAYED_TIME` (`0x401850`) puts `TIME_PLAYED_MSG` on the notice lane (`0x4018df`) and
+    /// prints nothing to chat itself: its own lines go to the console (`0x401878`-`0x4018c8`), and
+    /// the stock `ChatFrame_DisplayTimePlayed` is the answer's one printer.
     #[test]
     fn the_played_time_answer_prints_no_chat_line_of_its_own() {
+        use crate::field_watch::{FieldNotice, NoticeLane};
         let mut world = World::new();
         world.insert_resource(ChatLog::default());
-        world.init_resource::<PlayedTimeAnswer>();
+        world.init_resource::<NoticeLane>();
         world
             .run_system_once_with(
                 on_played_time,
@@ -287,25 +463,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            world.resource::<PlayedTimeAnswer>().0,
-            Some((360_000, 7_200))
+            world
+                .resource_mut::<NoticeLane>()
+                .drain()
+                .collect::<Vec<_>>(),
+            [FieldNotice::PlayedTime {
+                total: 360_000,
+                level: 7_200
+            }]
         );
         assert_eq!(world.resource::<ChatLog>().pending_len(), 0);
     }
 
-    /// `SMSG_TRANSFER_ABORTED` reaches chat: its reason is parked for the line the resolve pass
-    /// reads from the VM (`0x4019a0`).
+    /// `SMSG_TRANSFER_ABORTED` reaches chat: its reason goes on the chat lane at the packet, for
+    /// the line its firing reads from the VM (`0x4019a0`).
     #[test]
-    fn a_transfer_abort_is_parked_for_its_line() {
+    fn a_transfer_abort_is_queued_for_its_line() {
         let mut world = World::new();
         world.insert_resource(ChatLog::default());
         world
             .run_system_once_with(on_broadcast, SessionEvent::TransferAborted { reason: 5 })
             .unwrap();
-        assert_eq!(
-            world.resource_mut::<ChatLog>().take_broadcasts(),
-            [Broadcast::TransferAborted { reason: 5 }]
-        );
+        assert_eq!(world.resource::<ChatLog>().pending_kinds(), ["broadcast"]);
     }
 
     /// An addon line rides an ordinary lane; only its `language` keeps it out of the window.
@@ -386,10 +565,10 @@ mod tests {
             "the SendSysMessage half is the chat line, and it stays"
         );
 
-        let mut errors = UiErrorTexts::default();
-        notification("GM mode is ON".to_string(), &mut errors);
+        let errors = UiErrorKeys::default();
+        notification("GM mode is ON".to_string(), &errors);
         assert_eq!(
-            errors.0,
+            errors.texts(),
             [(
                 "GM mode is ON".to_string(),
                 benilla_ui::messages::MsgKind::Error
@@ -400,13 +579,13 @@ mod tests {
 
     #[test]
     fn an_area_trigger_refusal_takes_the_yellow_arm() {
-        let mut errors = UiErrorTexts::default();
+        let errors = UiErrorKeys::default();
         area_trigger_message(
             "You must be at least level 58 to enter.".to_string(),
-            &mut errors,
+            &errors,
         );
         assert_eq!(
-            errors.0,
+            errors.texts(),
             [(
                 "You must be at least level 58 to enter.".to_string(),
                 benilla_ui::messages::MsgKind::Info

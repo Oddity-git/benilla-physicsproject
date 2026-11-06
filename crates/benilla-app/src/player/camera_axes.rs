@@ -11,13 +11,15 @@ use super::camera_zoom::CAM_DIST_MIN;
 /// `0x511550`), a quarter of the yaw's 0.001 (`0x801360` at `0x51149b`): degrees a second × 0.25.
 const PITCH_RATE_SCALE: f32 = 0.25;
 
-/// One axis: `[cam+0x128]` bit `2i` (active) and `2i+1` (stopping), and whether its start time is
-/// this frame's, so the first tick moves nothing (`now − [cam+0x12c + 4i]`).
+/// One axis: `[cam+0x128]` bit `2i` (active) and `2i+1` (stopping), whether its start time is
+/// this frame's, so the first tick moves nothing (`now − [cam+0x12c + 4i]`), and the seconds left
+/// to its queued end (`[cam+0x15c + 4i]`), which a zoom sets.
 #[derive(Clone, Copy, Default, Debug)]
 struct Axis {
     active: bool,
     stopping: bool,
     fresh: bool,
+    queued: Option<f32>,
 }
 
 /// The six axes, indexed as [`ViewAxis`].
@@ -31,6 +33,29 @@ impl ViewAxes {
         let a = &mut self.0[axis as usize];
         a.active = true;
         a.fresh = true;
+        a.queued = None;
+    }
+
+    /// `CameraZoomIn`/`Out` (`0x50fc60`, `0x50fcd0`) on the distance axes: `yards` at `speed`, in
+    /// whole milliseconds (`0x50fc6c`-`0x50fc79`), the opposite axis stopped first (`0x50fc83`),
+    /// then added to the axis's queued end while it runs toward one (`0x50fca9`), else the axis
+    /// started with that end (`0x50fcbe` → `0x50fd40`), none for a zero span (`0x50fd80`).
+    pub(super) fn zoom(&mut self, out: bool, yards: f32, speed: f32) {
+        let (axis, other) = if out {
+            (ViewAxis::Out, ViewAxis::In)
+        } else {
+            (ViewAxis::In, ViewAxis::Out)
+        };
+        let secs = (yards / speed * 1000.0).trunc() / 1000.0;
+        self.stop(other);
+        let a = &mut self.0[axis as usize];
+        match a.queued {
+            Some(left) if a.active => a.queued = Some(left + secs),
+            _ => {
+                self.start(axis);
+                self.0[axis as usize].queued = (secs != 0.0).then_some(secs);
+            }
+        }
     }
 
     /// `0x50fd90(axis, now)`: on an active axis, set the stopping bit and the end time.
@@ -52,6 +77,18 @@ impl ViewAxes {
         }
     }
 
+    /// Whether `axis` is active, its bit `2i` of `[cam+0x128]`.
+    #[cfg(test)]
+    pub(super) fn active(&self, axis: ViewAxis) -> bool {
+        self.0[axis as usize].active
+    }
+
+    /// Whether `axis` is stopping, its bit `2i + 1`.
+    #[cfg(test)]
+    pub(super) fn stopping(&self, axis: ViewAxis) -> bool {
+        self.0[axis as usize].stopping
+    }
+
     /// Whether any axis is active, the reference's `[cam+0x128] != 0` (`0x50ea48`).
     fn any(&self) -> bool {
         self.0.iter().any(|a| a.active)
@@ -59,12 +96,21 @@ impl ViewAxes {
 
     /// Each active axis's seconds this tick, clearing the ones that stop: a continuing axis runs
     /// the frame, one started this frame runs nothing yet, and a stopping one runs to its end
-    /// time, then both bits clear (`0x511372`-`0x5113a0`, `max(end − start, 0)`).
+    /// time, then both bits clear (`0x511372`-`0x5113a0`, `max(end − start, 0)`). A queued end
+    /// reached stops its axis at the tick (`0x511341`-`0x511359`), which then runs whole.
     fn advance(&mut self, dt: f32) -> [f32; 6] {
         let mut secs = [0.0; 6];
         for (a, s) in self.0.iter_mut().zip(&mut secs) {
             if !a.active {
                 continue;
+            }
+            if let Some(left) = a.queued.as_mut() {
+                if !a.fresh {
+                    *left -= dt;
+                }
+                if *left <= 0.0 {
+                    a.stopping = true;
+                }
             }
             *s = if a.fresh { 0.0 } else { dt };
             a.fresh = false;
@@ -79,7 +125,8 @@ impl ViewAxes {
 /// The axes' tick (`0x5112d0`), from the camera update while any is active. Distance moves
 /// `cameraDistanceMoveSpeed` yards a second, held to `[0, max]` (`0x511402`, `0x51145e`); the yaw
 /// `cameraYawMoveSpeed` degrees a second; the pitch a quarter of `cameraPitchMoveSpeed`, held to
-/// ±89° (`0x8089d8`). The live value follows the target (`0x511422`, `0x51152f`, `0x5115d6`).
+/// ±89° (`0x8089d8`). The live value follows the target unless its channel runs (`0x511422`,
+/// `0x51152f`, `0x5115d6`). Any running axis sets mode bit 6 (`0x51131e`).
 /// Here Right raises the yaw as the reference's `+0x210` rises (`0x5114a7`), both turning left as
 /// they grow, so the camera swings to the character's right; Up raises the reference's pitch,
 /// which looks down as it grows, so ours, up-positive, falls.
@@ -94,6 +141,7 @@ pub(super) fn tick(
     if !rig.view_axes.any() {
         return;
     }
+    rig.view_moved = true;
     let secs = rig.view_axes.advance(dt);
     let at = |axis: ViewAxis| secs[axis as usize];
     let zoom = distance_speed * (at(ViewAxis::Out) - at(ViewAxis::In));
@@ -102,16 +150,20 @@ pub(super) fn tick(
         let target = (rig.target_distance + zoom)
             .max(CAM_DIST_MIN)
             .min(max_distance);
-        rig.distance = (rig.distance + (target - rig.target_distance))
-            .max(CAM_DIST_MIN)
-            .min(max_distance);
+        if !rig.view_blend.distance_in_flight() {
+            rig.distance = (rig.distance + (target - rig.target_distance))
+                .max(CAM_DIST_MIN)
+                .min(max_distance);
+        }
         rig.target_distance = target;
     }
     let yaw = look.yaw_speed.to_radians() * (at(ViewAxis::Right) - at(ViewAxis::Left));
-    cam.yaw += yaw;
+    if !rig.follow.move_target(yaw) {
+        cam.yaw += yaw;
+    }
     let pitch = (look.pitch_speed * PITCH_RATE_SCALE).to_radians()
         * (at(ViewAxis::Down) - at(ViewAxis::Up));
-    if pitch != 0.0 {
+    if pitch != 0.0 && !rig.view_blend.move_pitch_target(pitch) {
         cam.pitch = (cam.pitch + pitch).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
     }
 }
@@ -171,6 +223,17 @@ mod tests {
         );
     }
 
+    /// Any running axis sets mode bit 6 (`0x51131e`); with none running the tick never comes
+    /// (`0x50ea48`).
+    #[test]
+    fn a_running_axis_marks_the_camera_moved() {
+        let (mut r, mut c) = (rig(10.0), cam());
+        run(&mut r, &mut c, &[], 1, 0.1);
+        assert!(!r.view_moved);
+        run(&mut r, &mut c, &[(ViewAxis::Right, true)], 1, 0.1);
+        assert!(r.view_moved);
+    }
+
     /// Right raises the yaw and Left lowers it (`0x5114a7`, `0x5114f0`); Up lowers our pitch, the
     /// reference's rising (`0x51155c`), and Down raises it.
     #[test]
@@ -213,6 +276,34 @@ mod tests {
             0.1,
         );
         assert!(!r.view_axes.any());
+    }
+
+    /// A zoom queues its span on its distance axis (`0x50fc60`): 1 yd at 8.33 yd/s is 120 ms,
+    /// truncated (`0x50fc79`), and the axis stops at the first tick past it, which runs whole
+    /// (`0x511359`). A zoom the opposite way stops it first (`0x50fc83`): of `In` then `Out` in
+    /// one frame, the camera moves out alone. A second zoom the same way adds to the span
+    /// (`0x50fca9`).
+    #[test]
+    fn a_zoom_runs_its_axis_for_its_span_and_stops_the_opposite_one() {
+        let speed = 8.33;
+        let tick = |r: &mut CameraControl, c: &mut FlyCam| {
+            for _ in 0..10 {
+                super::tick(r, c, 0.05, LookConfig::default(), speed, 15.0);
+            }
+        };
+        let (mut r, mut c) = (rig(10.0), cam());
+        r.view_axes.zoom(false, 1.0, speed);
+        r.view_axes.zoom(true, 1.0, speed);
+        tick(&mut r, &mut c);
+        // The start tick runs nothing; the 0.12 s queued ends at the third tick after it.
+        assert!((r.target_distance - (10.0 + 3.0 * 0.05 * speed)).abs() < 1e-4);
+        assert!(!r.view_axes.any(), "both axes ended");
+
+        let (mut r, mut c) = (rig(10.0), cam());
+        r.view_axes.zoom(true, 1.0, speed);
+        r.view_axes.zoom(true, 1.0, speed);
+        tick(&mut r, &mut c);
+        assert!((r.target_distance - (10.0 + 5.0 * 0.05 * speed)).abs() < 1e-4);
     }
 
     /// The Lua pairs reach the axes through the bindings' frame state, in call order.

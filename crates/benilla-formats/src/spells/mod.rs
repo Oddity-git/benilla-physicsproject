@@ -350,14 +350,26 @@ impl SpellCatalog {
                 })
             })
             .collect();
+        // The language declaration off slot 0, as the loader reads it.
+        let declared_language = spells
+            .iter()
+            .filter(|(_, d)| d.effects[0] == SPELL_EFFECT_LANGUAGE && d.effect_misc_value[0] > 0)
+            .map(|(&id, d)| (id, d.effect_misc_value[0] as u32))
+            .collect();
         Self {
             weapon_skills: weapon_skill_table(&spells),
             spells,
             learned_spell,
             learn_effects,
-            declared_language: HashMap::new(),
+            declared_language,
             dispel_types: SpellDispelTypes::default(),
         }
+    }
+
+    /// The catalog with `dispel_types` for its dispel table, for the aura tests.
+    pub fn with_dispel_types(mut self, dispel_types: SpellDispelTypes) -> Self {
+        self.dispel_types = dispel_types;
+        self
     }
 
     /// The spell that teaches the skill of a weapon of `subclass`, the table `0xc4d738` that

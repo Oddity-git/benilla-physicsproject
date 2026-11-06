@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::Buffer;
 
 use crate::billboard::BillboardCard;
-use crate::doodad_anim::DoodadAnimHost;
+use crate::doodad_anim::{CarriedSphere, DoodadAnimHost};
 use crate::mesh_tag::alpha_bits;
 use crate::model_fade::DoodadFade;
 use crate::model_render::{model_material, MaterialCache, ShadeSel};
@@ -71,7 +71,7 @@ pub fn spawn_model_entities(
     interior_slot: Option<u16>,
     // The placement's draw-set gate, shared with its emitters, ribbons, lights and anim host: a
     // meshless prop's only verdict. `None` on the entity-hosted lane, as a mover has no baked
-    // world point to measure from; the mesh lane then builds a bare sphere from `radius`.
+    // world point to measure from; the host then judges a bare sphere of `radius` where it is.
     fade: Option<&crate::particles::EmitterFade>,
     radius: f32,
     local_center: Vec3,
@@ -101,7 +101,9 @@ pub fn spawn_model_entities(
         crate::static_gx::GxSite<'_>,
     )>,
 ) -> SpawnedModel {
-    // The caller's gate, else the bare sphere; every radius or centre read below goes through it.
+    // The caller's gate, else the bare sphere of a mover's prop, whose `transform` is parent-local:
+    // its host's gate re-centres it in world space each frame ([`CarriedSphere`]).
+    let carried = fade.is_none();
     let fade = match fade {
         Some(f) => f.clone(),
         None => {
@@ -163,7 +165,14 @@ pub fn spawn_model_entities(
         // A batch whose UV or tint loop differs by sequence gets a material keyed by this
         // placement's host, since placements re-roll their variations independently. Without a
         // host it shares and stays at the built seed.
-        let per_seq = sub.uv_seq.is_some() || sub.rgb_seq.is_some();
+        let stage1_moves = crate::doodad_anim::Stage1Loops::of(&sub.geometry).any();
+        let per_seq = sub.uv_seq.is_some()
+            || sub.rgb_seq.is_some()
+            || sub
+                .geometry
+                .stage1
+                .as_ref()
+                .is_some_and(|s| s.uv_seq.is_some());
         let seq_owner = per_seq.then_some(rig_root).flatten();
         let cutout = model_material(
             mat_cache,
@@ -240,6 +249,7 @@ pub fn spawn_model_entities(
                 || sub.alpha_anim.is_some()
                 || seq_owner.is_some()
                 || sub.uv_anim.is_some()
+                || stage1_moves
                 || sub.rgb_anim.is_some(),
             interior_prop: interior_probe,
             order_free: matches!(sub.blend, ModelBlend::Opaque | ModelBlend::AlphaTest)
@@ -375,7 +385,7 @@ pub fn spawn_model_entities(
                     two_sided,
                     unlit: sub.emissive,
                     fog_policy: sub.fog_policy,
-                    // The retained pass bakes neither stage-0 nor stage-1 generated coordinates.
+                    // The retained pass draws no second stage and bakes no generated coordinate.
                     env_map: sub.env_map || sub.stage1.is_some(),
                     no_depth_write: sub.no_depth_write,
                     no_depth_test: sub.no_depth_test,
@@ -414,32 +424,14 @@ pub fn spawn_model_entities(
                 continue;
             }
         }
-        // Register both materials for the UV scroll (idempotent per material). A per-sequence set
-        // replaces the shared loop when there is a host to read; a period-0 loop is a constant the
-        // seed already wrote, so it stays out.
-        if let (Some(seqs), Some(host)) = (sub.uv_seq.as_ref(), seq_owner) {
-            for id in [cutout.id(), blend.id()] {
-                crate::doodad_anim::register_uv(
-                    uv_reg,
-                    anim_table,
-                    materials,
-                    id,
-                    crate::doodad_anim::UvLoop::PerSeq {
-                        seqs: seqs.clone(),
-                        host,
-                    },
-                );
-            }
-        } else if let Some(anim) = sub.uv_anim.as_ref().filter(|a| a.period > 0.0) {
-            for id in [cutout.id(), blend.id()] {
-                crate::doodad_anim::register_uv(
-                    uv_reg,
-                    anim_table,
-                    materials,
-                    id,
-                    crate::doodad_anim::UvLoop::Shared(Some(anim.clone())),
-                );
-            }
+        // Register both materials for the UV scroll of either stage (idempotent per material). A
+        // per-sequence set replaces the shared loop when there is a host to read; a period-0 loop
+        // is a constant the seed already wrote, so it stays out.
+        let loops = crate::doodad_anim::UvLoops::of(sub).translation_only();
+        for id in [cutout.id(), blend.id()] {
+            crate::doodad_anim::register_entity_uv(
+                uv_reg, anim_table, materials, id, &loops, seq_owner,
+            );
         }
         // Likewise for the animated M2Color RGB tint.
         if let (Some(seqs), Some(host)) = (sub.rgb_seq.as_ref(), seq_owner) {
@@ -639,6 +631,9 @@ pub fn spawn_model_entities(
             active: false,
             parked_at: now,
         });
+        if carried {
+            commands.entity(h.root).insert(CarriedSphere(local_center));
+        }
         // The lazy rig, only with skinnable parts: an emitter-only host never takes a slot.
         if !lazy_parts.is_empty() {
             commands.entity(h.root).insert(crate::doodad_anim::LazyRig {

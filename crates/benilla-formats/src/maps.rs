@@ -99,9 +99,20 @@ impl MapCatalog {
         self
     }
 
+    /// This catalog with `InstanceType` values for `(id, type)` pairs, for tests and fixtures.
+    pub fn with_instance_types(mut self, types: impl IntoIterator<Item = (u32, u32)>) -> Self {
+        self.instance_types.extend(types);
+        self
+    }
+
     /// The MPQ directory name (`Directory`) for `map_id`, as `MapTiles::load(chain, dir)` takes it.
     pub fn directory(&self, map_id: u32) -> Option<&str> {
         self.dirs.get(&map_id).map(String::as_str)
+    }
+
+    /// Whether `Map.dbc` has a row for `map_id`, whatever its strings hold.
+    pub fn has_row(&self, map_id: u32) -> bool {
+        self.area_table_ids.contains_key(&map_id)
     }
 
     /// The display name (`MapName_Lang`) for `map_id`, "Eastern Kingdoms".

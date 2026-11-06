@@ -211,6 +211,17 @@ fn name_line(flags: u32, key: Option<TitleKey>, strings: &NameLineStrings, name:
     line
 }
 
+/// The name block through the grammar rewrite `0x7716f0` before it is built (`0x6c703f`): the
+/// whole text `0x608f50` made, lines and all, so a `|1` or `|2` reads what came before it across
+/// the line breaks.
+fn grammar_lines(lines: Vec<String>) -> Vec<String> {
+    let text = lines.join("\n");
+    match benilla_ui::strings::expand_grammar_escapes(&text) {
+        std::borrow::Cow::Borrowed(_) => lines,
+        std::borrow::Cow::Owned(rewritten) => rewritten.split('\n').map(str::to_owned).collect(),
+    }
+}
+
 /// A live plate: its entity and stack, and the inputs the stack was built from, so a steady frame
 /// compares fields and re-reads neither the name cache nor the install strings.
 struct LiveName {
@@ -442,8 +453,6 @@ pub(crate) fn drive_nameplates(
         Option<Res<crate::player::CameraControl>>,
         Res<crate::vplates::VPlates>,
         Res<crate::chat_bubble::BubblesActive>,
-        // The selector's party roster (`0xbc6f48`), for the pale party variants.
-        Res<crate::ui_party::GroupState>,
         // The UnitName* CVar mask.
         Res<NameConfig>,
         // The rank strings, read off the current VM ([`NameLineStrings`]).
@@ -471,7 +480,7 @@ pub(crate) fn drive_nameplates(
         Query<(), With<crate::entities::mount::MountChild>>,
     ),
 ) {
-    let (selection, flash, rig, vplates, bubbles, group, name_cfg, pvp_strings, self_guid) = gates;
+    let (selection, flash, rig, vplates, bubbles, name_cfg, pvp_strings, self_guid) = gates;
     let (Ok(cam_tf), Some(atlas)) = (camera.single(), atlas.as_mut()) else {
         return;
     };
@@ -530,8 +539,9 @@ pub(crate) fn drive_nameplates(
                 ghost_visual: store.is_some_and(|s| s.0.unit_is_ghost_visual()),
                 is_self,
                 // No name over a fully faded first-person avatar. Deviation: `ShouldShowName`'s
-                // first leg is `IsSelectable` (`0x60be60`), which passes our own unit; what hides
-                // the own name in first person in 1.12.1 is untraced, so the avatar's fade stands in.
+                // first leg is `IsSelectable` (`0x60be60`), which passes our own unit; the avatar's
+                // fade stands in because what hides the own name in first person in 1.12.1 is
+                // untraced.
                 self_faded: rig
                     .as_deref()
                     .map_or(1.0, crate::player::CameraControl::self_fade)
@@ -574,9 +584,9 @@ pub(crate) fn drive_nameplates(
                 .and_then(|e| names.creature_subname(e))
                 // vmangos sends "" for most templates: an empty subname is no line.
                 .filter(|s| !s.trim().is_empty()),
-            EntityKind::Player if name_cfg.player_guild => {
-                store.and_then(|s| crate::ui_guild::unit_guild_name(&s.0, &guilds, &net_commands))
-            }
+            EntityKind::Player if name_cfg.player_guild => store.and_then(|s| {
+                crate::ui_guild::unit_guild_name(guid.0, &s.0, &guilds, &net_commands)
+            }),
             _ => None,
         };
         // The selector's first-priority branch: the combat flash while we melee this unit.
@@ -589,7 +599,8 @@ pub(crate) fn drive_nameplates(
                 me.as_ref(),
                 net.kind == EntityKind::Player,
                 store.is_some_and(|s| s.0.unit_is_dead()),
-                group.members.iter().any(|m| m.guid == guid.0),
+                // `0x4e7f70`: us or one of the four party slots, never the raid roster.
+                rel.in_party(guid.0),
             ))
         };
 
@@ -617,6 +628,7 @@ pub(crate) fn drive_nameplates(
                 if let Some(bracketed) = bracketed {
                     lines.push(format!("<{bracketed}>"));
                 }
+                let lines = grammar_lines(lines);
                 debug!("nameplates: rebuild {entity} -> {lines:?} ({color:?})");
                 let mesh = plates
                     .meshes
@@ -764,7 +776,10 @@ pub(crate) struct NameplatesPlugin;
 struct NameAnchorTrace(bool);
 
 /// The overhead-name rows' change callback: the name trio, the guild line and the rank prefix.
-pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut names: ResMut<NameConfig>) {
+pub(crate) fn on_cvar(
+    ev: &crate::cvars::CvarChanged,
+    mut names: bevy::prelude::Mut<'_, NameConfig>,
+) {
     match ev.key().as_str() {
         "unitnameplayer" => names.player = ev.flag(),
         "unitnamenpc" => names.npc = ev.flag(),
@@ -777,7 +792,6 @@ pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut names: ResMut<NameC
 
 impl Plugin for NameplatesPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(on_cvar);
         app.insert_resource(NameAnchorTrace(
             std::env::var_os("WOW_PROBE_NAME_TRACE").is_some(),
         ))
@@ -1375,5 +1389,20 @@ mod tests {
         assert_eq!(plates.materials.len(), 1);
         assert_eq!(plates.live.len(), 1);
         assert!(world.get_entity(plate).is_ok());
+    }
+
+    /// The block goes through `0x7716f0` whole: a plain block is left as it is, and a `|2` rewrites
+    /// its word on its own line.
+    #[test]
+    fn the_name_block_runs_the_grammar_rewrite() {
+        let plain = vec!["Bob".to_string(), "<Guild>".to_string()];
+        assert_eq!(grammar_lines(plain.clone()), plain);
+        assert_eq!(
+            grammar_lines(vec![
+                "Garde |2Orgrimmar".to_string(),
+                "<Guilde>".to_string()
+            ]),
+            ["Garde d'Orgrimmar", "<Guilde>"]
+        );
     }
 }

@@ -915,6 +915,7 @@ fn unify_stamps_flying_from_the_live_spline_on_every_leg() {
     use std::time::{Duration, Instant};
     let spline = |grounded| crate::net::Spline {
         deck: None,
+        final_facing: benilla_protocol::MonsterMoveFacing::None,
         points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
         start: Instant::now(),
         duration: Duration::from_secs(10),
@@ -952,6 +953,7 @@ fn the_granted_modes_fold_into_the_flags_word_on_every_leg_but_our_own() {
     // Creature leg on a path: the granted bit rides alongside the spline's own FORWARD.
     let spline = crate::net::Spline {
         deck: None,
+        final_facing: benilla_protocol::MonsterMoveFacing::None,
         points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
         start: Instant::now(),
         duration: Duration::from_secs(10),
@@ -980,6 +982,7 @@ fn the_granted_modes_fold_into_the_flags_word_on_every_leg_but_our_own() {
         relay: Default::default(),
         last_apply_ms: 0.0,
         last_apply_pos: [0.0; 3],
+        fired_at_ms: None,
     };
     let v = unify(None, Some(&rm), None, false, Some(&walking));
     assert_eq!(v.flags, move_flags::FORWARD | move_flags::WALK_MODE);

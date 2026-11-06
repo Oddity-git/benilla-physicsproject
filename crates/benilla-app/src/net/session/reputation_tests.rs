@@ -363,11 +363,19 @@ fn notices(app: &mut App) -> Vec<FieldNotice> {
         .collect()
 }
 
-fn faction(guid: u64) -> FieldNotice {
-    FieldNotice::Signal {
-        guid,
-        id: crate::field_watch::id::UNIT_FACTION,
-    }
+/// `guid`'s `RefreshNameDesc`, whose plate leg recolours the bar (`0x606e3c`), then its
+/// `UNIT_FACTION`.
+fn faction(guid: u64) -> [FieldNotice; 2] {
+    [
+        FieldNotice::Plate {
+            guid,
+            call: crate::vplates::PlateCall::Colour,
+        },
+        FieldNotice::Signal {
+            guid,
+            id: crate::field_watch::id::UNIT_FACTION,
+        },
+    ]
 }
 
 fn update_faction() -> FieldNotice {
@@ -376,11 +384,11 @@ fn update_faction() -> FieldNotice {
     }
 }
 
-/// `RefreshReaction` on the active player (`0x606e20`): `UNIT_FACTION` for it and its `SUMMON`,
+/// `RefreshReaction` on the active player (`0x606e20`): [`faction`] for it and its `SUMMON`,
 /// then for each held unit the sweep reaches, its own summons skipped (`0x606f76`-`0x606f9e`), so
 /// neither its totem nor a party member the object manager does not hold hears it.
 fn refresh() -> Vec<FieldNotice> {
-    vec![faction(ME), faction(PET), faction(BOAR)]
+    [faction(ME), faction(PET), faction(BOAR)].concat()
 }
 
 /// A standing message refreshes the player's reaction once when an entry moved a rank (`0x4d58ac`
@@ -518,7 +526,7 @@ fn the_initialize_message_signals_both_rebuild_sorts_and_its_own() {
 
 /// Each message hands the pane's list what its handler does to it: a visible message the slot it
 /// lists (`0x4d5738`), a standing message the slots its entries made visible and whether a flag
-/// byte moved (`0x4d5826`, `0x4d58c8`), an at-war message nothing, as it sorts nothing
+/// byte moved (`0x4d5826`, `0x4d58c8`), an at-war message an edit of nothing, as it sorts nothing
 /// (`0x4d56b0`).
 #[test]
 fn each_message_hands_the_list_its_own_ops() {
@@ -526,12 +534,24 @@ fn each_message_hands_the_list_its_own_ops() {
     use benilla_ui::script::ReputationListOp as Op;
     let mut app = synthetic_app();
     seat(&mut app, VISIBLE, 0);
-    let ops =
-        |app: &mut App| std::mem::take(&mut app.world_mut().resource_mut::<Reputations>().list_ops);
+    let ops = |app: &mut App| app.world_mut().resource_mut::<Reputations>().take_ops();
     let _ = ops(&mut app);
     visible(&mut app, 40);
     visible(&mut app, 40);
-    assert_eq!(ops(&mut app), [Op::Visible(40)]);
+    assert_eq!(
+        ops(&mut app),
+        [
+            Op::Edit {
+                listed: vec![40],
+                sort: false
+            },
+            Op::Edit {
+                listed: vec![],
+                sort: true
+            }
+        ],
+        "the adder ahead of the flag write, the sort after it"
+    );
     send(
         &mut app,
         SessionEvent::ReputationAtWar {
@@ -539,14 +559,28 @@ fn each_message_hands_the_list_its_own_ops() {
             flags: AT_WAR,
         },
     );
-    assert!(ops(&mut app).is_empty());
+    assert_eq!(
+        ops(&mut app),
+        [Op::Edit {
+            listed: vec![],
+            sort: false
+        }],
+        "no row listed, no sort"
+    );
     delta(&mut app, 30, 5);
     assert_eq!(
         ops(&mut app),
-        [Op::Standing {
-            listed: vec![30],
-            flags_moved: true
-        }]
+        [
+            Op::Edit {
+                listed: vec![30],
+                sort: false
+            },
+            Op::Edit {
+                listed: vec![],
+                sort: true
+            }
+        ],
+        "the adder at the listing, then the sort once the entries are in"
     );
 }
 

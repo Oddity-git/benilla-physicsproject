@@ -13,206 +13,107 @@
 //!   player its tail, `SignalDeathState` (`0x6251cc` → `0x495850`), `PLAYER_DEAD` and the cursor
 //!   cleared ([`crate::death`]'s);
 //! - with a spell in flight (`0x6e3d30`) whose record's target (`0xceac60`, read through
-//!   `0x6e3d50`) is this unit, `CancelCast(1, 1, 0x65)` (`0x6058e0`);
-//! - when the unit is the selection (`0xb4e2d8`), `SetSelection(0, 0)` (`0x605901`) and then
-//!   `StopAutoRepeatSpell 0x6ea080` (`0x605906`);
+//!   `0x6e3d50`) is this unit, `CancelCast(1, 1, 0x65)` (`0x6058e0`), its `SPELLCAST_FAILED`
+//!   listeners run inside it (`0x6e4a50`);
+//! - when the unit is the selection (`0xb4e2d8`, read after those listeners, `0x6058ea`),
+//!   `SetSelection(0, 0)` (`0x605901`) and then `StopAutoRepeatSpell 0x6ea080` (`0x605906`);
 //! - the tail from `0x60590b`: the quest marker, the missiles, the effects, a sound, the auto-move
-//!   stop and `0x4931c0` on the unit's guid (`0x605950`).
+//!   stop (`0x605938`), which finds none (the health watcher's tick ended it first, `0x60479c`,
+//!   [`crate::player::AutoMoveStop`]), and `0x4931c0` on the unit's guid (`0x605950`).
 //!
 //! The health watcher runs it inside the update packet that wrote the health (`0x6046f0` at
-//! `0x6047a3`). Here the packet's end runs each death's legs in place, so their state and their
-//! sends come in packet order, and parks the Lua each leg signals ([`crate::script_calls::defer_vm`]) on the
-//! deaths lane, stamped under the health edge's stamp: they fire in stamp order among the other
-//! lanes' items, ahead of what the packet raised after the edge, their listeners reading the unit
-//! views as of the packet. The death line takes the place between `0x5e99b0`'s list and
-//! `PLAYER_DEAD` the legs leave it ([`crate::ui_chat::combat::watch::DeathLineAt`]). A listener reads other state
-//! as the frame's packets left it, which #2217 is about.
+//! `0x6047a3`). Here the packet's end runs each death's legs in place ([`crate::field_callbacks`]),
+//! so their state and their sends come in packet order, each leg a step under the health edge's
+//! stamp ([`crate::lanes::step`]): what was stamped before it fires first, then the leg runs with
+//! its signals' listeners in place, ahead of the next leg and of what the packet raised after the
+//! edge. The death line goes between `0x5e99b0`'s list and `PLAYER_DEAD`, as `PresentUnitDeath`
+//! writes it.
 
-use std::collections::VecDeque;
-
-use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 
 use benilla_protocol::messages::ObjectType;
-use benilla_protocol::{SessionEvent, SessionEventKind};
 
 use super::Selection;
 use crate::creature_anim::{AttackSeam, UnitEdit};
-use crate::lanes::{Stamp, Until};
-use crate::net::{FieldChanged, NetHandlerApp, ObjectStore, SelfPlayer};
+use crate::net::{FieldChanged, ObjectStore, SelfPlayer};
 use crate::query_cache::Ask;
 use crate::ui_action::{FillArg, UiError, UiErrorKeys};
 
 /// What a groupmate's death shows: message `0x4c` (`0x5e9a0e`).
 const PLAYER_DIED: &str = "ERR_PLAYER_DIED_S";
 
-/// The Lua the deaths' legs signalled, parked in the VM, each with its stamp and the VM's session
-/// and key, for the deaths lane.
-#[derive(Resource, Default)]
-pub(crate) struct Deaths(VecDeque<(Stamp, u64, u64)>);
-
-/// The VM's end, a reload's or the session's: what its deaths parked goes with it.
-pub(crate) fn drop_parked_deaths(world: &mut World) {
-    if let Some(mut deaths) = world.get_resource_mut::<Deaths>() {
-        deaths.0.clear();
-    }
-}
-
-/// Registers the deaths on the update packet's end, after the update handler that writes their
-/// edges (`crate::net` builds first), and the lane that fires their signals.
-pub(super) fn register(app: &mut App) {
-    use crate::lanes::LaneApp;
-    app.init_resource::<Deaths>()
-        .net_handler(SessionEventKind::ObjectUpdateEnd, on_unit_died)
-        .add_exclusive_lane("deaths", peek_deaths, fire_deaths, |_| Default::default());
-}
-
-/// The packet's deaths, in its edges' order, each run in place.
-fn on_unit_died(
-    In(ev): In<SessionEvent>,
-    world: &mut World,
-    edges: &mut SystemState<MessageReader<'static, 'static, FieldChanged>>,
-) {
-    let SessionEvent::ObjectUpdateEnd = ev else {
-        return;
-    };
-    let edges: Vec<FieldChanged> = edges
-        .get_mut(world)
-        .read()
-        .filter(|e| e.unit_died())
-        .copied()
-        .collect();
-    for e in edges {
-        // What the legs stamp nests under the edge, ahead of what the packet raised after it.
-        crate::lanes::firing(e.at, || die(world, e));
-    }
-}
-
-/// The deaths lane's head.
-fn peek_deaths(world: &World) -> Option<Stamp> {
-    world
-        .get_resource::<Deaths>()?
-        .0
-        .front()
-        .map(|(at, ..)| *at)
-}
-
-/// Each leg's signals `until` admits, run as the firing of their stamp with the host lent; the
-/// lane stops after one whose firing stamped anything, so what it pushed fires next. It reads
-/// nothing beside the host and its own lane.
-fn fire_deaths(In(until): In<Until>, world: &mut World) {
-    loop {
-        let Some((at, session, key)) = world
-            .resource::<Deaths>()
-            .0
-            .front()
-            .copied()
-            .filter(|(at, ..)| until.admits(*at))
-        else {
-            return;
-        };
-        world.resource_mut::<Deaths>().0.pop_front();
-        let ((), moved) =
-            crate::lanes::firing(at, || crate::script_calls::run_parked(world, session, key));
-        if moved {
-            return;
-        }
-    }
-}
-
-/// Every death's signals queued, fired alone, for a test that drives the deaths without the
-/// other lanes.
-#[cfg(test)]
-pub(crate) fn fire_deaths_lane(world: &mut World) {
-    while world
-        .resource::<Deaths>()
-        .0
-        .front()
-        .is_some_and(|(at, ..)| Until::all().admits(*at))
-    {
-        world
-            .run_system_cached_with(fire_deaths, Until::all())
-            .expect("the deaths lane fires");
-    }
-}
-
 /// One unit's death, each leg in its place: a deselect's `SetSelection` signals inside it
 /// ([`crate::script_calls::ScriptCallHost::engine_select`]), a release of the interaction latch
 /// closes its window there ([`crate::ui_session::release_cell`]), and our own death's quest-giver
 /// sweep asks there ([`crate::quest_markers::sweep_statuses`]), before the death goes on. What
-/// each leg signals is parked behind it ([`Parked`]).
-fn die(world: &mut World, e: FieldChanged) {
+/// each leg signals fires inside it, a step in its place ([`crate::lanes::step`]), ahead of the
+/// next leg.
+pub(crate) fn died(world: &mut World, e: FieldChanged) {
     let me = world
         .query_filtered::<Entity, With<SelfPlayer>>()
         .iter(world)
         .next();
     let own = e.kind == ObjectType::Player && me == Some(e.entity);
-    let mut parked = Parked::new(world);
+    // Ahead of `OnDied`, the health watcher runs the dying active mover's input tick
+    // (`0x60477a`-`0x60479c`), whose precondition fails on the health (`0x5144fd`), so it stops the
+    // auto-move (`0x5146d6`), its `AUTOFOLLOW_END` first; the tail's stop (`0x605938`) then finds
+    // the mode at 12.
+    crate::lanes::step(world, |world| crate::player::stop_auto_move(world, e.guid));
     // `CGPlayer_C::OnDied 0x5e99b0`, for a player (`0x605882`).
     if own {
         // The active player's leg (`0x5e99d8`-`0x5e99e4` match), in its order.
-        parked.step(world, own_death_head, e);
+        crate::lanes::step(world, |world| step(world, own_death_head, e));
         // `0x4931c0(0xb4e2d0, dl = 0)` (`0x5e9a51`): the latch, with the goodbye.
-        parked.leg(world, |world| crate::ui_session::release_latch(world, true));
-        parked.step(world, own_death_loot, e);
+        crate::lanes::step(world, |world| crate::ui_session::release_latch(world, true));
+        crate::lanes::step(world, |world| step(world, own_death_loot, e));
         // `0x5eb070` (`0x5e9a61`): the quest givers swept.
-        parked.leg(world, crate::quest_markers::sweep_statuses);
-        parked.step(world, own_death_cast, e);
+        crate::lanes::step(world, crate::quest_markers::sweep_statuses);
+        crate::lanes::step(world, |world| step(world, own_death_cast, e));
+        crate::lanes::step(world, |world| step(world, own_death_repop, e));
     } else if e.kind == ObjectType::Player {
-        parked.step(world, groupmate_died, e);
+        crate::lanes::step(world, |world| step(world, groupmate_died, e));
     }
-    parked.step(world, unit_attack_words, e);
-    // `PresentUnitDeath` (`0x6058ae`): the death line's place (`0x62c160`), then for the active
-    // player its tail (`0x6251c2`-`0x6251cc`).
-    let line = crate::lanes::stamp();
-    if let Some(mut at) = world.get_resource_mut::<crate::ui_chat::combat::watch::DeathLineAt>() {
-        at.place(e.at, line);
-    }
+    crate::lanes::step(world, |world| step(world, unit_attack_words, e));
+    // `PresentUnitDeath` (`0x6058ae`): the death line (`0x62c160`), then for the active player
+    // its tail (`0x6251c2`-`0x6251cc`).
+    crate::ui_chat::combat::watch::death_line(world, e);
     if own {
-        parked.leg(world, crate::death::signal_death_state);
+        crate::lanes::step(world, crate::death::signal_death_state);
     }
-    parked.step(world, unit_died, e);
+    crate::lanes::step(world, |world| step(world, unit_died_cancel, e));
+    crate::lanes::step(world, |world| step(world, unit_died_deselect, e));
     // The tail's `0x4931c0` on the unit's guid (`0x605950`, `dl = 1`): no goodbye.
-    parked.leg(world, |world| {
+    crate::lanes::step(world, |world| {
         crate::ui_session::release_cell(world, e.guid, false)
     });
-    drop(parked);
 }
 
-/// A death's deferred stretch on the world's VM: each leg's signals held as it runs and parked
-/// behind it on the deaths lane, at a stamp taken as it ends, after what it pushed onto the other
-/// lanes. With no VM nothing signals.
-struct Parked(Option<(benilla_ui::script::Deferring, usize)>);
-
-impl Parked {
-    fn new(world: &World) -> Self {
-        Self(crate::script_calls::defer_vm(world))
+/// The health watcher's leg after `OnDied` (`0x6047a8`-`0x6047e7`): with the dead unit still the
+/// selection (`0xb4e2d8`, `0x6047c7`-`0x6047d8`), which `OnDied`'s deselect leaves only when it
+/// was refused (a charmed player, `0x49359c`), the active player's precast ends with its own
+/// spell and its tail (`0x60d040(+0xc8c, 1, 1)`), whose loot close runs here, inside the update
+/// packet, at the edge's place.
+pub(crate) fn dead_selection_ends_precast(world: &mut World, e: FieldChanged) {
+    if world.get_resource::<Selection>().and_then(|s| s.guid) != Some(e.guid) {
+        return;
     }
-
-    /// Run `leg`, then park what it signalled.
-    fn leg(&mut self, world: &mut World, leg: impl FnOnce(&mut World)) {
-        leg(world);
-        let Some((_, mark)) = &self.0 else {
-            return;
-        };
-        if let Some((session, key)) = crate::script_calls::park_since(world, *mark) {
-            let at = crate::lanes::stamp();
-            world
-                .resource_mut::<Deaths>()
-                .0
-                .push_back((at, session, key));
-        }
-    }
-
-    /// [`step`] as a leg.
-    fn step<M: 'static>(
-        &mut self,
-        world: &mut World,
-        leg: impl IntoSystem<In<FieldChanged>, (), M> + 'static,
-        e: FieldChanged,
-    ) {
-        self.leg(world, |world| step(world, leg, e));
-    }
+    // The active player, looked up as one (`0x468550`, `0x6047be` with type mask 0x10).
+    let Some(me) = world
+        .query_filtered::<Entity, With<SelfPlayer>>()
+        .iter(world)
+        .next()
+    else {
+        return;
+    };
+    let Some(edits) = world.get_resource::<crate::creature_anim::UnitEdits>() else {
+        return;
+    };
+    edits.push(UnitEdit::EndPrecast {
+        entity: me,
+        spell_id: None,
+        tail: true,
+    });
+    crate::creature_anim::apply_unit_edits(world);
 }
 
 /// Run one leg of a death on `e` in place, its unit edits applied as it returns.
@@ -255,9 +156,7 @@ fn own_death_loot(In(_): In<FieldChanged>, mut seam: AttackSeam) {
 }
 
 /// Our own death past the quest-giver sweep: `CancelCast(1, 1, 0x1c)` (`0x5e9a6c`), asking
-/// nothing of the slot first; then with `UNIT_FIELD_FLAGS` bit 20 (`0x5e9a7d`) `0x5e0ae0` sends
-/// `CMSG_REPOP_REQUEST` at once while the player is dead or a ghost (`0x605f30`), as it is at its
-/// death edge.
+/// nothing of the slot first, its `SPELLCAST_FAILED` signalled inside (`0x6e4a50`).
 fn own_death_cast(In(e): In<FieldChanged>, mut d: Died) {
     let seam = &mut d.seam;
     let spells = seam.spells.as_deref();
@@ -269,6 +168,12 @@ fn own_death_cast(In(e): In<FieldChanged>, mut d: Died) {
         Some(e.entity),
         &seam.edits,
     );
+}
+
+/// Our own death past the cancel's listeners: with `UNIT_FIELD_FLAGS` bit 20 (`0x5e9a7d`)
+/// `0x5e0ae0` sends `CMSG_REPOP_REQUEST` at once (`0x5e9a87`) while the player is dead or a ghost
+/// (`0x605f30`), as it is at its death edge.
+fn own_death_repop(In(e): In<FieldChanged>, d: Died) {
     let store = d.stores.get(e.entity).ok();
     if store.is_some_and(|s| {
         s.0.unit_flags() & crate::player::UNIT_FLAG_TAXI_FLIGHT != 0
@@ -300,30 +205,35 @@ fn unit_attack_words(In(e): In<FieldChanged>, mut seam: AttackSeam) {
     seam.clear_stop_word(e.entity);
 }
 
-/// Any unit's legs past `PresentUnitDeath`: a cast whose record names it cancelled (`0x6058e0`),
-/// and when it is the selection the deselect (`0x605901`), signalled in place, then the auto-repeat
-/// stop (`0x605906`).
-fn unit_died(In(e): In<FieldChanged>, mut vm: crate::script_calls::VmWith<Died<'static, 'static>>) {
+/// Any unit's leg past `PresentUnitDeath`: a cast whose record names it cancelled (`0x6058e0`),
+/// its `SPELLCAST_FAILED` signalled inside (`0x6e4a50`).
+fn unit_died_cancel(In(e): In<FieldChanged>, mut d: Died) {
+    let seam = &mut d.seam;
+    let me = seam.me.single().ok();
+    let spells = seam.spells.as_deref();
+    let mut core = seam.slots.core(&seam.net);
+    if core.slot().is_some() && core.pending.record_target() == Some(e.guid) {
+        core.cancel_reaping(
+            true,
+            true,
+            crate::spell::REASON_TARGETS_DEAD,
+            spells,
+            me,
+            &seam.edits,
+        );
+    }
+}
+
+/// Any unit's leg past the cancel's listeners: the selection read then (`0x6058ea`), and when it
+/// is the unit the deselect (`0x605901`), signalled in place, then the auto-repeat stop
+/// (`0x605906`).
+fn unit_died_deselect(
+    In(e): In<FieldChanged>,
+    mut vm: crate::script_calls::VmWith<Died<'static, 'static>>,
+) {
     let me = vm.own().seam.me.single().ok();
-    let selected = {
-        let mut d = vm.own();
-        let seam = &mut d.seam;
-        let spells = seam.spells.as_deref();
-        let mut core = seam.slots.core(&seam.net);
-        if core.slot().is_some() && core.pending.record_target() == Some(e.guid) {
-            core.cancel_reaping(
-                true,
-                true,
-                crate::spell::REASON_TARGETS_DEAD,
-                spells,
-                me,
-                &seam.edits,
-            );
-        }
-        d.selection.guid == Some(e.guid)
-    };
     // The dead target becomes the last one; a corpse selected afterwards stays selected, gray.
-    if selected {
+    if vm.own().selection.guid == Some(e.guid) {
         let select = vm.own().deselect();
         vm.engine_select(select, Died::pay);
         let mut d = vm.own();
@@ -344,7 +254,7 @@ pub(super) struct Died<'w, 's> {
     seam: AttackSeam<'w, 's>,
     /// The release timer our own death arms.
     death: ResMut<'w, crate::death::DeathNet>,
-    /// The real clock the release timer counts on, as the death feed reads it.
+    /// The real clock the release timer counts on, as the death getters read it.
     time: Res<'w, Time<Real>>,
     group: Res<'w, crate::ui_party::GroupState>,
     names: Res<'w, crate::names::NameCache>,
@@ -357,7 +267,10 @@ impl Died<'_, '_> {
     fn deselect(&mut self) -> crate::script_calls::EngineSelect {
         let before = super::click::Standing::of(&self.selection, &self.seam);
         let send = super::click::deselect_owing(&mut self.selection, &mut self.seam);
-        before.owing(super::scan::Owed { send, swing: None })
+        before.owing(super::scan::Owed {
+            send,
+            ..Default::default()
+        })
     }
 
     /// What a deselect owes, paid with nothing to listen first.
@@ -382,7 +295,7 @@ mod tests {
     };
     use crate::spell::AutoRepeatActive;
     use crate::target::Selection;
-    use crate::ui_cast::{CastBarEdge, CastReport, CastReports};
+    use crate::ui_cast::{CastBarEdge, CastReport};
 
     const ME: u64 = 0x10;
     const MOB: u64 = 0xF130_0000_0000_0042;
@@ -408,6 +321,7 @@ mod tests {
     /// captured.
     fn client() -> Client {
         let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
+        crate::lanes::tap_tests::tap(&mut app);
         let (tx, sent) = crossbeam_channel::unbounded();
         app.insert_resource(NetCommands(tx));
         let world = app.world_mut();
@@ -535,7 +449,7 @@ mod tests {
             let world = self.world();
             world.write_message(edge);
             crate::net::handlers::dispatch(world, vec![SessionEvent::ObjectUpdateEnd]);
-            super::fire_deaths_lane(world);
+            crate::field_callbacks::fire_parked_lane(world);
         }
 
         /// A values block on `guid`, one packet, and the frame's lanes.
@@ -546,7 +460,7 @@ mod tests {
             };
             let world = self.world();
             crate::net::handlers::dispatch(world, crate::net::wire([block]));
-            super::fire_deaths_lane(world);
+            crate::field_callbacks::fire_parked_lane(world);
             self.lanes();
         }
 
@@ -566,7 +480,9 @@ mod tests {
         }
 
         fn reports(&mut self) -> Vec<CastReport> {
-            self.world().resource_mut::<CastReports>().take()
+            self.world()
+                .resource_mut::<crate::lanes::tap_tests::Tapped>()
+                .casts()
         }
 
         fn in_flight(&mut self) -> Option<u32> {
@@ -583,8 +499,9 @@ mod tests {
     /// Our own death runs `0x5e99b0`'s active-player leg first (`0x605860` at `0x60588d`), in its
     /// order: the target cleared (`0x493540(0, 0)` at `0x5e9a45`), the loot window closed with its
     /// release (`0x48f200(1, 0, 0)` at `0x5e9a5c`), the cast cancelled whatever it is bound to
-    /// (`CancelCast(1, 1, 0x1c)` at `0x5e9a6c`), and with `UNIT_FIELD_FLAGS` 0x100000 a release
-    /// asked at once (`0x5e9a7d` → `0x5e0ae0`, `CMSG_REPOP_REQUEST`); without it, none.
+    /// (`CancelCast(1, 1, 0x1c)` at `0x5e9a6c`), its `SPELLCAST_FAILED` listeners run inside it
+    /// (`0x6e4a50`), and with `UNIT_FIELD_FLAGS` 0x100000 a release asked after them
+    /// (`0x5e9a7d` → `0x5e0ae0` at `0x5e9a87`, `CMSG_REPOP_REQUEST`); without it, none.
     #[test]
     fn our_own_death_clears_the_target_closes_the_loot_cancels_the_cast_and_releases() {
         for flagged in [true, false] {
@@ -592,6 +509,11 @@ mod tests {
             let (me, mob) = (c.me, c.mob);
             c.select(MOB, mob);
             c.cast(FIREBALL);
+            crate::script_calls::insert_test_vm(c.world());
+            c.lua(
+                r#"local f = CreateFrame("Frame") f:RegisterEvent("SPELLCAST_FAILED")
+                f:SetScript("OnEvent", function() RandomRoll(1, 1) end)"#,
+            );
             c.world()
                 .resource_mut::<crate::ui_loot::LootState>()
                 .open(OTHER, 1, 0, Vec::new());
@@ -619,11 +541,18 @@ mod tests {
                 "SetSelection { guid: 0 }".to_string(),
                 format!("LootRelease {{ guid: {OTHER} }}"),
                 format!("CancelCast {{ spell_id: {FIREBALL} }}"),
+                "RandomRoll { min: 1, max: 1 }".to_string(),
             ];
             if flagged {
                 want.push("RepopRequest".to_string());
             }
-            let sent: Vec<String> = c.sent().iter().map(|s| format!("{s:?}")).collect();
+            // The VM's views ask a name of their own, which is no leg of the death's.
+            let sent: Vec<String> = c
+                .sent()
+                .iter()
+                .filter(|s| !matches!(s, ClientCommand::NameQuery { .. }))
+                .map(|s| format!("{s:?}"))
+                .collect();
             assert_eq!(sent, want, "flagged: {flagged}");
             assert_eq!(c.world().resource::<Selection>().guid, None);
             assert_eq!(
@@ -631,12 +560,8 @@ mod tests {
                 None
             );
             assert_eq!(c.in_flight(), None, "the cast is popped");
-            assert!(
-                c.reports()
-                    .iter()
-                    .any(|r| matches!(r, CastReport::Bar(CastBarEdge::Failed))),
-                "and fails"
-            );
+            c.lanes();
+            assert!(c.sent().is_empty(), "the listener ran once, in place");
         }
     }
 
@@ -644,8 +569,9 @@ mod tests {
     /// cleared (`0x5e9a45`); the interaction latch released with its window's close
     /// (`0x4931c0(0xb4e2d0, 0)` at `0x5e9a51` → `0x493310`); the loot closed with its release
     /// (`0x5e9a5c`); the quest givers asked again (`0x5eb070` at `0x5e9a61`); then the cast
-    /// cancelled (`0x5e9a6c`). Its `PLAYER_TARGET_CHANGED` and `MERCHANT_CLOSED` listeners run on
-    /// the deaths lane in that order, so their packets follow the death's own.
+    /// cancelled (`0x5e9a6c`). Its `PLAYER_TARGET_CHANGED` and `MERCHANT_CLOSED` listeners run where
+    /// their signals fire, inside the legs that raise them, so each one's packet goes out ahead of
+    /// the next leg's.
     #[test]
     fn our_own_death_runs_its_list_in_order() {
         const VENDOR: u64 = 0xF130_0000_0000_0050;
@@ -718,11 +644,11 @@ mod tests {
             sent,
             [
                 "SetSelection 0x0",
+                "RandomRoll 1",
+                "RandomRoll 2",
                 "LootRelease",
                 "QuestgiverStatusQuery",
-                "CancelCast",
-                "RandomRoll 1",
-                "RandomRoll 2"
+                "CancelCast"
             ]
         );
     }
@@ -764,9 +690,11 @@ mod tests {
             let bit = |set: bool| u32::from(set) * 0x8;
             c.values(ME, &[(FIELD_UNIT_HEALTH, 0), (BYTES, bit(armed))]);
             c.values(ME, &[(BYTES, bit(!armed))]);
-            crate::death::run_feed_death_once(c.world());
-            let left: f64 =
-                crate::script_calls::eval_in_vm(c.world(), "return GetReleaseTimeRemaining()");
+            let left: f64 = crate::script_calls::with_hosted_vm(c.world(), |s| {
+                s.expect("a VM")
+                    .eval("return GetReleaseTimeRemaining()")
+                    .expect("runs")
+            });
             let at_death = dead_reads(&mut c);
             assert_eq!(at_death.len(), 1, "armed {armed}: {at_death:?}");
             for read in [left, at_death[0]] {
@@ -781,9 +709,8 @@ mod tests {
 
     /// Our own death's `PresentUnitDeath` (`0x6058ae`) ends in `SignalDeathState` for the active
     /// player (`0x5fa6d0` at `0x6251c2`, `0x6251cc` → `0x495850`): `PLAYER_DEAD` inside the death's
-    /// packet, after `0x5e99b0` armed the timer, so its handlers read the whole window, and the
-    /// frame's feed signals it no second time. A second death past the first window reads a fresh
-    /// one.
+    /// packet, after `0x5e99b0` armed the timer, so its handlers read the whole window, and
+    /// nothing signals it a second time. A second death past the first window reads a fresh one.
     #[test]
     fn our_own_death_signals_player_dead_in_its_packet_over_the_timer_it_armed() {
         let mut c = dying_client();
@@ -791,15 +718,8 @@ mod tests {
         let first = dead_reads(&mut c);
         assert_eq!(first.len(), 1, "PLAYER_DEAD in the packet: {first:?}");
         assert!(first[0] > 359.0, "the whole window: {first:?}");
-        crate::death::run_feed_death_once(c.world());
-        assert_eq!(
-            dead_reads(&mut c).len(),
-            1,
-            "the feed signals it no second time"
-        );
 
         c.values(ME, &[(FIELD_UNIT_HEALTH, 100)]);
-        crate::death::run_feed_death_once(c.world());
         c.world()
             .resource_mut::<Time<bevy::time::Real>>()
             .update_with_duration(std::time::Duration::from_secs(400));
@@ -807,8 +727,6 @@ mod tests {
         let second = dead_reads(&mut c);
         assert_eq!(second.len(), 2, "{second:?}");
         assert!(second[1] > 359.0, "a fresh window: {second:?}");
-        crate::death::run_feed_death_once(c.world());
-        assert_eq!(dead_reads(&mut c).len(), 2);
     }
 
     /// `SignalDeathState` clears the cursor after `PLAYER_DEAD` (`ClearCursor(1, 1)`, `0x495889`
@@ -816,7 +734,10 @@ mod tests {
     #[test]
     fn our_own_death_clears_the_cursor_after_player_dead() {
         let mut c = dying_client();
-        crate::script_calls::with_hosted_vm(c.world(), |s| s.expect("a VM").set_money(500));
+        c.values(
+            ME,
+            &[(benilla_protocol::field::FIELD_PLAYER_FIELD_COINAGE, 500)],
+        );
         c.lua(
             r#"SEEN = {} local f = CreateFrame("Frame")
             f:RegisterEvent("PLAYER_DEAD") f:RegisterEvent("CURSOR_UPDATE")
@@ -869,65 +790,21 @@ mod tests {
         assert_eq!(order, ["SetSelection 0", "DuelAccepted"]);
     }
 
-    /// A death's signals parked on a VM that has since been replaced (a reload, the session's
-    /// end, the entry load's) run nothing on the new one, whose own parked keys count from 0
-    /// again.
+    /// The death line is written inside its update packet, among the death's legs (`0x6058ae` →
+    /// `0x62c160`): the packet's end words it, with no system after the dispatch.
     #[test]
-    fn a_deaths_signals_parked_on_a_replaced_vm_run_nothing_on_the_next() {
+    fn the_death_line_is_written_inside_its_packet() {
         let mut c = client();
         let mob = c.mob;
-        c.select(MOB, mob);
-        crate::script_calls::insert_test_vm(c.world());
-        c.lua(
-            r#"HEARD = 0 local f = CreateFrame("Frame") f:RegisterEvent("PLAYER_TARGET_CHANGED")
-            f:SetScript("OnEvent", function() HEARD = HEARD + 1 end)"#,
-        );
-        // The death's legs run, their signals parked on this VM and left on the lane.
-        let world = c.world();
-        world.write_message(FieldChanged {
-            at: crate::lanes::stamp(),
-            entity: mob,
-            guid: MOB,
-            kind: ObjectType::Unit,
-            index: FIELD_UNIT_HEALTH,
-            old: 100,
-            new: 0,
-        });
-        crate::net::handlers::dispatch(world, vec![SessionEvent::ObjectUpdateEnd]);
-        assert_eq!(world.resource::<Selection>().guid, None, "the legs ran");
-        crate::script_calls::insert_test_vm(world);
-        crate::script_calls::with_hosted_vm(world, |s| {
-            let s = s.expect("a VM");
-            s.run(
-                r#"HEARD = 0 local f = CreateFrame("Frame") f:RegisterEvent("LOOT_OPENED")
-                f:SetScript("OnEvent", function() HEARD = HEARD + 1 end)"#,
-            )
-            .expect("the listener is in");
-            // The new VM parks its own first stretch, under the key the old one's took.
-            let mark = s.waiting_mark();
-            let deferring = s.defer();
-            s.fire_event("LOOT_OPENED", vec![]);
-            assert!(s.park_since(mark).is_some());
-            drop(deferring);
-        });
-        super::fire_deaths_lane(c.world());
-        let heard: i64 = crate::script_calls::eval_in_vm(c.world(), "return HEARD");
-        assert_eq!(
-            heard, 0,
-            "the stale signals ran the new VM's parked stretch"
-        );
-    }
-
-    /// The death's legs reserve the death line's place in the net drain, and the line's watcher
-    /// takes it in the same frame: the watcher runs after the drain in the real schedule.
-    #[test]
-    fn the_death_line_watcher_runs_after_the_net_drain() {
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
-        assert!(crate::test_support::runs_before(
-            &mut app,
-            crate::net::apply_net_updates,
-            crate::ui_chat::combat::watch::death_lines,
-        ));
+        c.dies(mob, MOB, ObjectType::Unit);
+        let lines: Vec<String> = c
+            .world()
+            .resource::<crate::ui_chat::ChatLog>()
+            .pending_combat()
+            .into_iter()
+            .map(|l| l.family.key(l.variant))
+            .collect();
+        assert_eq!(lines, ["UNITDIESOTHER"]);
     }
 
     /// The guid the interaction latch holds.
@@ -1042,7 +919,7 @@ mod tests {
         world
             .resource_mut::<crate::ui_trade::TradeSession>()
             .begin(PARTNER);
-        crate::ui_trade::open_window(world);
+        crate::ui_trade::open_window(world, None);
         assert_eq!(latched(&mut c), Some(PARTNER));
         vocals(&mut c);
         c.values(PARTNER, &[(FIELD_UNIT_HEALTH, 0)]);
@@ -1128,8 +1005,64 @@ mod tests {
         );
     }
 
+    /// The selected unit dying under a cast that names it: `CancelCast` (`0x6058e0`) signals
+    /// `SPELLCAST_FAILED` inside it (`0x6e4a50`), so its listener's packet goes out ahead of the
+    /// deselect's `CMSG_SET_SELECTION` 0 (`0x605901`); and the death reads the selection after that
+    /// listener (`0x6058ea`), so a listener that clears the target leaves it nothing to deselect
+    /// and no auto-repeat to stop (`0x605906`).
+    #[test]
+    fn the_selections_death_mid_cast_runs_the_cancels_listeners_before_it_deselects() {
+        for clears in [false, true] {
+            let mut c = client();
+            let mob = c.mob;
+            c.select(MOB, mob);
+            c.cast(FIREBALL);
+            c.world().resource_mut::<AutoRepeatActive>().0 = Some(SHOOT);
+            crate::script_calls::insert_test_vm(c.world());
+            let act = if clears {
+                "ClearTarget()"
+            } else {
+                "RandomRoll(1, 1)"
+            };
+            c.lua(&format!(
+                r#"local f = CreateFrame("Frame") f:RegisterEvent("SPELLCAST_FAILED")
+                f:SetScript("OnEvent", function() {act} end)"#
+            ));
+            c.sent();
+            c.dies(mob, MOB, ObjectType::Unit);
+            let wire: Vec<&str> = c
+                .sent()
+                .iter()
+                .filter_map(|s| match s {
+                    ClientCommand::CancelCast { .. } => Some("CancelCast"),
+                    ClientCommand::RandomRoll { .. } => Some("RandomRoll"),
+                    ClientCommand::SetSelection { guid: 0 } => Some("SetSelection 0"),
+                    ClientCommand::CancelAutoRepeat => Some("CancelAutoRepeat"),
+                    _ => None,
+                })
+                .collect();
+            if clears {
+                assert_eq!(wire, ["CancelCast", "SetSelection 0"]);
+                assert_eq!(c.world().resource::<AutoRepeatActive>().0, Some(SHOOT));
+            } else {
+                assert_eq!(
+                    wire,
+                    [
+                        "CancelCast",
+                        "RandomRoll",
+                        "SetSelection 0",
+                        "CancelAutoRepeat"
+                    ]
+                );
+            }
+            assert_eq!(c.world().resource::<Selection>().guid, None);
+        }
+    }
+
     /// The far cast at a unit the client does not hold parks its guid in the record's target
-    /// (`0x6e5454`), which the unit's death reads once it is held (`0x6058c7`).
+    /// (`0x6e5454`), which the unit's death reads once it is held (`0x6058c7`). Its send left the
+    /// arm's word standing (`0x6e5467`), so the death's cancel drops the word with no packet
+    /// (`0x6e4955`) as it pops the cast.
     #[test]
     fn a_far_casts_parked_target_dying_cancels_it() {
         let mut c = client();
@@ -1150,13 +1083,15 @@ mod tests {
         );
         let unit = c.world().spawn(Guid(UNHELD)).id();
         c.dies(unit, UNHELD, ObjectType::Player);
-        assert!(c.sent().iter().any(|s| matches!(
-            s,
-            ClientCommand::CancelCast {
-                spell_id: MIND_VISION
-            }
-        )));
+        assert!(!c
+            .sent()
+            .iter()
+            .any(|s| matches!(s, ClientCommand::CancelCast { .. })));
         assert_eq!(c.in_flight(), None);
+        assert!(!c
+            .world()
+            .resource::<crate::spell::SpellTargeting>()
+            .active());
     }
 
     /// The cursor's click binds the clicked unit into the record's target (`BindTarget`,
@@ -1420,16 +1355,47 @@ mod tests {
         world.resource_mut::<crate::ui_pet::PetAttackLatch>().0 = Some(PET);
     }
 
+    /// The selection's destroy releases it (`0x5fbbe5` → `0x493910(guid, 1)`), whose teardown calls
+    /// a possessed unit off (`0x493a18` → `0x4bd650`) and signals `PET_BAR_UPDATE` (`0x4bd6b4`)
+    /// inside the destroy's packet: its listener's packet goes out ahead of the teardown's
+    /// `CMSG_SET_SELECTION` 0.
+    #[test]
+    fn the_selections_destroy_signals_its_pet_stop_in_place() {
+        let mut c = client();
+        crate::script_calls::insert_test_vm(c.world());
+        possessing_an_attacker(&mut c);
+        let mob = c.mob;
+        c.select(MOB, mob);
+        c.lua(
+            r#"local r = CreateFrame("Frame") r:RegisterEvent("PET_BAR_UPDATE")
+            r:SetScript("OnEvent", function() RandomRoll(1, 100) end)"#,
+        );
+        let _ = c.sent();
+        crate::net::handlers::dispatch(c.world(), vec![SessionEvent::ObjectDestroyed(MOB)]);
+        c.lanes();
+        let wire: Vec<String> = c
+            .sent()
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                ClientCommand::PetStopAttack { .. } => Some("PetStopAttack".to_string()),
+                ClientCommand::RandomRoll { .. } => Some("RandomRoll".to_string()),
+                ClientCommand::SetSelection { guid } => Some(format!("SetSelection {guid:#x}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wire, ["PetStopAttack", "RandomRoll", "SetSelection 0x0"]);
+    }
+
     /// The selection's death deselects (`0x605901`), whose teardown calls a possessed unit off
     /// (`0x493a18` → `0x4bd650`): `PetStopAttack` signals `PET_BAR_UPDATE` (`0x4bd6b4`) ahead of
-    /// `PLAYER_TARGET_CHANGED` (`0x493a73`), each heard once. The listeners run on the deaths lane,
-    /// so the listener's packet follows the deselect's `CMSG_SET_SELECTION` 0.
+    /// `PLAYER_TARGET_CHANGED` (`0x493a73`), each heard once, each where it fires: the
+    /// `PET_BAR_UPDATE` listener's packet goes out ahead of the deselect's `CMSG_SET_SELECTION` 0,
+    /// which follows the store (`0x49388d`).
     #[test]
     fn the_selections_death_signals_its_pet_stop_and_its_change_in_place() {
         let mut c = client();
         // In the world before the bar: the entry's pet reset drops a bar (`0x4bc6f0`).
         crate::script_calls::insert_test_vm(c.world());
-        crate::ui_unit::run_feed_units_once(c.world());
         possessing_an_attacker(&mut c);
         let mob = c.mob;
         c.select(MOB, mob);
@@ -1459,8 +1425,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(wire, ["PetStopAttack", "SetSelection 0x0", "RandomRoll"]);
-        crate::ui_unit::run_feed_units_once(c.world());
+        assert_eq!(wire, ["PetStopAttack", "RandomRoll", "SetSelection 0x0"]);
         let heard: Vec<String> = crate::script_calls::eval_in_vm(c.world(), "return HEARD");
         assert_eq!(heard, ["PET_BAR_UPDATE", "PLAYER_TARGET_CHANGED"]);
     }

@@ -470,28 +470,72 @@ fn a_handlers_join_keeps_the_slot_its_call_took() {
     assert_eq!(c.joins(), ["X"]);
 }
 
+/// Our player unguilded in Stormwind City, a capital (`0x100`), with the city word's row, so the
+/// cascade's plan, read as it runs, is the join.
+fn unguilded_in_a_capital(c: &mut Client) {
+    let row = |flags, name: &str| benilla_formats::AreaTableRow {
+        map_id: 0,
+        zone_id: 0,
+        explore_flag: 0,
+        flags,
+        faction_group_mask: 0,
+        exploration_level: 0,
+        name: name.into(),
+    };
+    crate::test_support::hold_self_player(c.world(), 0x7, &[]);
+    c.world().insert_resource(crate::area::AreaTableRes(
+        benilla_formats::AreaTableCatalog::from_rows(vec![
+            (1519, row(0x138, "Stormwind City")),
+            (3459, row(0x200, "City")),
+        ]),
+    ));
+    c.world()
+        .insert_resource(crate::area::CommittedZone(Some(1519)));
+}
+
 /// `SetGuildRecruitmentMode(1)` runs the cascade inside the verb (`0x49ea7b` → `0x49eb55` →
 /// `0x49eb70`), whose join takes its slot there (`0x49edf3`): a `/join` the same script makes after
 /// it takes the next one, with 1-2 held 3 and then 4, each sent in that order.
 #[test]
 fn the_cascades_join_takes_its_slot_ahead_of_a_later_join() {
-    let mut script = UiScript::new().expect("a VM");
-    script.set_guild_recruitment_plan(benilla_ui::script::RecruitmentPlan::Join {
-        name: "GuildRecruitment - City".into(),
-        shortcut: "GuildRecruitment".into(),
-        id: 25,
-    });
+    let script = UiScript::new().expect("a VM");
     let mut c = Client::new(&["A", "B"], script);
+    unguilded_in_a_capital(&mut c);
     c.run("SetGuildRecruitmentMode(1) JoinChannelByName('Y')");
     super::drain_chat_input_once(c.world());
-    bevy::ecs::system::RunSystemOnce::run_system_once(
-        c.world(),
-        super::recruitment::guild_recruitment_cascade,
-    )
-    .expect("the cascade runs");
     assert_eq!(c.number_of("GuildRecruitment - City"), Some(3));
     assert_eq!(c.number_of("Y"), Some(4));
     assert_eq!(c.joins(), ["GuildRecruitment - City", "Y"]);
+}
+
+/// The senders' local-player gate looks the active player up as the call runs (`0x49f944`-
+/// `0x49f94b`, `0x468550` → `0x468460`): a `"player"` copy in the VM with no object held sends
+/// nothing, and the object held with no copy sends.
+#[test]
+fn the_senders_gate_on_the_player_object_not_its_copy() {
+    let mut script = UiScript::new().expect("a VM");
+    script.set_unit(
+        "player",
+        Some(benilla_ui::script::UnitState {
+            exists: true,
+            ..Default::default()
+        }),
+    );
+    let mut c = Client::new(&[], script);
+    let addon = |c: &mut Client| {
+        c.run("SendAddonMessage('P', 'm')");
+        super::drain_chat_input_once(c.world());
+        c.sent
+            .try_iter()
+            .filter(|cmd| matches!(cmd, ClientCommand::AddonMessage { .. }))
+            .count()
+    };
+    assert_eq!(addon(&mut c), 0, "a copy, no object");
+    crate::test_support::hold_self_player(c.world(), 0x7, &[]);
+    c.world()
+        .non_send_resource_mut::<UiScript>()
+        .set_unit("player", None);
+    assert_eq!(addon(&mut c), 1, "the object, no copy");
 }
 
 /// Each chat verb sends inside its call, so call order is wire order: `DoEmote` (`0x49fd30`,
@@ -499,7 +543,10 @@ fn the_cascades_join_takes_its_slot_ahead_of_a_later_join() {
 /// `SendAddonMessage` (`0x49faff`).
 #[test]
 fn the_chat_verbs_go_out_in_call_order() {
-    let mut c = Client::new(&[], UiScript::new().expect("a VM"));
+    let script = UiScript::new().expect("a VM");
+    let mut c = Client::new(&[], script);
+    // `SendAddonMessage` needs the player object (`0x49f94b`).
+    crate::test_support::hold_self_player(c.world(), 0x7, &[]);
     // WAVE as a chat-only text emote, which reads `Emotes.dbc` row 0.
     c.world().insert_resource(crate::sound::EmoteSounds(
         benilla_formats::EmoteSoundCatalog::default()
@@ -601,6 +648,7 @@ fn posture_wire(c: &mut Client) -> Vec<String> {
             ClientCommand::LootRelease { guid } => Some(format!("release {guid:#x}")),
             ClientCommand::AttackStop => Some("attack stop".into()),
             ClientCommand::TextEmote { text_id, .. } => Some(format!("emote {text_id}")),
+            ClientCommand::RandomRoll { .. } => Some("roll".into()),
             _ => None,
         })
         .collect()
@@ -635,6 +683,9 @@ fn a_sit_emote_releases_the_loot_and_stops_the_attack_ahead_of_its_packet() {
         0,
         Vec::new(),
     );
+    // The loot target an admitted response leaves latched, which the leave's close asks
+    // (`0x5f07c6`).
+    c.world().resource_mut::<crate::ui_loot::LootLatch>().0 = Some(CORPSE);
     c.run("DoEmote('SIT')");
     assert_eq!(
         posture_wire(&mut c),
@@ -642,6 +693,43 @@ fn a_sit_emote_releases_the_loot_and_stops_the_attack_ahead_of_its_packet() {
             "sheath 0",
             "stand 1",
             "release 0xf130000000000042",
+            "attack stop",
+            "emote 86"
+        ]
+    );
+}
+
+/// The leave's loot close signals `LOOT_CLOSED` (`0x4c1dac`) inside `0x48f200` (`0x5f07d5`), so
+/// its listeners run before the attack stop's `CMSG_ATTACKSTOP` (`0x5f07e7`).
+#[test]
+fn a_sit_emotes_loot_closed_listener_sends_ahead_of_its_attack_stop() {
+    const CORPSE: u64 = 0xf130_0000_0000_0042;
+    let (mut c, me) = seated_client(&[]);
+    c.world()
+        .entity_mut(me)
+        .insert(crate::creature_anim::Engaged(CORPSE));
+    c.world().resource_mut::<crate::ui_loot::LootState>().open(
+        CORPSE,
+        benilla_protocol::messages::loot_type::CORPSE,
+        0,
+        Vec::new(),
+    );
+    // The loot target an admitted response leaves latched, which the leave's close asks
+    // (`0x5f07c6`).
+    c.world().resource_mut::<crate::ui_loot::LootLatch>().0 = Some(CORPSE);
+    c.run(
+        r#"local r = CreateFrame("Frame")
+        r:RegisterEvent("LOOT_CLOSED")
+        r:SetScript("OnEvent", function() RandomRoll(1, 2) end)"#,
+    );
+    c.run("DoEmote('SIT')");
+    assert_eq!(
+        posture_wire(&mut c),
+        [
+            "sheath 0",
+            "stand 1",
+            "release 0xf130000000000042",
+            "roll",
             "attack stop",
             "emote 86"
         ]

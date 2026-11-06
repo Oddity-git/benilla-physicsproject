@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
+use benilla_ui::script::origin::{within, Origin};
 use bevy::ecs::system::SystemId;
 use bevy::prelude::*;
 
@@ -85,12 +86,16 @@ impl NetHandlers {
 }
 
 fn call(world: &mut World, id: SystemId<In<SessionEvent>>, name: &str, ev: SessionEvent) {
-    if let Err(e) = world.run_system_with(id, ev) {
-        // A plugin bug (most likely a missing resource), logged loud so the smoke gate sees it.
-        error!("net: handler `{name}` did not run: {e}");
-    }
-    // The unit edits a handler's seams queued, applied with its commands, before the next event.
-    crate::creature_anim::apply_unit_edits(world);
+    // One handler's run signals in place, as the reference's handlers do (`0x703e50`).
+    within(Origin::Allowed("net::handlers::call"), || {
+        if let Err(e) = world.run_system_with(id, ev) {
+            // A plugin bug (most likely a missing resource), logged loud so the smoke gate sees it.
+            error!("net: handler `{name}` did not run: {e}");
+        }
+        // The unit edits a handler's seams queued, applied with its commands, before the next
+        // event.
+        crate::creature_anim::apply_unit_edits(world);
+    });
 }
 
 /// `app.net_handler(SessionEventKind::X, on_x)` registers a system taking `In<SessionEvent>`;
@@ -174,13 +179,83 @@ pub(crate) fn measure(world: &mut World) {
     });
 }
 
-/// One drain's dispatch in wire order, each handler's commands applied before the next event.
+/// What runs after each packet of a dispatch, its handlers done, with a stamp taken ahead of
+/// them, so a state the packet moved can be logged ahead of what the packet raised
+/// ([`crate::lanes`]). A log's start is read where the span of packets begins
+/// ([`crate::lanes::LaneApp::add_span_start`]).
+type PacketEnd = fn(&mut World, crate::lanes::Stamp);
+
+/// Every [`PacketEnd`], in registration order.
+#[derive(Resource, Default, Clone)]
+struct PacketEnds(Vec<PacketEnd>);
+
+/// Register a [`PacketEnd`].
+pub(crate) fn add_packet_end(app: &mut App, end: PacketEnd) {
+    app.world_mut()
+        .get_resource_or_init::<PacketEnds>()
+        .0
+        .push(end);
+}
+
+/// One drain's dispatch in wire order, each handler's commands applied before the next event,
+/// and each packet's lanes fired once its handlers are done ([`crate::lanes::flush`]): the
+/// reference's poll runs each packet's handler whole before the next (`0x5384d0`, `0x537ae5`),
+/// and what a handler signals runs every listener before the signal returns (`0x703e50`). What
+/// the input records and the last tick stamped fires first, as the window input runs ahead of the
+/// packets (`0x420d23`, `0x420d55`); the span's starts follow, and each packet's ends after its
+/// handlers.
 pub(crate) fn dispatch(world: &mut World, events: Vec<SessionEvent>) {
-    let handlers = world.remove_resource::<NetHandlers>().unwrap_or_default();
-    for ev in events {
-        handlers.run(world, ev);
+    if events.is_empty() {
+        return;
     }
+    let handlers = world.remove_resource::<NetHandlers>().unwrap_or_default();
+    let ends = world
+        .get_resource::<PacketEnds>()
+        .cloned()
+        .unwrap_or_default();
+    if !crate::lanes::flush(world) {
+        crate::lanes::span_starts(world);
+    }
+    crate::lanes::at_packets(|| {
+        for ev in events {
+            let last = ends_its_packet(&ev);
+            let at = (!ends.0.is_empty()).then(crate::lanes::stamp);
+            handlers.run(world, ev);
+            if let Some(at) = at {
+                for end in &ends.0 {
+                    end(world, at);
+                }
+            }
+            if last {
+                crate::lanes::flush(world);
+            }
+        }
+    });
     world.insert_resource(handlers);
+}
+
+/// Whether `ev` is the last event its packet decodes to (`benilla_protocol::decode`): an update
+/// packet's blocks run until its [`SessionEvent::ObjectUpdateEnd`], as its handler writes every
+/// block before its notify pass (`0x46520e`, `0x465222`, `0x465277`), a `MSG_MOVE_SET_*_SPEED`
+/// decodes to its pose, the [`benilla_protocol::messages::RelayVerb::Speed`] move, then its
+/// speed, and a saved store's answer sends its bytes ahead of its record
+/// ([`crate::net::io::inbound`]). Every other relayed move is its packet whole.
+pub(crate) fn ends_its_packet(ev: &SessionEvent) -> bool {
+    !matches!(
+        ev,
+        SessionEvent::SavedAnswer { .. }
+            | SessionEvent::ObjectCreate { .. }
+            | SessionEvent::ItemCreate { .. }
+            | SessionEvent::ObjectValues { .. }
+            | SessionEvent::ObjectsRemoved(_)
+            | SessionEvent::ObjectsNear(_)
+            | SessionEvent::ObjectMove { .. }
+            | SessionEvent::ObjectNotify { .. }
+            | SessionEvent::UnitMove {
+                verb: benilla_protocol::messages::RelayVerb::Speed,
+                ..
+            }
+    )
 }
 
 #[cfg(test)]
@@ -421,6 +496,86 @@ mod tests {
             failed[0].contains("needs_what_nobody_inserted"),
             "{failed:?}"
         );
+    }
+
+    /// Each packet's last event alone ends it: an update packet's blocks run to its
+    /// `ObjectUpdateEnd`, a speed change's pose to its speed (`benilla_protocol::decode`), and a
+    /// plain relay is its one pose, so the dispatch fires the lanes between packets, never between
+    /// one packet's events.
+    #[test]
+    fn only_a_packets_last_event_ends_it() {
+        use benilla_protocol::messages::{opcode, parse_server};
+        let hex = |s: &str| -> Vec<u8> {
+            s.as_bytes()
+                .chunks(2)
+                .map(|h| u8::from_str_radix(std::str::from_utf8(h).unwrap(), 16).unwrap())
+                .collect()
+        };
+        // Two values blocks, the first a first-pass guid's, which leaves its notify place.
+        let update = hex("020000000000814260010800000013000000\
+            0001aa010800000012000000");
+        let mut speed = hex("012a");
+        speed.extend([0; 28]);
+        speed.extend(7.0f32.to_le_bytes());
+        // Two plain relays, one event each: a stop, and a swim start, whose flags carry a pitch.
+        let mut stop = hex("012a");
+        stop.extend([0; 28]);
+        let mut swim = hex("012a");
+        swim.extend(0x0020_0001u32.to_le_bytes());
+        swim.extend([0; 28]);
+        for (op, body) in [
+            (opcode::SMSG_UPDATE_OBJECT, update),
+            (opcode::MSG_MOVE_SET_RUN_SPEED, speed),
+            (opcode::MSG_MOVE_STOP, stop),
+            (opcode::MSG_MOVE_START_SWIM, swim),
+            (opcode::SMSG_LOGOUT_COMPLETE, Vec::new()),
+        ] {
+            let events = benilla_protocol::decode(parse_server(op, &body).unwrap());
+            let ends: Vec<bool> = events.iter().map(ends_its_packet).collect();
+            let mut want = vec![false; ends.len().saturating_sub(1)];
+            want.push(true);
+            assert_eq!(ends, want, "{op:#06x}: {events:?}");
+        }
+    }
+
+    fn raises_in_a_handler(_: In<SessionEvent>, world: &mut World) {
+        let mut ui = world.non_send_resource_mut::<benilla_ui::script::UiScript>();
+        ui.fire_event("PLAYER_MONEY", Vec::new());
+    }
+
+    fn raises_at_a_packets_end(world: &mut World, _: crate::lanes::Stamp) {
+        let mut ui = world.non_send_resource_mut::<benilla_ui::script::UiScript>();
+        ui.fire_event("PLAYER_MONEY", Vec::new());
+    }
+
+    /// One packet's dispatch, a pong, in each frame.
+    fn dispatch_a_pong(world: &mut World) {
+        dispatch(world, vec![SessionEvent::Pong { sequence: 0 }]);
+    }
+
+    /// The raise check armed over a frame that dispatches a pong.
+    fn armed() -> App {
+        let mut app = App::new();
+        crate::ui_script::raise_origin::arm_each_frame(&mut app);
+        app.insert_non_send_resource(benilla_ui::script::UiScript::new().expect("a VM"))
+            .add_systems(Update, dispatch_a_pong);
+        app
+    }
+
+    /// A handler's raise inside the dispatch passes, its packet's own (`0x703e50`); a packet end's,
+    /// which runs in the dispatch outside every handler and lane firing, fails.
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "the check compiles out")]
+    fn a_handlers_raise_passes_and_a_packet_ends_fails() {
+        let mut handled = armed();
+        handled.net_handler(SessionEventKind::Pong, raises_in_a_handler);
+        handled.update();
+        let mut ended = armed();
+        add_packet_end(&mut ended, raises_at_a_packets_end);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ended.update()))
+            .expect_err("the packet end's raise passed");
+        let message = failed.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(message.contains("`PLAYER_MONEY`"), "{message}");
     }
 
     /// `//` comments out, so a variant named in prose does not count as an arm.

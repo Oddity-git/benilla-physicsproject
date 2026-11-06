@@ -1,12 +1,14 @@
-//! The dressing-room drain: applies the stock window's `DressUpModel` verbs ([`DressUpIntent`]) in
-//! call order, since `DressUpItem` can reset and try on in one call, and composes the booth's look
-//! ([`DressUpPreview`]): the player's own gear with each substitution in its [`equip_slot`], the
-//! held triple through [`held_lanes`]. A try-on whose template ([`Items::template`]) is cached
-//! lands in its place in that order; one that is not lands when the record arrives.
-//! There is no fit check: the reference previews whatever it is handed (`DressUpFrame.lua:2-16`).
+//! The dressing room: applies the stock window's `DressUpModel` verbs ([`DressUpIntent`]) inside
+//! their calls ([`DressUpSteps`]), in call order, since `DressUpItem` can reset and try on in one
+//! call, and composes the booth's look each frame ([`DressUpPreview`]): the player's own gear with
+//! each substitution in its [`equip_slot`], the held triple through [`held_lanes`]. A try-on whose
+//! template ([`Items::template`]) is cached at the call lands there, or refuses there; one that is
+//! not lands, or refuses, inside the record's answer, at its callback's place in the entry's list
+//! ([`try_on_answered`]). There is no fit check: the reference previews whatever it is handed
+//! (`DressUpFrame.lua:2-16`).
 
 use benilla_protocol::CharEnumItem;
-use benilla_ui::script::DressUpIntent;
+use benilla_ui::script::{DressUpIntent, UiScript};
 use bevy::prelude::*;
 
 use crate::entities::equip_slot;
@@ -107,7 +109,7 @@ fn lanes_coexist(main: u8, off: u8, dual_wield: bool) -> bool {
 /// The room's substitutions over the player's own gear, resolved and pending.
 #[derive(Resource, Default)]
 pub(crate) struct DressUpRoom {
-    /// False after `Close`: the booth is empty.
+    /// False after [`Self::close`]: the booth is empty.
     open: bool,
     /// `Undress()` has taken off the player's own pieces until the next `Dress`: `0x504490` clears
     /// component slots `0..0xb` (`0x5044b0`) and detaches and zeroes both held lanes
@@ -119,11 +121,17 @@ pub(crate) struct DressUpRoom {
     /// ones left ([`held_lanes`]).
     held: Vec<CharEnumItem>,
     /// Try-ons whose record the cache did not hold at the call, each with the callback `0x504ba0`
-    /// registered (`0x504579`), read again every frame until the record lands.
+    /// waiting in the item cache (`0x504579`), whose answer lands it ([`Self::answered`]).
     pending: Vec<u32>,
 }
 
 impl DressUpRoom {
+    /// The teardown's free of the try-ons' callbacks `0x504ba0`, running none (`0x55c1b0`), with
+    /// what they held.
+    pub(crate) fn free_store_callbacks(&mut self) {
+        self.pending.clear();
+    }
+
     /// One verb, as its call does it. Returns 1 for a try-on that raised `ERR_NOT_EQUIPPABLE`.
     fn apply(&mut self, intent: DressUpIntent, items: &Items, commands: &NetCommands) -> u32 {
         match intent {
@@ -142,54 +150,73 @@ impl DressUpRoom {
                 self.worn = Default::default();
                 self.held.clear();
             }
-            // The lookup with the callback (`0x504579`): a cached record goes on inside the call
-            // (`0x5045dd`-`0x5045ee`), a missing one waits for `0x504ba0`.
+            // The lookup with the callback (`0x504579`, dedupe 0): a cached record goes on inside
+            // the call (`0x5045dd`-`0x5045ee`), a missing one keeps `0x504ba0` in the cache's
+            // list, one per call.
             DressUpIntent::TryOn(item) => {
                 self.open = true;
                 match items.template(item, 0, Ask::Event(commands)) {
                     Some(t) => return self.land(t),
-                    None => self.pending.push(item),
+                    None => {
+                        items.wait(item, crate::items::RecordCallback::TryOn);
+                        self.pending.push(item);
+                    }
                 }
-            }
-            DressUpIntent::Close => {
-                self.open = false;
-                self.bare = false;
-                self.worn = Default::default();
-                self.held.clear();
-                self.pending.clear();
             }
         }
         0
     }
 
-    /// One frame: the records that landed for the try-ons still waiting, whose callbacks
-    /// (`0x504ba0`) ran as each arrived, ahead of the verbs called since; then those verbs in call
-    /// order. Returns the `ERR_NOT_EQUIPPABLE` count to show.
+    /// Both panes hidden, so the booth empties. The reference's widget keeps its state while
+    /// hidden, but `DressUpItem` re-issues `SetUnit("player")` on a hidden frame, so the kept
+    /// state is never seen.
+    fn close(&mut self) {
+        self.open = false;
+        self.bare = false;
+        self.worn = Default::default();
+        self.held.clear();
+        self.pending.clear();
+    }
+
+    /// The verbs in call order. Returns the `ERR_NOT_EQUIPPABLE` count to show.
     fn step(
         &mut self,
         intents: impl IntoIterator<Item = DressUpIntent>,
         items: &Items,
         commands: &NetCommands,
     ) -> u32 {
-        let mut refused = self.resolve_pending(items);
+        let mut refused = 0;
         for intent in intents {
             refused += self.apply(intent, items, commands);
         }
         refused
     }
 
-    /// The try-ons whose record has landed, in try-on order; an id the server never answers stays
-    /// pending, and its slot shows the player's own gear. Returns the refusal count, as
-    /// [`Self::land`].
-    fn resolve_pending(&mut self, items: &Items) -> u32 {
-        let mut refused = 0;
-        for item in std::mem::take(&mut self.pending) {
-            match items.template(item, 0, Ask::Read) {
-                Some(t) => refused += self.land(t),
-                None => self.pending.push(item),
-            }
+    /// The callback `0x504ba0` on a found record of `entry`: `TryOn` again (`0x504bae` →
+    /// `0x504540`), which finds the record now and goes on, or refuses, whether or not the room
+    /// was emptied since the call that waited; one try-on of `entry` waits no more. Returns the
+    /// refusal count, as [`Self::land`].
+    fn answered(&mut self, entry: u32, items: &Items) -> u32 {
+        if let Some(i) = self.pending.iter().position(|&e| e == entry) {
+            self.pending.remove(i);
         }
-        refused
+        self.open = true;
+        items
+            .template(entry, 0, Ask::Read)
+            .map_or(0, |t| self.land(t))
+    }
+
+    /// Every try-on whose record is cached now, in try-on order, as each answer's callback lands
+    /// it ([`Self::answered`]): a test's stand-in for the answers.
+    #[cfg(test)]
+    fn resolve_pending(&mut self, items: &Items) -> u32 {
+        let landed: Vec<u32> = self
+            .pending
+            .iter()
+            .copied()
+            .filter(|&e| items.template(e, 0, Ask::Read).is_some())
+            .collect();
+        landed.into_iter().map(|e| self.answered(e, items)).sum()
     }
 
     /// `0x504540` with the record in hand, by its inventory type. Returns 1 when it is not
@@ -227,24 +254,127 @@ fn not_equippable(inventory_type: u32) -> bool {
     matches!(inventory_type, 0 | 18 | 24 | 27) || inventory_type > 28
 }
 
+/// Whether a dressing-room pane is shown: the dressing room's or the auction house's
+/// `AuctionDressUpFrame`, read off the frames (the stock files carry no hook of ours). A hidden
+/// pane has no model, and a verb on it does nothing (`0x504596`).
+fn pane_shown(script: &UiScript) -> bool {
+    script.frame_visible("DressUpFrame") || script.frame_visible("AuctionDressUpFrame")
+}
+
+/// Show `refused` `ERR_NOT_EQUIPPABLE` lines (`0x504b2d`, `push 0x13; call 0x496720`), each as
+/// `DisplayError` shows it, under the call's input events.
+fn show_refusals(script: &mut UiScript, sink: &mut crate::ui_action::MessageSink, refused: u32) {
+    let input = script.input_events();
+    for _ in 0..refused {
+        if let Some(line) = crate::ui_action::keyed_line(script, "ERR_NOT_EQUIPPABLE") {
+            crate::ui_action::show_now(script, sink, "ui_dressup", line.under(input));
+        }
+    }
+}
+
+/// The dressing-room verbs inside their calls ([`benilla_ui::script::ScriptCall::DressUp`]),
+/// and the frame's turn for the records that landed since.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct DressUpSteps<'w> {
+    /// Absent in a harness without the room.
+    room: Option<ResMut<'w, DressUpRoom>>,
+    items: Option<Res<'w, Items>>,
+    commands: Option<Res<'w, NetCommands>>,
+    sink: crate::ui_action::MessageSink<'w>,
+}
+
+impl DressUpSteps<'_> {
+    /// One verb inside its call: a try-on looks its record up in the cache as it stands at the
+    /// call (`0x504579`), and a cached one goes on, or refuses, before the verb returns
+    /// (`0x5045dd`-`0x5045ee`, `0x504b2d`).
+    pub(crate) fn apply(&mut self, script: &mut UiScript, intent: DressUpIntent) {
+        let (Some(room), Some(items), Some(commands)) = (
+            self.room.as_deref_mut(),
+            self.items.as_deref(),
+            self.commands.as_deref(),
+        ) else {
+            return;
+        };
+        if !pane_shown(script) {
+            return;
+        }
+        let refused = room.step([intent], items, commands);
+        show_refusals(script, &mut self.sink, refused);
+    }
+
+    /// The frame's turn: the room emptied when no pane is shown.
+    fn frame(&mut self, script: &mut UiScript) {
+        let Some(room) = self.room.as_deref_mut() else {
+            return;
+        };
+        if !pane_shown(script) {
+            room.close();
+        }
+    }
+
+    /// The callback `0x504ba0` on a found record of `entry`, inside its answer: `TryOn` again on
+    /// a shown pane (`0x504596`), whose refusal shows there (`0x504b2d`).
+    fn answered(&mut self, script: &mut UiScript, entry: u32) {
+        let (Some(room), Some(items)) = (self.room.as_deref_mut(), self.items.as_deref()) else {
+            return;
+        };
+        if !pane_shown(script) {
+            return;
+        }
+        let refused = room.answered(entry, items);
+        show_refusals(script, &mut self.sink, refused);
+    }
+}
+
+/// The try-on callback `0x504ba0` on a found record of `entry`, at its place in the entry's list
+/// ([`crate::net::objects`]): the try-on again (`0x504bae` → `0x504540`), whose refusal's
+/// `UI_ERROR_MESSAGE` runs its listeners there, a step in its place ([`crate::lanes::step`]). A
+/// refusal runs nothing (`0x504ba8`).
+pub(crate) fn try_on_answered(world: &mut World, entry: u32) {
+    fn run(In(entry): In<u32>, mut vm: crate::script_calls::VmWith<DressUpSteps<'static>>) {
+        vm.turn(|script, mut steps| {
+            if let Some(script) = script {
+                steps.answered(script, entry);
+            }
+        });
+    }
+    crate::lanes::step(world, |world| {
+        if let Err(err) = world.run_system_cached_with(run, entry) {
+            debug!("ui_dressup: the try-on callback did not run: {err}");
+        }
+    });
+}
+
 pub(crate) struct DressUpUiPlugin;
 
 impl Plugin for DressUpUiPlugin {
     fn build(&self, app: &mut App) {
-        // A drain, the frame its verbs are called: a try-on's cache lookup reads the cache as it
-        // stood at the call, before the next frame's packets land.
         app.init_resource::<DressUpRoom>()
-            .add_systems(Update, drain_dressup.in_set(UiDrain));
+            .add_systems(Update, compose_dressup.in_set(UiDrain));
     }
 }
 
-fn drain_dressup(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    mut room: ResMut<DressUpRoom>,
+/// The booth's look, each frame: the room's turn ([`DressUpSteps::frame`]), then the player's own
+/// look with the room's substitutions written in, pushed to the pane when it moved.
+#[allow(clippy::type_complexity)]
+fn compose_dressup(
+    // The room, beside the host that applies the verbs to it, and the player the pane clones,
+    // whose pins the host writes.
+    mut vm: crate::script_calls::VmWith<(
+        DressUpSteps<'static>,
+        Query<
+            'static,
+            'static,
+            (
+                &'static ObjectStore,
+                &'static NetEntity,
+                Option<&'static crate::entities::WornPins>,
+            ),
+            With<SelfPlayer>,
+        >,
+    )>,
     mut preview: ResMut<DressUpPreview>,
-    items: Res<Items>,
     commands: Res<NetCommands>,
-    self_q: Query<(&ObjectStore, &NetEntity), With<SelfPlayer>>,
     // A miss sends the `CMSG_GUILD_QUERY` whose answer paints the tabard.
     guilds: Res<crate::ui_guild::GuildState>,
     // The known spells the dual-wield flag `0x5eab70` reads.
@@ -252,60 +382,48 @@ fn drain_dressup(
         Res<crate::ui_action::PlayerActions>,
         Option<Res<crate::ui_action::Spells>>,
     ),
-    mut sink: crate::ui_action::MessageSink,
 ) {
-    hosted_vm.run(|script| {
+    let ran = vm.turn(|script, (mut steps, _)| {
         let Some(script) = script else {
-            return;
+            return false;
         };
-        let mut intents = script.take_dressup_intents();
-        // The room empties when neither the dressing room nor the auction house's
-        // `AuctionDressUpFrame` is shown, read off the frames (the stock files carry no hook of
-        // ours), and a verb on a hidden pane does nothing (`0x504596`). The reference's widget
-        // keeps its state while hidden, but `DressUpItem` re-issues `SetUnit("player")` on a
-        // hidden frame, so the kept state is never seen.
-        if !script.frame_visible("DressUpFrame") && !script.frame_visible("AuctionDressUpFrame") {
-            intents = vec![DressUpIntent::Close];
-        }
-        // A refusal shows as its record lands: in the call when cached, else from the cache's
-        // callback (`0x504ba0`).
-        let refused = room.step(intents, &items, &commands);
-        let lines = (0..refused)
-            .filter_map(|_| crate::ui_action::keyed_line(script, "ERR_NOT_EQUIPPABLE"))
-            .collect::<Vec<_>>();
-        crate::ui_action::show_messages(script, &mut sink, "ui_dressup", lines);
-
-        // The crest comes off the guild cache this system holds, not the outfit `player_look`
-        // builds.
-        let dual_wield = known.0.knows_dual_wield(known.1.as_deref());
-        let look = match (room.open, self_q.single().ok()) {
-            (true, Some((store, net))) => {
-                player_look(store, net, &room, &items, dual_wield).map(|l| DressUpLook {
-                    emblem: crate::ui_guild::unit_guild_emblem(
-                        &store.0,
-                        &guilds,
-                        Ask::New(&commands),
-                    ),
-                    ..l
-                })
-            }
-            _ => None,
-        };
-        if preview.look != look {
-            preview.look = look;
-        }
-    })
+        steps.frame(script);
+        true
+    });
+    if !ran {
+        return;
+    }
+    // The crest comes off the guild cache this system holds, not the outfit `player_look`
+    // builds.
+    let dual_wield = known.0.knows_dual_wield(known.1.as_deref());
+    let (steps, me) = vm.own();
+    let (Some(room), Some(items)) = (steps.room.as_deref(), steps.items.as_deref()) else {
+        return;
+    };
+    let look = match (room.open, me.single().ok()) {
+        (true, Some((store, net, pins))) => player_look(store, net, pins, room, items, dual_wield)
+            .map(|l| DressUpLook {
+                emblem: crate::ui_guild::unit_guild_emblem(&store.0, &guilds, Ask::New(&commands)),
+                ..l
+            }),
+        _ => None,
+    };
+    if preview.look != look {
+        preview.look = look;
+    }
 }
 
 /// The player's own look with the room's substitutions written in.
 fn player_look(
     store: &ObjectStore,
     net: &NetEntity,
+    pins: Option<&crate::entities::WornPins>,
     room: &DressUpRoom,
     items: &Items,
     dual_wield: bool,
 ) -> Option<DressUpLook> {
     let s = &store.0;
+    let (hide_helm, hide_cloak) = crate::entities::WornPins::hidden(pins, s);
     let mut equipment = [CharEnumItem::default(); 19];
     for slot in LOOK_SLOTS {
         let idx = slot as usize;
@@ -319,9 +437,9 @@ fn player_look(
             continue;
         }
         // Hidden in the world, hidden here: `SetUnit` (`0x505d70`) clones the live player's
-        // bodyslot display pointers verbatim (`0x476cb0`). A try-on, handled above, gates on
-        // nothing.
-        if (idx == 0 && s.player_hides_helm()) || (idx == 14 && s.player_hides_cloak()) {
+        // bodyslot display pointers verbatim (`0x476cb0`), a call's re-dress among them. A try-on,
+        // handled above, gates on nothing.
+        if (idx == 0 && hide_helm) || (idx == 14 && hide_cloak) {
             continue;
         }
         let Some(entry) = s.player_visible_item_entry(slot).filter(|e| *e != 0) else {
@@ -440,7 +558,7 @@ mod tests {
         room.apply(DressUpIntent::TryOn(2000), &items, &cmds);
         room.resolve_pending(&items);
 
-        let look = player_look(&store, &net(), &room, &items, true).expect("a look");
+        let look = player_look(&store, &net(), None, &room, &items, true).expect("a look");
         assert_eq!(
             look.equipment[4].display_id, 7000,
             "the tried-on chest shows"
@@ -468,7 +586,7 @@ mod tests {
         room.apply(DressUpIntent::TryOn(2000), &items, &cmds);
         room.resolve_pending(&items);
         assert_eq!(
-            player_look(&store, &net(), &room, &items, true)
+            player_look(&store, &net(), None, &room, &items, true)
                 .unwrap()
                 .equipment[4]
                 .display_id,
@@ -477,7 +595,7 @@ mod tests {
 
         room.apply(DressUpIntent::Dress, &items, &cmds);
         assert_eq!(
-            player_look(&store, &net(), &room, &items, true)
+            player_look(&store, &net(), None, &room, &items, true)
                 .unwrap()
                 .equipment[4]
                 .display_id,
@@ -485,7 +603,7 @@ mod tests {
             "Reset puts the player's own chest back on"
         );
 
-        room.apply(DressUpIntent::Close, &items, &cmds);
+        room.close();
         assert!(!room.open, "closing empties the room (the booth goes dark)");
     }
 
@@ -497,7 +615,7 @@ mod tests {
         items: &Items,
         dual_wield: bool,
     ) -> DressUpLook {
-        player_look(store, &net(), room, items, dual_wield).expect("a look")
+        player_look(store, &net(), None, room, items, dual_wield).expect("a look")
     }
 
     /// The held pair, main hand then off hand.
@@ -520,7 +638,7 @@ mod tests {
         room.apply(DressUpIntent::TryOn(2000), &items, &cmds);
         room.resolve_pending(&items);
         room.apply(DressUpIntent::Undress, &items, &cmds);
-        let look = player_look(&store, &net(), &room, &items, true).unwrap();
+        let look = player_look(&store, &net(), None, &room, &items, true).unwrap();
         assert_eq!(look.equipment[4].display_id, 0, "the tried-on chest is off");
         assert_eq!(look.equipment[0].display_id, 0, "the worn helm is off");
         assert_eq!(
@@ -530,7 +648,7 @@ mod tests {
 
         room.apply(DressUpIntent::TryOn(2000), &items, &cmds);
         room.resolve_pending(&items);
-        let look = player_look(&store, &net(), &room, &items, true).unwrap();
+        let look = player_look(&store, &net(), None, &room, &items, true).unwrap();
         assert_eq!(
             look.equipment[4].display_id, 7000,
             "a try-on lands on the bare body"
@@ -541,7 +659,7 @@ mod tests {
         );
 
         room.apply(DressUpIntent::Dress, &items, &cmds);
-        let look = player_look(&store, &net(), &room, &items, true).unwrap();
+        let look = player_look(&store, &net(), None, &room, &items, true).unwrap();
         assert_eq!(
             look.equipment[4].display_id, 5000,
             "Dress puts the player's own chest back"
@@ -737,6 +855,7 @@ mod tests {
             &cmds,
         );
         items.insert_template(2000, Some(worn("Shiny Chest", 7000, 5)));
+        room.answered(2000, &items);
         room.step([DressUpIntent::Undress], &items, &cmds);
         assert_eq!(
             look_dw(&store, &room, &items, true).equipment[4].display_id,
@@ -767,7 +886,7 @@ mod tests {
             "the player's own chest until the record comes"
         );
         items.insert_template(2000, Some(worn("Shiny Chest", 7000, 5)));
-        room.step([], &items, &cmds);
+        room.answered(2000, &items);
         assert_eq!(
             look_dw(&store, &room, &items, true).equipment[4].display_id,
             7000,
@@ -788,7 +907,7 @@ mod tests {
         room.resolve_pending(&items);
         assert_eq!(room.pending, vec![2000], "still waiting on the answer");
         assert_eq!(
-            player_look(&store, &net(), &room, &items, true)
+            player_look(&store, &net(), None, &room, &items, true)
                 .unwrap()
                 .equipment[4]
                 .display_id,
@@ -805,7 +924,7 @@ mod tests {
         room.resolve_pending(&items);
         assert!(room.pending.is_empty());
         assert_eq!(
-            player_look(&store, &net(), &room, &items, true)
+            player_look(&store, &net(), None, &room, &items, true)
                 .unwrap()
                 .equipment[4]
                 .display_id,
@@ -882,6 +1001,55 @@ mod tests {
         }
     }
 
+    /// A try-on applies inside its call (`0x504540`): a cached bag refuses there, so the chunk's
+    /// next line reads the `UI_ERROR_MESSAGE` its `DisplayError` signalled (`0x504b2d`), and a
+    /// cached chest is on the booth before the verb returns.
+    #[test]
+    fn a_try_on_refuses_and_lands_inside_its_call() {
+        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        app.insert_resource(bevy::ecs::error::DefaultErrorHandler(
+            bevy::ecs::error::ignore,
+        ));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx));
+        app.update();
+        {
+            let mut items = app.world_mut().resource_mut::<Items>();
+            items.insert_template(4500, Some(worn("Small Bag", 9100, 18)));
+            items.insert_template(2000, Some(worn("Shiny Chest", 7000, 5)));
+        }
+        let mut s = UiScript::new().expect("a VM");
+        s.set_screen_size(800.0, 600.0);
+        app.insert_non_send_resource(s);
+        let seen: Option<String> = crate::script_calls::with_hosted_vm(app.world_mut(), |s| {
+            let s = s.expect("a VM");
+            s.run(
+                r#"
+                    ERR_NOT_EQUIPPABLE = "That item can't be equipped."
+                    local room = CreateFrame("Frame", "DressUpFrame", UIParent)
+                    dm = CreateFrame("DressUpModel", "DressUpModel", room)
+                    local f = CreateFrame("Frame")
+                    f:RegisterEvent("UI_ERROR_MESSAGE")
+                    f:SetScript("OnEvent", function() seen = arg1 end)
+                    "#,
+            )
+            .expect("the room");
+            let seen = s
+                .eval::<Option<String>>("dm:SetUnit('player') dm:TryOn(4500) return seen")
+                .expect("the chunk runs");
+            s.run("dm:TryOn(2000)").expect("the try-on");
+            seen
+        });
+        // No frame has run since: the room is as the call left it.
+        let worn_chest = app.world().resource::<DressUpRoom>().worn[4].is_some();
+        assert_eq!(
+            seen.as_deref(),
+            Some("That item can't be equipped."),
+            "the refusal signals inside the call"
+        );
+        assert!(worn_chest, "the cached chest went on inside its call");
+    }
+
     /// A bow takes the off lane and clears the main; a crossbow takes the main and clears the off.
     #[test]
     fn a_tried_on_ranged_weapon_takes_a_hand_and_clears_the_melee_pair() {
@@ -899,7 +1067,7 @@ mod tests {
             room.apply(DressUpIntent::TryOn(item), &items, &cmds);
             room.resolve_pending(&items);
 
-            let look = player_look(&store, &net(), &room, &items, true).expect("a look");
+            let look = player_look(&store, &net(), None, &room, &items, true).expect("a look");
             assert_eq!(
                 look.equipment[17].display_id, display,
                 "the {what} is in the ranged slot, which is what puts it in a hand"
@@ -923,7 +1091,7 @@ mod tests {
 
         let mut room = DressUpRoom::default();
         room.apply(DressUpIntent::Dress, &items, &cmds);
-        let look = player_look(&store, &net(), &room, &items, true).expect("a look");
+        let look = player_look(&store, &net(), None, &room, &items, true).expect("a look");
         assert_eq!(
             look.equipment[17].display_id, 0,
             "the worn bow stays stowed"
@@ -947,7 +1115,7 @@ mod tests {
         room.apply(DressUpIntent::TryOn(2700), &items, &cmds);
         room.resolve_pending(&items);
 
-        let look = player_look(&store, &net(), &room, &items, true).expect("a look");
+        let look = player_look(&store, &net(), None, &room, &items, true).expect("a look");
         assert_eq!(look.equipment[15].display_id, 8700, "the axe is in hand");
         assert_eq!(look.equipment[17].display_id, 0, "…and the bow is gone");
     }
@@ -965,11 +1133,11 @@ mod tests {
         room.apply(DressUpIntent::TryOn(1600), &items, &cmds);
         room.resolve_pending(&items);
 
-        let look = player_look(&player(&[(15, 1500)]), &net(), &room, &items, true).unwrap();
+        let look = player_look(&player(&[(15, 1500)]), &net(), None, &room, &items, true).unwrap();
         assert_eq!(look.equipment[15].display_id, 5500, "the one-hander stays");
         assert_eq!(look.equipment[16].display_id, 5600, "…beside the shield");
 
-        let look = player_look(&player(&[(15, 1550)]), &net(), &room, &items, true).unwrap();
+        let look = player_look(&player(&[(15, 1550)]), &net(), None, &room, &items, true).unwrap();
         assert_eq!(
             look.equipment[15].display_id, 0,
             "the two-hander is evicted"
@@ -1000,7 +1168,7 @@ mod tests {
             room.apply(DressUpIntent::TryOn(2000), &items, &cmds);
             room.resolve_pending(&items);
 
-            let look = player_look(&store, &net(), &room, &items, true).expect("a look");
+            let look = player_look(&store, &net(), None, &room, &items, true).expect("a look");
             assert_eq!(look.equipment[7].display_id, 7000, "the boots went on");
             assert_eq!(
                 (look.equipment[15].display_id, look.equipment[16].display_id),
@@ -1028,7 +1196,7 @@ mod tests {
 
         let mut room = DressUpRoom::default();
         room.apply(DressUpIntent::Dress, &items, &cmds);
-        let look = player_look(&store, &net(), &room, &items, true).expect("a look");
+        let look = player_look(&store, &net(), None, &room, &items, true).expect("a look");
         assert_eq!(
             look.equipment[0].display_id, 0,
             "the player's own helm is hidden"
@@ -1042,7 +1210,7 @@ mod tests {
         // The reference's `TryOn` path never tests the flag.
         room.apply(DressUpIntent::TryOn(2000), &items, &cmds);
         room.resolve_pending(&items);
-        let look = player_look(&store, &net(), &room, &items, true).expect("a look");
+        let look = player_look(&store, &net(), None, &room, &items, true).expect("a look");
         assert_eq!(
             look.equipment[0].display_id, 7000,
             "the tried-on helm previews regardless of the preference"
@@ -1050,10 +1218,20 @@ mod tests {
 
         // Reset drops the substitution: bare-headed again.
         room.apply(DressUpIntent::Dress, &items, &cmds);
-        let look = player_look(&store, &net(), &room, &items, true).expect("a look");
+        let look = player_look(&store, &net(), None, &room, &items, true).expect("a look");
         assert_eq!(
             look.equipment[0].display_id, 0,
             "Reset re-clones the hidden helm away"
         );
+
+        // A `ShowHelm(1)` put the helm back on the model ahead of the server: the clone shows it.
+        let mut pins = crate::entities::WornPins::default();
+        pins.pin(benilla_ui::script::WornDisplay::Helm, true, false);
+        let look = player_look(&store, &net(), Some(&pins), &room, &items, true).expect("a look");
+        assert_eq!(
+            look.equipment[0].display_id, 5000,
+            "the model's helm, cloned"
+        );
+        assert_eq!(look.equipment[14].display_id, 0, "the cloak by its flag");
     }
 }

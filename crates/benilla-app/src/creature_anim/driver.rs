@@ -109,6 +109,17 @@ fn armed_id(
     })
 }
 
+/// The manual toggle's model tests (`0x5eb542`, `0x5eb580`) on the animation armed now
+/// (`0x5fdb50`), for a toggle made inside its call.
+pub(crate) fn toggle_model_refuses(
+    drv: &AnimDriver,
+    player: &AnimationPlayer,
+    tr: &AnimationTransitions,
+    anims: &ModelAnimations,
+) -> bool {
+    model_refuses_toggle(anims, armed_id(drv, player, tr, anims))
+}
+
 /// Whether a one-shot is live on the unit; the missile queue polls it to launch a missile whose
 /// release keyframe never fired when the cast ends (the reference's `0x5fc920` → `0x60c9b0`).
 pub(crate) fn oneshot_is_live(
@@ -320,14 +331,25 @@ pub(super) fn drive_animations(
         Option<Res<crate::ui_session::InteractNpc>>,
         // `ChrClasses.dbc`, for the setter's class test on the ranged state.
         Option<Res<crate::chr_classes::ChrClassTable>>,
+        // `+0xcb4`, stamped as a unit's Death ends (`0x5fc95a`).
+        Option<ResMut<super::DeathStamps>>,
     ),
     // The variation roll's LCG, the reference's single CRT `_rand` stream shared by every play.
     mut rng: ResMut<benilla_assets::AnimRng>,
     // The last anim trace line per traced unit; the trace writes only on change.
     mut anim_trace_last: Local<std::collections::HashMap<Entity, String>>,
 ) {
-    let (emote_sounds, loot_kneel, time, names, mut recomputes, riders, interact, class_table) =
-        aux;
+    let (
+        emote_sounds,
+        loot_kneel,
+        time,
+        names,
+        mut recomputes,
+        riders,
+        interact,
+        class_table,
+        mut death_stamps,
+    ) = aux;
     let classes = class_table.as_deref().map(|t| &t.0);
     let dt = time.delta_secs();
     // This frame's one-shot plays per unit, replayed in the reference's call order (`PlaySeq`
@@ -605,6 +627,9 @@ pub(super) fn drive_animations(
                     },
                     if first { ", streamed in dead" } else { "" }
                 );
+                // The death settles as the clip's pass ends: `0x5fc920` stamps `+0xcb4` for Death
+                // (`0x5fc95a`). One streamed in dead, or with no clip, is settled at once.
+                drv.death_end = Some(time.elapsed_secs());
                 if let Some(c) = find_resolved(anims, DEATH, catalog)
                     .or_else(|| find_resolved(anims, STAND, catalog))
                 {
@@ -621,6 +646,9 @@ pub(super) fn drive_animations(
                     } else if first {
                         active.seek_to(c.duration); // streamed in dead: settled, not replayed
                     }
+                    if !first {
+                        drv.death_end = Some(time.elapsed_secs() + c.duration);
+                    }
                 }
                 // A blended bone-0 arm overwrites bone 0's secondary slot: it evicts a full-body
                 // wound; a masked wound on the key bone decays out on its own.
@@ -631,6 +659,12 @@ pub(super) fn drive_animations(
                 drv.gait = Some(DEATH);
                 drv.gait_pinned = false; // a death is never pinned (`0x5fda90`)
                 drv.deferred = None; // a normal arm clears the cache
+            }
+            if drv.death_end.is_some_and(|end| time.elapsed_secs() >= end) {
+                drv.death_end = None;
+                if let Some(stamps) = death_stamps.as_deref_mut() {
+                    stamps.stamp(entity);
+                }
             }
             continue;
         }
@@ -739,6 +773,20 @@ pub(super) fn drive_animations(
         // The setter: a no-op when unchanged (`newState == CUR`), else commit, volunteer
         // `CMSG_SETSHEATHED` for the local player, and for the manual toggle play the ceremony,
         // per-arm masked overlays (`0x60b770`) by each item's stow family (hip 90, back 89).
+        // A toggle committed inside its call plays its ceremony from the state it left.
+        if let Some((from, to)) = committed.owed_ceremony.take() {
+            start_sheath_ceremony(
+                &mut commands,
+                entity,
+                &mut drv,
+                &mut player,
+                anims,
+                wielded,
+                from,
+                to,
+                catalog,
+            );
+        }
         if let Some(req) = pending_sheath.get(&entity) {
             let cur = committed.cur.unwrap_or(0);
             // Deviation: a mounted draw is refused at the setter, because our rider track never

@@ -22,9 +22,10 @@ macro_rules! unit_object {
         /// `UnitIsGhost`, `UnitIsDeadOrGhost`, `UnitIsTapped`, `UnitIsTappedByPlayer`,
         /// `UnitIsCharmed`, `UnitIsTrivial`, `UnitIsPlusMob`, `UnitPlayerControlled`,
         /// `UnitAffectingCombat`, `UnitIsPartyLeader`, `UnitIsCivilian`, `UnitPlayerOrPetInParty`,
-        /// `UnitPlayerOrPetInRaid` and `UnitSex`. The rest of these fields (the quest log, the
-        /// combat stats, the guild id, the PvP rank and medal, the raw flags dwords) are read off
-        /// the snapshot by their getters, until those read the object too.
+        /// `UnitPlayerOrPetInRaid` and `UnitSex`; the stat getters read the level and
+        /// SUMMONEDBY, and the stats themselves through [`crate::script::CombatRead`]. The rest of
+        /// these fields (the quest log, the guild id, the PvP rank and medal, the raw flags
+        /// dwords) are read off the snapshot by their getters, until those read the object too.
         pub trait UnitObjectRead {
             $(
                 #[doc = concat!("[`UnitState::", stringify!($field), "`].")]
@@ -96,4 +97,36 @@ unit_object! {
     sex: u8,
     combat: UnitCombatStats,
     summoned_by: u64,
+}
+
+/// What names a held unit as its getters read it, past its descriptor's own fields: its name off
+/// the name caches (`UnitName` looks the object up at `0x51710c` and names a unit through
+/// `GetUnitName 0x609210`, `0x517131`) and its race and class bytes through `ChrRaces.dbc` and
+/// `ChrClasses.dbc` (`UnitRace 0x518200`, `UnitClass 0x518350`). Off the held object through the
+/// lent host ([`crate::script::CallHost::read_unit_identity`]), or off a snapshot, which holds them
+/// as its build read them.
+pub trait UnitIdentityRead {
+    /// [`UnitState::name`].
+    fn name(&self) -> Option<String>;
+    /// [`UnitState::race`] and [`UnitState::race_file`].
+    fn race(&self) -> Option<(String, String)>;
+    /// [`UnitState::class`] and [`UnitState::class_file`].
+    fn class(&self) -> Option<(String, String)>;
+    /// [`UnitState::family`].
+    fn family(&self) -> Option<String>;
+}
+
+impl UnitIdentityRead for UnitState {
+    fn name(&self) -> Option<String> {
+        self.name.clone()
+    }
+    fn race(&self) -> Option<(String, String)> {
+        self.race.clone().zip(self.race_file.clone())
+    }
+    fn class(&self) -> Option<(String, String)> {
+        self.class.clone().zip(self.class_file.clone())
+    }
+    fn family(&self) -> Option<String> {
+        self.family.clone()
+    }
 }

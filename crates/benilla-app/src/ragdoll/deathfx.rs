@@ -196,6 +196,7 @@ fn start_effects(
                         class: FxClass::AuraState,
                         stage: FxStage::State,
                         effects,
+                        at: None,
                     });
                 } else {
                     warn!("death effects: no burning model (Immolate's state kit) for unit {unit}");
@@ -217,6 +218,7 @@ fn start_effects(
                         class: FxClass::Hold,
                         stage: FxStage::OneShot,
                         effects,
+                        at: None,
                     });
                 }
                 if let Some(at) = body_point(&mut puffs, &bodies, &frames, unit) {
@@ -287,6 +289,7 @@ fn run_effects(
                 spell_id: BURN_KEY,
                 class: FxClass::AuraState,
                 force: true,
+                at: None,
             });
         }
         if over || !on {

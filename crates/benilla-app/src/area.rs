@@ -62,11 +62,31 @@ fn load_area_table(mut commands: Commands, assets: Option<Res<WorldAssets>>) {
     }
 }
 
+/// `s_zoneId` (`0xb4e314`): the zone the last zone-text commit stored, the leaf's parent zone
+/// (`AreaTable +0x8`) else the leaf. Committed on the tenth-tick poll while our player is held,
+/// so an area id with no row keeps the last commit; `None` until the first commit of a world
+/// session, and only the session's teardown (`0x491180`) zeroes it, so a reload keeps it.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CommittedZone(pub(crate) Option<u32>);
+
+/// `s_realZoneText` (`0xb4b404`): the real zone name the last commit stored. Its change walks the
+/// zone channels (`0x4948b7` → `0x494931`). Like the zone it outlives a reload and is cleared only
+/// at the session's end (`0x491180`); an empty name leaves it as it was (`0x49489a`).
+#[derive(Resource, Default)]
+pub(crate) struct CommittedZoneText(String);
+
+/// The session's end, standing in for `ShutdownGame`'s zeroing of `0xb4e314` and `0xb4b404`
+/// (`0x491180`).
+fn clear_committed_zone(mut zone: ResMut<CommittedZone>, mut text: ResMut<CommittedZoneText>) {
+    zone.set_if_neq(CommittedZone(None));
+    text.0.clear();
+}
+
 /// The client's zone-text cache: the compare targets of `0x494780`, the minimap line's cache
 /// (`0x494970`) and the indoor dedup pair (`[0x868608]`, `[0x86860c]`). It lives per VM, so every
 /// login starts zeroed and its first resolve is a NEW_AREA.
 #[derive(Default)]
-struct ZoneCache {
+pub(crate) struct ZoneCache {
     /// `None` until the first resolve.
     zone_id: Option<u32>,
     zone_text: String,
@@ -79,6 +99,22 @@ struct ZoneCache {
     wmo_group: u32,
     /// The realm flag last pushed to this VM.
     realm_pvp: Option<bool>,
+    /// The zone the VM's channel catalog was last fed for ([`crate::ui_chat::ZoneCommit`]).
+    catalog: Option<Option<u32>>,
+}
+
+/// What a commit leaves for the steps after the stores: the walk and the events.
+struct Committed {
+    /// `0x494780` ran. A hit group the indoor dedup passes stops short of it (`0x67e510`), with
+    /// nothing after to do.
+    called: bool,
+    zone: u32,
+    /// The real zone text changed to a nonempty one.
+    real_changed: bool,
+    event: Option<&'static str>,
+    /// `MINIMAP_ZONE_CHANGED`'s new text.
+    minimap: Option<String>,
+    texts: (String, String),
 }
 
 /// One resolve's compare inputs.
@@ -104,34 +140,39 @@ fn elect_event(cache: &ZoneCache, next: &ZoneSignal) -> Option<&'static str> {
     None
 }
 
-/// Resolves the texts and PvP info, pushes the zone caches, then fires the elected zone event and,
-/// independently, `MINIMAP_ZONE_CHANGED`. The poll `0x5db900` counts every tick in `ticks`
-/// (`0xc4d790`), which nothing resets, and reports only on the tenth, subtracting ten (`0x5db906`,
-/// `0x5db917`); the other nine return at once. It reports the active mover's position, else the
-/// active player's, and nothing with neither held (`0x5db937`, `0x5db956`, `0x5db95d`): after a
-/// worldport frees every object, the commit waits for our player's create. It runs on the tick
-/// after the tick's packets (category 6's drain `0x403620`, then category 5's `0x401ec0`), so it
-/// reads what the unit feed pushed of a player that arrived this frame.
+/// Resolves the texts and PvP info, pushes the zone caches, then walks the zone channels and fires
+/// the elected zone event and, independently, `MINIMAP_ZONE_CHANGED`. The poll `0x5db900` counts
+/// every tick in `ticks` (`0xc4d790`), which nothing resets, and reports only on the tenth,
+/// subtracting ten (`0x5db906`, `0x5db917`); the other nine return at once. It reports the active
+/// mover's position, else the active player's, and nothing with neither held (`0x5db937`,
+/// `0x5db956`, `0x5db95d`): after a worldport frees every object, the commit waits for our
+/// player's create. It runs on the tick after the tick's packets (category 6's drain `0x403620`,
+/// then category 5's `0x401ec0`), so it reads a player that arrived this frame.
+///
+/// The walk is `UpdateZoneText`'s own (`0x494931`), after the caches and ahead of the event
+/// (`0x49493f`, `0x49495f`), when the real zone text changed; the zone feeds the verbs' catalog
+/// as it is stored (`0x49479a`).
 #[allow(clippy::too_many_arguments)] // a Bevy system's full input set
-fn feed_zone_events(
+pub(crate) fn feed_zone_events(
     mut ticks: Local<u32>,
-    mut hosted_vm: crate::script_calls::HostedVm,
+    mut vm: crate::script_calls::VmWith<crate::ui_chat::ZoneCommit<'static, 'static>>,
     me: Query<(), (With<crate::net::SelfPlayer>, With<crate::net::ObjectStore>)>,
     world: benilla_world::world_point::WorldPoint,
     areas: Option<Res<AreaTableRes>>,
     factions: Option<Res<Factions>>,
     realm_pvp: Option<Res<RealmPvp>>,
     mut cache: Local<crate::ui_script::VmMemo<ZoneCache>>,
+    mut real_text: ResMut<CommittedZoneText>,
+    cinematic: Option<Res<crate::cinematic::Cinematic>>,
+    mut cascade: Option<ResMut<crate::ui_chat::GuildRecruitmentCascade>>,
 ) {
     *ticks += 1;
     let due = *ticks >= 10;
     if due {
         *ticks -= 10;
     }
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
+    let done = vm.run(|script| {
+        let script = script?;
         let cache = cache.get(script);
         let realm_pvp = realm_pvp.is_some_and(|r| r.0);
         if cache.realm_pvp != Some(realm_pvp) {
@@ -139,19 +180,15 @@ fn feed_zone_events(
             script.set_realm_pvp(realm_pvp);
         }
         if !due {
-            return;
+            return None;
         }
-        let Some(areas) = areas else {
-            return;
-        };
+        let areas = areas.as_deref()?;
         if me.is_empty() {
-            return;
+            return None;
         }
-        let Some(leaf) = world.area() else { return };
-        let Some(leaf_row) = areas.0.get(leaf) else {
-            // An unknown id keeps the last state, as the resolver does for areaId 0.
-            return;
-        };
+        let leaf = world.area()?;
+        // An unknown id keeps the last state, as the resolver does for areaId 0.
+        let leaf_row = areas.0.get(leaf)?;
         let zone = if leaf_row.zone_id == 0 {
             leaf
         } else {
@@ -176,7 +213,14 @@ fn feed_zone_events(
                 && k.group_area_id != 0
                 && (cache.wmo_id, cache.wmo_group) == (k.wmo_id, wmo_group)
             {
-                return;
+                return Some(Committed {
+                    called: false,
+                    zone,
+                    real_changed: false,
+                    event: None,
+                    minimap: None,
+                    texts: Default::default(),
+                });
             }
             cache.wmo_id = k.wmo_id;
             // The whole-WMO -1 row. An unnamed one with `AreaTableID` 0 takes the leaf's name,
@@ -223,37 +267,71 @@ fn feed_zone_events(
 
         let event = elect_event(cache, &signal);
         let minimap_changed = cache.minimap_text != minimap_text;
-        if event.is_none() && !minimap_changed {
-            return;
-        }
-
-        script.set_zone_texts(benilla_ui::script::ZoneTexts {
-            zone: signal.zone_text.clone(),
-            real_zone: real_zone_text,
-            subzone: signal.subzone_text.clone(),
-            minimap: minimap_text.clone(),
-            pvp_zone: zone_pvp(areas.0.get(zone), factions.as_deref()),
-            is_arena: leaf_row.flags & 0x80 != 0,
-        });
-
-        if let Some(event) = event {
-            script.fire_event(event, vec![]);
-            debug!(
-                "area: {event} → zone {:?} / sub {:?}",
-                signal.zone_text, signal.subzone_text
-            );
-        }
-        if minimap_changed {
-            script.fire_event("MINIMAP_ZONE_CHANGED", vec![]);
-            debug!("area: minimap zone text → {minimap_text:?}");
+        // An empty name stores nothing and walks nothing (`0x49489a` → `0x494936`); the compare
+        // ignores case (`0x4948b0` → `0x64a4c0`).
+        let real_changed =
+            !real_zone_text.is_empty() && !real_text.0.eq_ignore_ascii_case(&real_zone_text);
+        let texts = (signal.zone_text.clone(), signal.subzone_text.clone());
+        if event.is_some() || minimap_changed || real_changed {
+            script.set_zone_texts(benilla_ui::script::ZoneTexts {
+                zone: signal.zone_text.clone(),
+                real_zone: real_zone_text.clone(),
+                subzone: signal.subzone_text.clone(),
+                minimap: minimap_text.clone(),
+                pvp_zone: zone_pvp(areas.0.get(zone), factions.as_deref()),
+                is_arena: leaf_row.flags & 0x80 != 0,
+            });
         }
         cache.zone_id = Some(signal.zone_id);
         cache.zone_text = signal.zone_text;
         cache.subzone_text = signal.subzone_text;
-        cache.minimap_text = minimap_text;
+        if real_changed {
+            real_text.0 = real_zone_text;
+        }
+        cache.minimap_text.clone_from(&minimap_text);
         cache.indoor = signal.indoor;
         cache.wmo_group = wmo_group;
-    })
+        Some(Committed {
+            called: true,
+            zone,
+            real_changed,
+            event,
+            minimap: minimap_changed.then_some(minimap_text),
+            texts,
+        })
+    });
+    let Some(done) = done else { return };
+
+    // The zone is stored (`0x49479a`) outside the host's reads, feeds the verbs, and the walk
+    // follows the caches (`0x494931`).
+    let walked = vm.turn(|script, mut commit| {
+        if done.called {
+            commit.store_zone(done.zone);
+        }
+        let Some(script) = script else { return false };
+        commit.feed_catalog(script, Some(done.zone), &mut cache.get(script).catalog);
+        done.called
+            && commit.walk_on_commit(script, done.zone, done.real_changed, cinematic.as_deref())
+    });
+    vm.run(|script| {
+        let Some(script) = script else { return };
+        if walked {
+            if let Some(cascade) = cascade.as_deref_mut() {
+                cascade.tail(script);
+            }
+        }
+        if let Some(event) = done.event {
+            script.fire_event(event, vec![]);
+            debug!(
+                "area: {event} → zone {:?} / sub {:?}",
+                done.texts.0, done.texts.1
+            );
+        }
+        if let Some(minimap) = done.minimap {
+            script.fire_event("MINIMAP_ZONE_CHANGED", vec![]);
+            debug!("area: minimap zone text → {minimap:?}");
+        }
+    });
 }
 
 /// What `GetZonePVPInfo` (`0x48d540`) reads of the committed zone's row `zone`: the capital bit
@@ -313,6 +391,13 @@ pub(crate) struct AreaPlugin;
 impl Plugin for AreaPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RealmPvp>()
+            .init_resource::<CommittedZone>()
+            .init_resource::<CommittedZoneText>()
+            // The session's end stands in for `ShutdownGame` (`0x491180`), the one zeroing.
+            .add_systems(
+                OnExit(crate::client_state::ClientState::InWorld),
+                clear_committed_zone,
+            )
             .add_systems(Startup, load_area_table.after(AssetSet::Open))
             .add_systems(
                 OnEnter(crate::client_state::ClientState::InWorld),
@@ -322,11 +407,15 @@ impl Plugin for AreaPlugin {
                 Update,
                 // After the leaf authority: leaf, indoor bit and names must come from one frame,
                 // as in the client's single-pass resolve (`0x67e510`), or a stale leaf fires a
-                // spurious splash. After the unit feed too, by the sets: the commit's handlers read
-                // our template as the frame's packets left it.
+                // spurious splash. The commit's handlers read our template through the host, as the
+                // frame's packets left it.
                 feed_zone_events
                     .after(crate::ui_script::UiTick)
-                    .after(benilla_world::terrain_stream::AreaAuthoritySet),
+                    .after(benilla_world::terrain_stream::AreaAuthoritySet)
+                    // And after the stream, the sound's listener and the hover, which read CVar
+                    // knobs (the clip and detail, the volumes, the rig) its handlers' calls write.
+                    .after(benilla_world::schedule::WorldStage::Stream)
+                    .after(crate::target::TargetUpdate),
             );
     }
 }
@@ -523,17 +612,17 @@ mod tests {
         world.resource_mut::<GuidIndex>().0.insert(ME, me);
         let pvp = |app: &mut App| {
             let world = app.world_mut();
-            crate::ui_unit::run_feed_units_once(world);
             // The poll's tenth tick (`0x5db906`).
             for _ in 0..10 {
                 world.run_system_cached(feed_zone_events).unwrap();
             }
-            world
-                .non_send_resource::<UiScript>()
-                .eval::<(Option<String>, Option<String>)>(
-                    "local t, f = GetZonePVPInfo() return t, f",
-                )
-                .unwrap()
+            crate::script_calls::with_hosted_vm(world, |s| {
+                s.expect("a VM")
+                    .eval::<(Option<String>, Option<String>)>(
+                        "local t, f = GetZonePVPInfo() return t, f",
+                    )
+                    .unwrap()
+            })
         };
         assert_eq!(pvp(&mut app), (None, None), "no template: nil");
         app.world_mut().entity_mut(me).insert(store(Some(ORC)));
@@ -591,7 +680,6 @@ mod tests {
         world.insert_non_send_resource(script);
         let frame = |app: &mut App| {
             let world = app.world_mut();
-            crate::ui_unit::run_feed_units_once(world);
             // The poll's tenth tick (`0x5db906`).
             for _ in 0..10 {
                 world.run_system_cached(feed_zone_events).unwrap();
@@ -612,16 +700,6 @@ mod tests {
         let me = app.world_mut().spawn((SelfPlayer, Guid(ME), store)).id();
         app.world_mut().resource_mut::<GuidIndex>().0.insert(ME, me);
         assert_eq!(frame(&mut app), ["friendly"]);
-    }
-
-    /// The commit reads what the unit feed pushed of a player that arrived this frame.
-    #[test]
-    fn the_zone_commit_runs_after_the_unit_feed() {
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
-        assert!(crate::ui_unit::feed_units_runs_before(
-            &mut app,
-            feed_zone_events
-        ));
     }
 
     /// The poll `0x5db900` counts its calls (`0xc4d790`) and reports the area only on the tenth
@@ -696,6 +774,11 @@ mod tests {
         );
         assert!(ticks(&mut app, GOLDSHIRE, 9).is_empty());
         assert_eq!(ticks(&mut app, GOLDSHIRE, 1), ["ZONE_CHANGED"]);
+        // `0xb4e314` holds the leaf's parent zone, and an id with no row keeps the last commit.
+        let committed = |app: &App| app.world().resource::<CommittedZone>().0;
+        assert_eq!(committed(&app), Some(ELWYNN));
+        ticks(&mut app, 4242, 10);
+        assert_eq!(committed(&app), Some(ELWYNN), "no row, no commit");
     }
 
     /// `0x67e6e4` compares the whole-WMO name with the subzone by `SStrCmpI` (`0x64a4c0`, limit

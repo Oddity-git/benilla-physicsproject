@@ -155,6 +155,80 @@ fn env_lines(e: EnvironmentalDamageLog) -> Vec<PendingCombat> {
     })
 }
 
+/// `0x62aac0` flashes the victim's nameplate (`0x62abac`) for a type below 6, a victim held as a
+/// unit and strictly inside its class's range of you (`0x62ab97`-`0x62aba4`, a creature's 30
+/// yards), ahead of the line; the zero hit `0x624f4c` stops first.
+#[test]
+fn environmental_damage_flashes_the_victims_plate_inside_its_range() {
+    let flash = |e: EnvironmentalDamageLog, mob_yards: f32| {
+        let bench = Bench::new();
+        let at = super::At(std::collections::HashMap::from([
+            (bench.index.0[&ME], bevy::prelude::Vec3::ZERO),
+            (
+                bench.index.0[&MOB],
+                bevy::prelude::Vec3::new(mob_yards, 0.0, 0.0),
+            ),
+        ]));
+        let mut flash = None;
+        bench.run_posed(&at, |ctx, st, po, log| {
+            flash = super::super::super::environmental_damage_log(e, ctx, st, po, log);
+        });
+        flash
+    };
+    assert_eq!(flash(environment(MOB, 2, 245, 0, 0), 20.0), Some(MOB));
+    assert_eq!(
+        flash(environment(MOB, 2, 245, 0, 0), 40.0),
+        None,
+        "past a creature's 30 yards"
+    );
+    assert_eq!(flash(environment(ME, 2, 245, 0, 0), 20.0), Some(ME));
+    assert_eq!(
+        flash(environment(MOB, 0, 0, 12, 0), 20.0),
+        Some(MOB),
+        "an absorbed fall still flashes"
+    );
+    assert_eq!(flash(environment(MOB, 6, 245, 0, 0), 20.0), None, "type 6");
+    assert_eq!(
+        flash(environment(MOB, 2, 0, 0, 0), 20.0),
+        None,
+        "a zero hit"
+    );
+    assert_eq!(
+        flash(environment(0x99, 2, 245, 0, 0), 20.0),
+        None,
+        "a victim not held as a unit"
+    );
+}
+
+/// The packet's handler looks the victim up with type mask 8 (`0x62565c`) and calls `0x624f30` only
+/// for a unit: your own trap, a game object that classifies as yours, gets neither line nor flash.
+#[test]
+fn environmental_damage_needs_a_held_unit() {
+    const TRAP: u64 = 7;
+    let mut bench = Bench::new();
+    let e = bench.world.spawn_empty().id();
+    bench.index.0.insert(TRAP, e);
+    bench.stores.insert(
+        e,
+        crate::net::ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+            (2, 0x21),
+            (6, ME as u32),
+            (7, (ME >> 32) as u32),
+        ])),
+    );
+    let mut flash = None;
+    let log = bench.run(|ctx, st, po, log| {
+        let hit = environment(TRAP, 3, 50, 0, 0);
+        flash = super::super::super::environmental_damage_log(hit, ctx, st, po, log);
+    });
+    assert_eq!(flash, None);
+    assert!(log.pending_combat_order().is_empty());
+    assert_eq!(
+        stems(&env_lines(environment(MOB, 3, 50, 0, 0))),
+        ["VSENVIRONMENTALDAMAGE_LAVA_"]
+    );
+}
+
 /// `0x62aac0` raises its word when the victim is you (`0x62ac74`): `RESIST` with the damage and a
 /// resisted amount above 0 (`0x62ac7e`), else `ABSORB` with an absorbed one (`0x62ac99`), else
 /// `DAMAGE` (`0x62acad`).

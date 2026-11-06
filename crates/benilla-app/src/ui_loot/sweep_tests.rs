@@ -4,13 +4,12 @@
 
 use benilla_protocol::messages::GroupMemberEntry;
 use benilla_protocol::SessionEvent;
-use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 
 use super::call_tests::{
     client, eval, feed, open, packets, row, run, seen, sent, Loot, CORPSE, LINEN, ME, THRALL, WOOL,
 };
-use super::{AutoLootByte, LootCloseAtRest, LootLatch};
+use super::{AutoLootByte, LootLatch};
 use crate::net::{ClientCommand, GuidIndex, SelfPlayer};
 
 /// Disenchanting: a window `CloseLoot` sweeps while rows are left.
@@ -194,8 +193,7 @@ fn a_disenchant_window_whose_source_is_gone_closes_at_rest() {
     let world = l.app.world_mut();
     let corpse = world.resource_mut::<GuidIndex>().0.remove(&CORPSE).unwrap();
     world.despawn(corpse);
-    world.resource_mut::<LootCloseAtRest>().0 = true;
-    world.run_system_once(super::drain_loot).unwrap();
+    super::close_at_precast_end(world, false);
     assert!(matches!(
         sent(&l)[..],
         [ClientCommand::LootRelease { guid: CORPSE }]
@@ -278,4 +276,79 @@ fn auto_loot_default_sweeps_a_pickpocket_and_a_disenchant_window() {
             );
         }
     }
+}
+
+/// `SMSG_LOOT_MONEY_NOTIFY` shows `LOOT_MONEY_SPLIT` over the coins as a `CHAT_MSG_MONEY` line at
+/// its packet (`0x5ebf20` → `0x5ec011`), its listeners run before the next packet's handler
+/// (`0x537ae5`): the first nonzero coin as `"%d %s"` and each later one as `", %d %s"`
+/// (`0x5ebf88`, `0x5ebf9f`), so a zero middle coin leaves no empty separator; an amount of 0 shows
+/// nothing (`0x5ebf3a`).
+#[test]
+fn a_group_coin_share_shows_its_line_at_its_packet() {
+    let mut l = client();
+    note_money(&mut l);
+    let lines = [
+        "Your share of the loot is 1 Gold, 2 Silver, 3 Copper.",
+        "Your share of the loot is 1 Gold, 3 Copper.",
+        "Your share of the loot is 5 Silver.",
+        "Your share of the loot is 7 Copper.",
+    ];
+    for (n, amount) in [10_203, 10_003, 500, 7, 0].into_iter().enumerate() {
+        packets(&mut l, vec![SessionEvent::LootMoneyNotify { amount }]);
+        assert_eq!(money_lines(&mut l), lines[..(n + 1).min(4)], "{amount}");
+    }
+    assert_eq!(
+        seen(&mut l),
+        "CHAT_MSG_MONEY,CHAT_MSG_MONEY,CHAT_MSG_MONEY,CHAT_MSG_MONEY"
+    );
+}
+
+/// A release in the frame of an auto-looted response with money: the response sweeps inside its
+/// own packet (`0x4c1ed3` → `0x4c1fa0`), its coin take, store and money line ahead of the release,
+/// whose close takes the window and clears the money line's flag (`0x4c1d95`): nothing is sent
+/// after the release, and the next corpse's sweep prints its line.
+#[test]
+fn a_release_in_the_frame_of_a_swept_response_leaves_the_next_line() {
+    let mut l = client();
+    note_money(&mut l);
+    let _ = sent(&l);
+    l.app.world_mut().resource_mut::<AutoLootByte>().0 = true;
+    l.app.world_mut().resource_mut::<LootLatch>().0 = Some(CORPSE);
+    packets(
+        &mut l,
+        vec![
+            SessionEvent::LootResponse {
+                guid: CORPSE,
+                loot_type: 1,
+                gold: 150,
+                items: vec![row(0, LINEN)],
+            },
+            SessionEvent::LootReleaseResponse {
+                guid: CORPSE,
+                result: 1,
+            },
+        ],
+    );
+    feed(&mut l);
+    let swept = sent(&l);
+    assert!(
+        matches!(
+            swept[..],
+            [
+                ClientCommand::LootMoney,
+                ClientCommand::AutostoreLootItem { slot: 0 }
+            ]
+        ),
+        "the sweep's, inside the response, and nothing after the release: {swept:?}"
+    );
+    assert_eq!(seen(&mut l), "CHAT_MSG_MONEY,LOOT_OPENED,LOOT_CLOSED");
+    assert!(!l.app.world().resource::<super::LootState>().coin_line_shown);
+    auto_open(&mut l, 1, 250, vec![row(0, WOOL), row(1, LINEN)]);
+    assert_eq!(
+        money_lines(&mut l),
+        [
+            "You loot 1 Silver, 50 Copper",
+            "You loot 2 Silver, 50 Copper"
+        ]
+    );
 }

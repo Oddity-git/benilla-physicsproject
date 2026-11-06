@@ -1,338 +1,13 @@
-//! Every unit's aura list, the player's too, one per guid, and the unit-token resolver's inputs
-//! (`0x515970`, [`UnitGuids`]) that `UnitBuff 0x519500` and `UnitDebuff 0x5198f0` read them through:
-//! the guid globals, the group tables, and each held unit a `target` chain can reach. A list is the
-//! live unit's slots, gated as any unit's; a group member or pet with no live object diverts to its
-//! roster record's block (`0x519592`-`0x5195a4` to `0x519735`, `0x519b25`). Lists are built only for
-//! guids some token can name, once per guid whatever names it, and rebuilt only when what they are
-//! built from moves: a 40-man raid names up to 80 units, and their targets.
+//! The aura lists of the units each token names: the player, the group's members and pets, in
+//! view or off their records, the target and the mouseover, and any `target` chain off them, read
+//! through the units the tokens reach ([`crate::ui_unit::reach`]) as the aura getters walk them
+//! ([`super::AuraLive`]).
 
-use std::collections::hash_map::{Entry, HashMap};
-
-use benilla_formats::SpellCatalog;
-use benilla_ui::script::{UiScript, UnitAuraList, UnitGuids};
-
-use super::{aura_list, other_unit_inputs, record_inputs, AuraInput, RaidFilter};
-use crate::net::ObjectStore;
-use crate::ui_party::{raid_row_guids, GroupState};
-
-/// The group tables of [`UnitGuids`]: `party1..4` are the own subgroup's slots and `partypetN`
-/// their pets (`0x4e81d0`); `raidN` is `GetRaidRosterInfo` row N, as every other raid-token reader
-/// resolves it, and `raidpetN` that row's pet (`0x491960`).
-fn fill_group<'a>(
-    g: &mut UnitGuids,
-    group: Option<&GroupState>,
-    held: impl Fn(u64) -> Option<&'a ObjectStore>,
-) {
-    g.party = [0; 4];
-    g.party_pets = [0; 4];
-    g.raid.clear();
-    g.raid_pets.clear();
-    let Some(group) = group else {
-        return;
-    };
-    let live = |m: u64| held(m).map(|s| &s.0);
-    for (i, m) in group.party_slots().take(4).enumerate() {
-        g.party[i] = m.guid;
-        g.party_pets[i] = group.party_pet_guid(m.guid, live(m.guid)).unwrap_or(0);
-    }
-    g.raid = raid_row_guids(group);
-    g.raid_pets.extend(
-        g.raid
-            .iter()
-            .map(|&m| group.raid_pet_guid(m, live(m)).unwrap_or(0)),
-    );
-}
-
-/// What [`UnitAuras::feed`] reads this frame.
-pub(super) struct Inputs<'g, 'a, H, V> {
-    pub(super) group: Option<&'g GroupState>,
-    /// Our guid, whose slots list as any held unit's: `UnitBuff("player")` walks the fields, not
-    /// the buff cache (`0x51960f`).
-    pub(super) me: u64,
-    /// `pet`, `target`, `mouseover` and `npc`'s guids, 0 for none.
-    pub(super) pet: u64,
-    pub(super) target: u64,
-    pub(super) mouseover: u64,
-    pub(super) npc: u64,
-    /// The object manager's lookup (`0x468460`).
-    pub(super) held: H,
-    /// `UnitBuff`'s unit gate on a live unit, by guid.
-    pub(super) buffs_visible: V,
-    pub(super) catalog: Option<&'a SpellCatalog>,
-    /// The spell catalog was replaced, so every list is rebuilt.
-    pub(super) catalog_moved: bool,
-    /// Each aura's `raidFilter` verdict.
-    pub(super) raid: &'a RaidFilter,
-    /// The active player's `PLAYER_FIELD_BYTES2` byte 1, the auras it can see (`0x5198b0`).
-    pub(super) vision: Option<u8>,
-}
-
-/// One guid's list, shared by every token naming it.
-struct GuidList {
-    /// What the list was built from; the list is rebuilt only when these move.
-    inputs: Vec<AuraInput>,
-    list: UnitAuraList,
-    /// Taken from [`UnitAuras::versions`] each time the list changes.
-    version: u64,
-    /// The frame that last read it; an entry no token can name this frame is dropped.
-    frame: u64,
-}
-
-/// The per-guid lists and the resolver's inputs, for one VM.
-#[derive(Default)]
-pub(super) struct UnitAuras {
-    /// The resolver's inputs as last built.
-    guids: UnitGuids,
-    by_guid: HashMap<u64, GuidList>,
-    /// Each list version the VM holds, by guid.
-    pushed: HashMap<u64, u64>,
-    /// The last version handed out; every list change takes the next, so none repeats.
-    versions: u64,
-    catalog_present: bool,
-    frame: u64,
-    /// Kept to save the allocations: the inputs being read, and the walk over the guids a token
-    /// can name, each with whether its roster record may stand in for it.
-    scratch: Vec<AuraInput>,
-    walk: Vec<(u64, bool)>,
-}
-
-impl UnitAuras {
-    /// Build the resolver's inputs and every nameable guid's list, push what moved, and return
-    /// the guids whose list the VM was handed. Pushing fires nothing: `UNIT_AURA` is the aura
-    /// fields' watches and the stats packet's record diff (`crate::field_watch`).
-    pub(super) fn feed<'a, H, V>(
-        &mut self,
-        script: &mut UiScript,
-        inputs: Inputs<'_, 'a, H, V>,
-    ) -> Vec<u64>
-    where
-        H: Fn(u64) -> Option<&'a ObjectStore>,
-        V: Fn(u64, &ObjectStore) -> bool,
-    {
-        let Inputs {
-            group,
-            me,
-            pet,
-            target,
-            mouseover,
-            npc,
-            held,
-            buffs_visible,
-            catalog,
-            catalog_moved,
-            raid,
-            vision,
-        } = inputs;
-        self.frame += 1;
-        if catalog_moved || catalog.is_some() != self.catalog_present {
-            self.catalog_present = catalog.is_some();
-            self.by_guid.clear();
-        }
-        // The resolver's inputs and the lists, in one walk over every guid a token can name: the
-        // bases, then each held unit their `target` chains reach. A group token's guid lists off
-        // its roster record while out of view; any other lists only while held.
-        let mut g = std::mem::take(&mut self.guids);
-        let mut walk = std::mem::take(&mut self.walk);
-        (g.player, g.pet, g.target, g.mouseover, g.npc) = (me, pet, target, mouseover, npc);
-        fill_group(&mut g, group, &held);
-        g.held.clear();
-        walk.clear();
-        walk.extend([me, pet, target, mouseover, npc].map(|g| (g, false)));
-        walk.extend(g.party.iter().chain(&g.party_pets).map(|&g| (g, true)));
-        walk.extend(g.raid.iter().chain(&g.raid_pets).map(|&g| (g, true)));
-        while let Some((guid, record_ok)) = walk.pop() {
-            if guid == 0 || g.held.contains_key(&guid) {
-                continue;
-            }
-            let store = held(guid);
-            if let Some(unit) = store.filter(|s| s.is_unit()) {
-                let next = unit.0.unit_target().unwrap_or(0);
-                g.held.insert(guid, next);
-                walk.push((next, false));
-            }
-            self.refresh(
-                guid,
-                store,
-                record_ok,
-                group,
-                &buffs_visible,
-                catalog,
-                raid,
-                vision,
-            );
-        }
-        script.set_unit_guids(&g);
-        self.guids = g;
-        self.walk = walk;
-        let frame = self.frame;
-        self.by_guid.retain(|_, e| e.frame == frame);
-
-        let mut handed = Vec::new();
-        for (&guid, e) in &self.by_guid {
-            if self.pushed.insert(guid, e.version) != Some(e.version) {
-                script.set_unit_auras(guid, Some(e.list.clone()));
-                handed.push(guid);
-            }
-        }
-        let by_guid = &self.by_guid;
-        self.pushed.retain(|guid, _| {
-            let keep = by_guid.contains_key(guid);
-            if !keep {
-                script.set_unit_auras(*guid, None);
-            }
-            keep
-        });
-
-        handed
-    }
-
-    /// `guid`'s list as last built, `None` for a unit with none.
-    pub(super) fn list(&self, guid: u64) -> Option<&UnitAuraList> {
-        self.by_guid.get(&guid).map(|e| &e.list)
-    }
-
-    /// Rebuild `guid`'s list this frame if what it is built from moved: the live unit's slots
-    /// (`store`, the object manager's answer) with its unit gate, else, for a guid a group token
-    /// names, the roster record's block, which has none (`0x519735`). A guid neither held nor a
-    /// group token's gets no list, as `UnitBuff`'s roster walk finds nothing for it.
-    #[allow(clippy::too_many_arguments)] // the list's inputs, as the feed reads them
-    fn refresh(
-        &mut self,
-        guid: u64,
-        store: Option<&ObjectStore>,
-        record_ok: bool,
-        group: Option<&GroupState>,
-        buffs_visible: &impl Fn(u64, &ObjectStore) -> bool,
-        catalog: Option<&SpellCatalog>,
-        raid: &RaidFilter,
-        vision: Option<u8>,
-    ) {
-        if self
-            .by_guid
-            .get(&guid)
-            .is_some_and(|e| e.frame == self.frame)
-        {
-            return;
-        }
-        self.scratch.clear();
-        let Some(gate) = list_inputs(
-            &mut self.scratch,
-            guid,
-            store,
-            record_ok,
-            group,
-            buffs_visible,
-            catalog,
-            raid,
-            vision,
-        ) else {
-            return;
-        };
-        let build = |inputs: &[AuraInput]| UnitAuraList {
-            auras: aura_list(catalog, inputs),
-            buffs_visible: gate,
-        };
-        match self.by_guid.entry(guid) {
-            Entry::Occupied(mut e) => {
-                let e = e.get_mut();
-                e.frame = self.frame;
-                if e.inputs != self.scratch || e.list.buffs_visible != gate {
-                    std::mem::swap(&mut e.inputs, &mut self.scratch);
-                    let list = build(&e.inputs);
-                    if list != e.list {
-                        e.list = list;
-                        self.versions += 1;
-                        e.version = self.versions;
-                    }
-                }
-            }
-            Entry::Vacant(e) => {
-                self.versions += 1;
-                let inputs = self.scratch.clone();
-                let list = build(&inputs);
-                e.insert(GuidList {
-                    inputs,
-                    list,
-                    version: self.versions,
-                    frame: self.frame,
-                });
-            }
-        }
-    }
-}
-
-/// What `guid`'s list is built from, into `inputs`, with its unit gate: the live unit's slots
-/// (`store`, the object manager's answer) with its gate, else, for a guid a group token names
-/// (`record_ok`), the roster record's block, which has none (`0x519735`). A guid neither held nor
-/// a group token's gets no list, as `UnitBuff`'s roster walk finds nothing for it.
-#[allow(clippy::too_many_arguments)] // the list's inputs, as the feed reads them
-fn list_inputs(
-    inputs: &mut Vec<AuraInput>,
-    guid: u64,
-    store: Option<&ObjectStore>,
-    record_ok: bool,
-    group: Option<&GroupState>,
-    buffs_visible: &impl Fn(u64, &ObjectStore) -> bool,
-    catalog: Option<&SpellCatalog>,
-    raid: &RaidFilter,
-    vision: Option<u8>,
-) -> Option<bool> {
-    match store {
-        Some(store) => {
-            inputs.extend(other_unit_inputs(store, catalog, raid, vision));
-            Some(buffs_visible(guid, store))
-        }
-        None if record_ok => {
-            if let Some(group) = group {
-                inputs.extend(record_inputs(
-                    group.roster_aura_slots(guid),
-                    catalog,
-                    raid,
-                    vision,
-                ));
-            }
-            Some(true)
-        }
-        None => None,
-    }
-}
-
-/// `guid`'s list off `store` and the record `group` holds, as [`UnitAuras::feed`] builds it.
-#[allow(clippy::too_many_arguments)] // the list's inputs, as the feed reads them
-pub(super) fn list_of(
-    guid: u64,
-    store: Option<&ObjectStore>,
-    record_ok: bool,
-    group: Option<&GroupState>,
-    buffs_visible: &impl Fn(u64, &ObjectStore) -> bool,
-    catalog: Option<&SpellCatalog>,
-    raid: &RaidFilter,
-    vision: Option<u8>,
-) -> Option<UnitAuraList> {
-    let mut inputs = Vec::new();
-    let gate = list_inputs(
-        &mut inputs,
-        guid,
-        store,
-        record_ok,
-        group,
-        buffs_visible,
-        catalog,
-        raid,
-        vision,
-    )?;
-    Some(UnitAuraList {
-        auras: aura_list(catalog, &inputs),
-        buffs_visible: gate,
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use benilla_protocol::messages::{
         member_status, GroupMemberEntry, ObjectFields, PartyMemberStatsInfo,
     };
-    use benilla_ui::script::UiScript;
+    use benilla_ui::script::{AuraState, UiScript};
     use bevy::prelude::*;
 
     use crate::client_state::ClientState;
@@ -348,7 +23,7 @@ mod tests {
     /// `UNIT_FIELD_FLAGS`; bit 27 is `UNIT_FLAG_AURAS_VISIBLE`, which opens `UnitBuff`'s gate.
     const FLAGS: u16 = 46;
 
-    /// The feed on a bare app with a VM, us, and a party of one, `MEMBER`, with no record.
+    /// The aura plugin on a bare app with a VM, us, and a party of one, `MEMBER`, with no record.
     fn party_app() -> App {
         let (tx, _) = crossbeam_channel::unbounded();
         let mut app = App::new();
@@ -417,29 +92,87 @@ mod tests {
             .apply_stats(guid, full, info);
     }
 
-    /// The spell ids of `token`'s pushed debuffs (`harmful`) or buffs, after checking that
-    /// `UnitDebuff` (or `UnitBuff`) enumerates exactly that many, index 1 up to the nil.
+    /// The guid `token` names off the units the tokens reach now ([`crate::ui_unit::reach`]).
+    fn guid_of(app: &mut App, token: &str) -> Option<u64> {
+        use bevy::ecs::system::RunSystemOnce;
+        let published = app
+            .world()
+            .non_send_resource::<UiScript>()
+            .world_mouseover();
+        let token = token.to_string();
+        app.world_mut()
+            .run_system_once(
+                move |selection: Res<crate::target::Selection>,
+                      group: Option<Res<GroupState>>,
+                      me: Query<(&ObjectStore, &Guid), With<SelfPlayer>>,
+                      index: Res<GuidIndex>,
+                      stores: Query<&ObjectStore>| {
+                    use crate::ui_unit::reach::{mouseover_unit, reach, Inputs};
+                    let held = |guid: u64| index.0.get(&guid).and_then(|&e| stores.get(e).ok());
+                    let (store, me) = me.single().ok()?;
+                    reach(Inputs {
+                        group: group.as_deref(),
+                        me: me.0,
+                        pet: crate::ui_unit::pet_token_guid(Some(store)),
+                        target: selection.guid.unwrap_or(0),
+                        mouseover: mouseover_unit(published, held),
+                        npc: 0,
+                        held,
+                    })
+                    .guid_of(&token)
+                },
+            )
+            .expect("the walk runs as a one-shot system")
+    }
+
+    /// The list of the unit `token` names, as the lent host's walk reads it at a getter's call
+    /// ([`super::super::AuraLive`]), its roster record standing in for a unit not held.
+    fn list_of(app: &mut App, token: &str) -> Option<benilla_ui::script::UnitAuraList> {
+        use bevy::ecs::system::RunSystemOnce;
+        let guid = guid_of(app, token)?;
+        app.world_mut()
+            .run_system_once(
+                move |views: super::super::AuraViews,
+                      relations: crate::target::RelationWorld,
+                      me: Query<&ObjectStore, With<SelfPlayer>>,
+                      index: Res<GuidIndex>,
+                      stores: Query<&ObjectStore>,
+                      group: Option<Res<GroupState>>| {
+                    let store = index.0.get(&guid).and_then(|&e| stores.get(e).ok());
+                    views.list(
+                        guid,
+                        store,
+                        true,
+                        group.as_deref(),
+                        &relations,
+                        me.iter().next(),
+                    )
+                },
+            )
+            .expect("the walk runs as a one-shot system")
+    }
+
+    /// What `UnitDebuff` (`harmful`) or `UnitBuff` enumerates for `token`, index 1 up to the nil:
+    /// the half, the buffs through the unit gate, past the vision test, `raid` keeping the
+    /// `raidFilter` verdicts alone.
+    fn walked(app: &mut App, token: &str, harmful: bool, raid: bool) -> Vec<AuraState> {
+        let Some(list) = list_of(app, token) else {
+            return Vec::new();
+        };
+        let gate = harmful || list.buffs_visible;
+        list.auras
+            .into_iter()
+            .filter(|a| gate && a.helpful != harmful && !a.vision_hidden)
+            .filter(|a| !raid || a.raid_listed)
+            .collect()
+    }
+
+    /// The spell ids [`walked`] enumerates for `token`.
     fn listed(app: &mut App, token: &str, harmful: bool) -> Vec<i64> {
-        let verb = if harmful { "UnitDebuff" } else { "UnitBuff" };
-        let s = app.world_mut().non_send_resource::<UiScript>();
-        let ids = s.aura_spell_ids(token, !harmful);
-        let enumerated = s
-            .eval::<usize>(&format!(
-                r#"local n = 0
-                   for i = 1, 48 do
-                       local _, count = {verb}("{token}", i)
-                       if count == nil then break end
-                       n = n + 1
-                   end
-                   return n"#
-            ))
-            .unwrap();
-        assert_eq!(
-            enumerated,
-            ids.len(),
-            "{verb}(\"{token}\", i) enumerates the list"
-        );
-        ids.into_iter().map(i64::from).collect()
+        walked(app, token, harmful, false)
+            .into_iter()
+            .map(|a| i64::from(a.spell_id))
+            .collect()
     }
 
     fn seen(app: &mut App) -> Vec<String> {
@@ -510,19 +243,11 @@ mod tests {
                 (AURAFLAGS, 0x0000_0088),
             ],
         );
-        let kept = |app: &mut App| {
-            app.world_mut()
-                .non_send_resource::<UiScript>()
-                .eval::<Vec<String>>(
-                    r#"local t = {}
-                       for i = 1, 32 do
-                           local icon = UnitBuff("party1", i, 1)
-                           if not icon then break end
-                           table.insert(t, icon)
-                       end
-                       return t"#,
-                )
-                .unwrap()
+        let kept = |app: &mut App| -> Vec<String> {
+            walked(app, "party1", false, true)
+                .into_iter()
+                .filter_map(|a| a.icon)
+                .collect()
         };
         app.update();
         assert_eq!(kept(&mut app), ["Spell_1243"]);
@@ -594,12 +319,7 @@ mod tests {
             "buffs, ungated: no factions, which would close the live gate"
         );
         assert_eq!(listed(&mut app, "party1", true), [589]);
-        let count = app
-            .world_mut()
-            .non_send_resource::<UiScript>()
-            .eval::<i64>(r#"local _, count = UnitDebuff("party1", 1) return count"#)
-            .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(walked(&mut app, "party1", true, false)[0].count, 1);
 
         stats(
             &mut app,
@@ -652,14 +372,7 @@ mod tests {
             app.update();
         };
         relist(&mut app, member_status::OFFLINE);
-        let nil = app
-            .world_mut()
-            .non_send_resource::<UiScript>()
-            .eval::<bool>(
-                r#"return UnitBuff("party1", 1) == nil and UnitDebuff("party1", 1) == nil"#,
-            )
-            .unwrap();
-        assert!(nil, "the record kept the auras, the clear bit hides them");
+        // The record kept the auras, the clear bit hides them.
         assert!(listed(&mut app, "party1", false).is_empty());
         assert!(listed(&mut app, "party1", true).is_empty());
 
@@ -935,12 +648,18 @@ mod tests {
         assert_eq!(listed(&mut app, "party1", false), [1243], "Amorous hidden");
         assert!(listed(&mut app, "player", false).is_empty(), "on us too");
         let bar_shows = |app: &mut App| {
-            app.world_mut()
-                .non_send_resource::<UiScript>()
-                .eval::<i64>(r#"return (GetPlayerBuff(0, "HELPFUL"))"#)
-                .unwrap()
+            let me = app.world().resource::<GuidIndex>().0[&ME];
+            let store = app.world().get::<ObjectStore>(me).expect("our store");
+            let catalog = app.world().resource::<crate::ui_action::Spells>();
+            let mut cache = Vec::new();
+            super::super::rebuild(&mut cache, store, Some(&catalog.catalog), 0.0);
+            cache.iter().map(|c| c.spell_id).collect::<Vec<_>>()
         };
-        assert_eq!(bar_shows(&mut app), 0, "the buff bar runs no vision test");
+        assert_eq!(
+            bar_shows(&mut app),
+            [AMOROUS],
+            "the buff bar runs no vision test"
+        );
 
         // Bit 0 of byte 1 is vision 1 (Detect Amore).
         seat_me(&mut app, &me(1));
@@ -1068,12 +787,7 @@ mod tests {
         );
         app.update();
         assert_eq!(listed(&mut app, "raid4", true), [589, 11976]);
-        let count = app
-            .world_mut()
-            .non_send_resource::<UiScript>()
-            .eval::<i64>(r#"local _, count = UnitDebuff("raid4", 1) return count"#)
-            .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(walked(&mut app, "raid4", true, false)[0].count, 1);
         assert_eq!(listed(&mut app, "raidpet4", false), [1126]);
         assert_eq!(listed(&mut app, "raidpet4", true), [770]);
         assert!(
@@ -1082,11 +796,11 @@ mod tests {
         );
     }
 
-    /// The feed pushes each moved list and fires nothing: `UNIT_AURA` is the aura fields' watches
-    /// and the stats packet's record diff (`crate::field_watch`), so neither a record's new block
-    /// nor a token's first look at one reaches a handler from here.
+    /// A frame fires nothing of itself: `UNIT_AURA` is the aura fields' watches and the stats
+    /// packet's record diff (`crate::field_watch`), so neither a record's new block nor a token's
+    /// first look at one reaches a handler from here; the walk reads each record as it stands.
     #[test]
-    fn the_feed_pushes_each_moved_list_and_fires_nothing() {
+    fn a_frame_fires_nothing_and_the_walk_reads_each_record_as_it_stands() {
         let mut app = raid_app();
         stats_of(&mut app, MATE, true, online(vec![(32, 589)]));
         stats_of(&mut app, FAR, true, online(vec![(32, 770)]));
@@ -1170,33 +884,6 @@ mod tests {
         app.update();
         assert_eq!(listed(&mut app, "player", true), [589]);
         assert_eq!(listed(&mut app, "raid5", true), [589]);
-    }
-
-    /// A frame where nothing moved builds no list: the feed compares the inputs, not the lists.
-    #[test]
-    fn an_unchanged_raid_rebuilds_no_list() {
-        let mut app = raid_app();
-        stats_of(&mut app, FAR, true, online(vec![(32, 589)]));
-        app.update();
-        let versions = |app: &mut App| {
-            app.world_mut()
-                .resource_scope(|world, mut mem: Mut<super::super::AuraFeedMemory>| {
-                    let script = world.non_send_resource::<UiScript>();
-                    mem.vm.get(script).units.versions
-                })
-        };
-        let before = versions(&mut app);
-        for _ in 0..3 {
-            app.update();
-        }
-        assert_eq!(versions(&mut app), before);
-        stats_of(&mut app, FAR, false, online(vec![(33, 770)]));
-        app.update();
-        assert_eq!(
-            versions(&mut app),
-            before + 1,
-            "one list moved, one rebuilt"
-        );
     }
 
     // == Any token the resolver parses ==
@@ -1283,9 +970,9 @@ mod tests {
         );
     }
 
-    /// A chain's or the mouseover's list moving is pushed, and fires nothing.
+    /// A chain's or the mouseover's list moving fires nothing, and the walk reads it as it stands.
     #[test]
-    fn a_chains_list_is_pushed_and_fires_nothing() {
+    fn a_chains_list_moving_fires_nothing() {
         let mut app = chain_app();
         assert!(seen(&mut app).is_empty(), "a first look fires nothing");
 

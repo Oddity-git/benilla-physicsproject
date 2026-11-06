@@ -80,6 +80,11 @@ impl PendingEquips {
         u32::try_from(idx).unwrap_or(u32::MAX)
     }
 
+    /// The element as the table holds it now; `None` for an index nobody filed or one freed.
+    pub(crate) fn get(&self, index: u32) -> Option<PendingEquip> {
+        self.slots.get(index as usize).copied().flatten()
+    }
+
     /// Frees the element. An index nobody filed does nothing, as `0x5e1be0` bounds-checks it.
     pub(crate) fn take(&mut self, index: u32) -> Option<PendingEquip> {
         self.slots.get_mut(index as usize)?.take()
@@ -213,73 +218,67 @@ impl BindGate<'_> {
 }
 
 /// The lookup's miss (`0x55ba30`): ask the record with the callback, which its answer runs. A
-/// record the cache already answered, which the VM's copy of the cache had not caught up with,
-/// runs it now rather than wait for an answer that has come.
+/// record the cache holds never comes here: the call acts on it in its body (`0x5e163b`,
+/// [`crate::ui_items::ItemSteps`]). A refused entry holds no record, its node destroyed with the
+/// refusal (`0x55bed2`), so its lookup waits and asks again.
 fn wait_for(entry: u32, callback: RecordCallback, items: &Items, commands: &NetCommands) {
-    if items.template_answered(entry) {
-        items.run_with_vm(entry, callback, items.template_known(entry));
-        return;
-    }
     items.wait(entry, callback);
     let _ = items.template(entry, 0, Ask::Event(commands));
 }
 
-/// The equip callbacks whose records answered, run with the VM and the host lent, after the bag,
-/// doll and record feeds have pushed what the answer changed. `0x5e1020` walks the whole table,
-/// every element whose entry field matches, a standing question's included: each replays when the
-/// record was found (`0x5e10c2`) and is freed either way (`0x5e10cf`-`0x5e10e5`), a refusal
-/// leaving its items locked. This replays and frees the swaps parked on the entry alone
-/// ([`PendingEquips::parked_on`]). `0x5e17a0` runs
+/// The VM, the item cache and the pending-equip table an equip callback runs on.
+type ReplayVm<'w, 's> =
+    crate::script_calls::VmWith<'w, 's, (Res<'static, Items>, ResMut<'static, PendingEquips>)>;
+
+/// An equip callback for the record of `entry`, with the VM and the host lent, so its send goes
+/// out inside it. `0x5e1020` walks the whole table, every element whose entry field matches, a
+/// standing question's included: each replays when the record was found (`0x5e10c2`) and is
+/// freed either way (`0x5e10cf`-`0x5e10e5`), a refusal leaving its items locked. This replays and
+/// frees the swaps parked on the entry alone ([`PendingEquips::parked_on`]). `0x5e17a0` runs
 /// `AutoEquipCursorItem` again for a found record ([`UiScript::replay_auto_equip`]).
-pub(crate) fn replay_equip_records(
-    mut vm: crate::script_calls::VmWith<(Res<'static, Items>, ResMut<'static, PendingEquips>)>,
-) {
-    let ran = vm.own().0.take_vm_callbacks();
-    for (entry, callback, found) in ran {
-        match callback {
-            RecordCallback::AutoEquip if found => vm.run(|script| {
-                if let Some(Err(e)) = script.map(|s| s.replay_auto_equip(entry)) {
-                    debug!("ui_bind_confirm: auto-equip replay on {entry} raised: {e}");
-                }
-            }),
-            RecordCallback::Swap => {
-                let parked = vm.own().1.parked_on(entry);
-                for (index, mv) in parked {
-                    if found {
-                        vm.run(|script| {
-                            if let Some(Err(e)) = script.map(|s| s.replay_swap(mv)) {
-                                debug!("ui_bind_confirm: swap replay on {entry} raised: {e}");
-                            }
-                        });
-                    }
-                    vm.own().1.take(index);
-                }
+fn replay(vm: &mut ReplayVm, entry: u32, callback: RecordCallback, found: bool) {
+    match callback {
+        RecordCallback::AutoEquip if found => vm.run(|script| {
+            if let Some(Err(e)) = script.map(|s| s.replay_auto_equip(entry)) {
+                debug!("ui_bind_confirm: auto-equip replay on {entry} raised: {e}");
             }
-            _ => {}
+        }),
+        RecordCallback::Swap => {
+            let parked = vm.own().1.parked_on(entry);
+            for (index, mv) in parked {
+                if found {
+                    vm.run(|script| {
+                        if let Some(Err(e)) = script.map(|s| s.replay_swap(mv)) {
+                            debug!("ui_bind_confirm: swap replay on {entry} raised: {e}");
+                        }
+                    });
+                }
+                vm.own().1.take(index);
+            }
         }
+        _ => {}
     }
 }
 
-#[cfg(test)]
-mod tests {
-    /// The replays read the VM's views and its item records, so they run after the bag feed and
-    /// the record feed have pushed the answer.
-    #[test]
-    fn the_equip_replays_run_after_the_bag_feed() {
-        let app = crate::game_plugins::schedule_tests::headless_client();
-        let order = &app.world().resource::<crate::vm_pass::PassOrder>().0;
-        if !order.iter().any(|n| n.contains("benilla_app::")) {
-            eprintln!("skipped: this build carries no type names");
-            return;
-        }
-        let at = |name: &str| {
-            order
-                .iter()
-                .position(|n| n.ends_with(name))
-                .unwrap_or_else(|| panic!("`{name}` is in the pass"))
-        };
-        let replay = at("::ui_bind_confirm::replay_equip_records");
-        assert!(at("::ui_items::feed::feed_containers") < replay);
-        assert!(at("::ui_items::feed::feed_item_stats") < replay);
+/// The equip callback the record's answer runs inside its handler (`ItemCacheReceive`
+/// `0x55bdb0`, `0x55bf39`, from `0x555140`), in its place among the entry's other callbacks
+/// ([`crate::net::objects`]), once the VM's copy holds the record
+/// ([`crate::ui_items::feed::push_answered_record`]): a step in its place
+/// ([`crate::lanes::step`]), its send going out at the packet, ahead of a later packet's, and its
+/// signals' listeners running inside it, ahead of the entry's next callback.
+pub(crate) fn replay_at_answer(
+    world: &mut World,
+    entry: u32,
+    callback: RecordCallback,
+    found: bool,
+) {
+    fn run(In((entry, callback, found)): In<(u32, RecordCallback, bool)>, mut vm: ReplayVm) {
+        replay(&mut vm, entry, callback, found);
     }
+    crate::lanes::step(world, |world| {
+        if let Err(err) = world.run_system_cached_with(run, (entry, callback, found)) {
+            debug!("ui_bind_confirm: the equip callback did not run: {err}");
+        }
+        crate::creature_anim::apply_unit_edits(world);
+    });
 }

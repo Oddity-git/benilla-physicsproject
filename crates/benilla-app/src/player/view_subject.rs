@@ -12,10 +12,9 @@
 
 use std::sync::{Mutex, PoisonError};
 
-use benilla_protocol::EntityKind;
 use bevy::prelude::*;
 
-use super::{head_height, CameraPivot};
+use super::{head_height, CameraPivot, Player};
 use crate::net::{ClientCommand, GuidIndex, NetCommands, NetEntity, ObjectStore, SelfPlayer};
 
 /// Where the camera rig sits this frame when it is not our body; `None` is the body. It carries a
@@ -47,8 +46,10 @@ impl RemoteView {
 
 /// The far-sight machine `UpdateFarSight` (`0x5ee290`) runs for the active player, written
 /// through `&self` as a shared sink of the VM pass ([`crate::vm_pass::shared_sinks`]): the buff
-/// cancel runs it inside its call (`0x6e70ad`), and [`publish_view_subject`] for the field's
-/// change, an object's arrival and the camera's lost object.
+/// cancel runs it inside its call (`0x6e70ad`); the update handler at the field's change
+/// (`0x5de0d0`) and at the arrival of the object it names (`0x5fbb1a`, `0x5d552d`); the clear's
+/// handler (`0x5e441d`); and [`publish_view_subject`] for the camera's lost object. Our player's
+/// free takes the latch with it ([`Self::free`]).
 ///
 /// Not built: the mover switch (`SetActiveMover` `0x6006e0` at `0x5ee35b`, `0x5ee477`,
 /// `0x5ee573`), which possession already moves by the control update; the attack stop at a
@@ -113,34 +114,100 @@ impl FarSight {
     }
 
     /// `StartFarSight` (`0x5ee270`): the update while far sight is off.
-    fn start(&self, field: Option<u64>, held: impl Fn(u64) -> bool, net: &NetCommands) {
+    pub(crate) fn start(&self, field: Option<u64>, held: impl Fn(u64) -> bool, net: &NetCommands) {
         if !self.state().on {
             self.update(field, held, net);
         }
     }
 
     /// `EndFarSight` (`0x5ee590`): the update while far sight is on.
-    fn end(&self, field: Option<u64>, held: impl Fn(u64) -> bool, net: &NetCommands) {
+    pub(crate) fn end(&self, field: Option<u64>, held: impl Fn(u64) -> bool, net: &NetCommands) {
         if self.state().on {
             self.update(field, held, net);
         }
     }
 
     /// Whether far sight is on (`+0x1c70` bit 0).
-    fn on(&self) -> bool {
+    pub(crate) fn on(&self) -> bool {
         self.state().on
+    }
+
+    /// Our player freed with every object, at a world's end or a cross-map load (`0x467800`): the
+    /// bit goes with it, and the next player's constructor zeroes it (`0x5dd33d`), so the next
+    /// world owes the server no `CMSG_FAR_SIGHT` 0 and sends its first start's 1.
+    pub(crate) fn free(&self) {
+        *self.state() = FarSightState::default();
     }
 }
 
-/// Runs the far-sight callers outside a script call, then resolves the camera's object into a
-/// pose, before the controller runs; an object not held leaves the camera on the body.
-/// - `PLAYER_FARSIGHT`'s change (`0x5de0d0`): the start when the new field's object is held
-///   (`0x5de144`), else the end (`0x5de15d`);
-/// - the field's object arriving, a unit's (`0x5fbb1a`) or a dynamic object's (`0x5d552d`): the
-///   start;
-/// - the camera's object gone while far sight is on, the world frame's render (`0x483031`,
-///   `0x483054`-`0x483061`): the update.
-#[allow(clippy::too_many_arguments)] // a Bevy system's full input set
+/// `OBJECT_FIELD_TYPE`'s game object bit.
+const TYPEMASK_GAMEOBJECT: u32 = 0x20;
+/// `OBJECT_FIELD_TYPE`'s dynamic object bit.
+const TYPEMASK_DYNAMICOBJECT: u32 = 0x40;
+
+/// What the arrows' updates, the minimap's (`0x4eb07e`) and the world map's (`0x4a7c7c`), read of
+/// the object the camera follows: far sight's, or with none the active player, which a 0 seats
+/// (`0x490930` → `0x48ec90`).
+#[derive(bevy::ecs::system::SystemParam)]
+#[allow(clippy::type_complexity)]
+pub(crate) struct FollowedObject<'w, 's> {
+    player: Res<'w, Player>,
+    far_sight: Res<'w, FarSight>,
+    index: Res<'w, GuidIndex>,
+    objects: Query<
+        'w,
+        's,
+        (
+            Has<crate::net::ActiveMover>,
+            Option<&'static crate::net::RemoteMotion>,
+            Option<&'static ObjectStore>,
+            Option<&'static Transform>,
+        ),
+    >,
+}
+
+impl FollowedObject<'_, '_> {
+    /// Slot 6 of the object `[camera+0x88]` finds (`0x4eb07e`-`0x4eb0a8`, `0x4a7c7c`-`0x4a7cb1`),
+    /// none where the lookup fails (`0x4eb0a2`, `0x4a7ca2`). A unit's facing and our accumulator
+    /// are normalized to `[0, 2π)`, the range a reference mover's facing keeps; an object's field
+    /// is copied raw.
+    pub(crate) fn facing(&self) -> Option<f32> {
+        use std::f32::consts::TAU;
+        let Some(guid) = self.far_sight.camera() else {
+            let player = &self.player;
+            return player.active.then(|| player.facing().rem_euclid(TAU));
+        };
+        let entity = self.index.0.get(&guid).copied()?;
+        let (mover, motion, store, transform) = self.objects.get(entity).ok()?;
+        if let Some(fields) = store.map(|s| &s.0) {
+            let mask = fields.object_type_mask().unwrap_or(0);
+            // A dynamic object's slot (`0x5d5f40`) and a game object's (`0x5f9fb0`) read its field.
+            if mask & TYPEMASK_DYNAMICOBJECT != 0 {
+                return Some(fields.dynamicobject_position().map_or(0.0, |(_, f)| f));
+            }
+            if mask & TYPEMASK_GAMEOBJECT != 0 {
+                return Some(fields.gameobject_position().map_or(0.0, |(_, f)| f));
+            }
+        }
+        // A unit's slot (`0x5f1f30`) reads its mover's facing: ours while we move it, the relayed
+        // one, or where a creature with no relay stands turned. A corpse's own slot (`0x5d76c0`)
+        // is not read: vmangos's `Camera::SetView` seats only a unit or a dynamic object
+        // (`Camera.cpp:70`).
+        let yaw = if mover {
+            self.player.facing()
+        } else if let Some(motion) = motion {
+            motion.orientation
+        } else {
+            transform.map_or(0.0, |t| t.rotation.to_euler(EulerRot::YXZ).0)
+        };
+        Some(yaw.rem_euclid(TAU))
+    }
+}
+
+/// Runs the one far-sight caller outside a packet and a script call, the world frame's render
+/// (`0x483031`, `0x483054`-`0x483061`): with far sight on and the camera's object gone, the
+/// update. Then it resolves the camera's object into a pose, before the controller runs; an object
+/// not held leaves the camera on the body.
 pub(super) fn publish_view_subject(
     mut subject: ResMut<ViewSubject>,
     far_sight: Res<FarSight>,
@@ -149,37 +216,12 @@ pub(super) fn publish_view_subject(
     // The pivot height takes the raw `OBJECT_FIELD_SCALE_X`, not the eased render scale.
     poses: Query<(&Transform, Option<&CameraPivot>, Option<&NetEntity>)>,
     net: Res<NetCommands>,
-    mut seen_field: Local<Option<u64>>,
-    mut seen_object: Local<Option<Entity>>,
 ) {
     let field = self_store
         .iter()
         .next()
         .and_then(|store| store.0.player_farsight());
     let held = |guid: u64| index.0.contains_key(&guid);
-    let object = field.and_then(|guid| index.0.get(&guid).copied());
-    if *seen_field != field {
-        *seen_field = field;
-        if object.is_some() {
-            far_sight.start(field, held, &net);
-        } else {
-            far_sight.end(field, held, &net);
-        }
-    } else if object.is_some() && object != *seen_object {
-        let arrives = object
-            .and_then(|e| poses.get(e).ok())
-            .and_then(|(_, _, net)| net)
-            .is_some_and(|n| {
-                matches!(
-                    n.kind,
-                    EntityKind::Unit | EntityKind::Player | EntityKind::DynamicObject
-                )
-            });
-        if arrives {
-            far_sight.start(field, held, &net);
-        }
-    }
-    *seen_object = object;
     if far_sight.camera().is_some_and(|guid| !held(guid)) && far_sight.on() {
         far_sight.update(field, held, &net);
     }
@@ -227,6 +269,26 @@ pub(super) fn register(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unit's network identity.
+    fn unit_identity() -> crate::net::NetEntity {
+        crate::net::NetEntity {
+            kind: benilla_protocol::EntityKind::Unit,
+            display_id: None,
+            scale: 1.0,
+        }
+    }
+
+    /// Far sight started on `guid` as its create starts it (`0x5fbb1a`), the update handler's.
+    fn started_on(app: &App, guid: u64) {
+        let world = app.world();
+        let index = world.resource::<GuidIndex>();
+        world.resource::<FarSight>().start(
+            Some(guid),
+            |g| index.0.contains_key(&g),
+            world.resource::<NetCommands>(),
+        );
+    }
 
     #[test]
     fn an_unset_or_unstreamed_far_sight_both_resolve_to_the_body() {
@@ -301,11 +363,21 @@ mod tests {
              far sight is off"
         );
 
-        // Streamed: the subject's feet, and its pivot as the sweep origin's height.
+        // Streamed: the pass starts nothing, as the arrival is the create's (`0x5fbb1a`).
         app.world_mut()
             .resource_mut::<GuidIndex>()
             .0
             .insert(0x1234, subject);
+        app.update();
+        assert!(
+            app.world().resource::<ViewSubject>().remote.is_none(),
+            "the pass starts no far sight"
+        );
+        assert!(votes(&rx).is_empty(), "and tells the server nothing");
+
+        // Started: the subject's feet, and its pivot as the sweep origin's height.
+        started_on(&app, 0x1234);
+        assert_eq!(votes(&rx), [true], "the start tells the server once");
         app.update();
         let remote = app
             .world()
@@ -319,22 +391,14 @@ mod tests {
             "the boom sweeps from the SUBJECT's head, not ours — otherwise it is cast across the \
              world and stops at the first wall in between"
         );
-        assert_eq!(
-            votes(&rx),
-            [true],
-            "the unit's arrival starts far sight (`0x5fbb1a`), which tells the server once"
-        );
         app.update();
         assert!(votes(&rx).is_empty(), "once, not per frame");
 
-        // Cleared to zero: home.
+        // Cleared to zero: the field's change is its handler's (`0x5de0d0`), so the frame's pass
+        // leaves the view where it is.
         set(&mut app, 0);
         app.update();
-        assert!(
-            app.world().resource::<ViewSubject>().remote.is_none(),
-            "a zeroed field is vmangos's teardown signal: it sends no CLEAR_FAR_SIGHT_IMMEDIATE"
-        );
-        assert_eq!(votes(&rx), [false], "and the release votes 0, once");
+        assert!(votes(&rx).is_empty(), "the pass runs no end of its own");
     }
 
     /// Cancelling the buff of a far-sight spell (`AttributesEx` 0x2000 without 0x4: Sentry Totem,
@@ -368,7 +432,7 @@ mod tests {
         });
         let totem = app
             .world_mut()
-            .spawn(Transform::from_xyz(50.0, 0.0, 0.0))
+            .spawn((Transform::from_xyz(50.0, 0.0, 0.0), unit_identity()))
             .id();
         app.world_mut()
             .resource_mut::<GuidIndex>()
@@ -410,10 +474,11 @@ mod tests {
                 .unwrap();
         };
 
+        started_on(&app, TOTEM);
         assert_eq!(
             publish(&mut app),
             Some(totem),
-            "the field engages the totem"
+            "the totem's arrival engaged it (`0x5fbb1a`)"
         );
         assert_eq!(sent(&rx), ["far sight 1"]);
 
@@ -448,7 +513,7 @@ mod tests {
         app.insert_resource(NetCommands(tx));
         let eye = app
             .world_mut()
-            .spawn(Transform::from_xyz(50.0, 0.0, 0.0))
+            .spawn((Transform::from_xyz(50.0, 0.0, 0.0), unit_identity()))
             .id();
         app.world_mut()
             .resource_mut::<GuidIndex>()
@@ -485,6 +550,7 @@ mod tests {
                 vec![benilla_protocol::SessionEvent::FarSightCleared],
             );
         };
+        started_on(&app, EYE);
         assert_eq!(publish(&mut app), Some(eye));
         assert_eq!(votes(&rx), [true]);
 
@@ -498,5 +564,130 @@ mod tests {
         );
         clear(&mut app);
         assert!(votes(&rx).is_empty(), "with far sight off, nothing");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod followed_tests {
+    use super::*;
+    use crate::net::{ActiveMover, RemoteMotion};
+    use benilla_protocol::ObjectFields;
+    use bevy::ecs::system::RunSystemOnce;
+    use std::f32::consts::TAU;
+
+    const EYE: u64 = 0xF130_0000_0000_0042;
+    /// Our own mover's facing in every world here, so a read of it shows.
+    const OURS: f32 = 1.5;
+
+    fn world() -> World {
+        let mut world = World::new();
+        world.init_resource::<Player>();
+        world.init_resource::<FarSight>();
+        world.init_resource::<GuidIndex>();
+        world.resource_mut::<Player>().turn_aim(OURS);
+        world
+    }
+
+    /// `world`'s active player with the camera on `EYE`, held with `bundle`.
+    fn camera_on(world: &mut World, bundle: impl Bundle) {
+        world.resource_mut::<Player>().active = true;
+        let eye = world.spawn(bundle).id();
+        world.resource_mut::<GuidIndex>().0.insert(EYE, eye);
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        world
+            .resource::<FarSight>()
+            .start(Some(EYE), |_| true, &NetCommands(tx));
+    }
+
+    /// The camera on a dynamic object facing `facing`, for the arrows' feeds.
+    pub(crate) fn camera_on_an_eye(world: &mut World, facing: f32) {
+        camera_on(world, typed(0x41, 14, facing));
+    }
+
+    fn following(bundle: impl Bundle) -> World {
+        let mut world = world();
+        camera_on(&mut world, bundle);
+        world
+    }
+
+    fn read(world: &mut World) -> Option<f32> {
+        fn facing(followed: FollowedObject) -> Option<f32> {
+            followed.facing()
+        }
+        world.run_system_once(facing).expect("the read runs")
+    }
+
+    fn turned(yaw: f32) -> Transform {
+        Transform::from_rotation(Quat::from_rotation_y(yaw))
+    }
+
+    fn typed(mask: u32, facing_field: u16, facing: f32) -> ObjectStore {
+        ObjectStore(ObjectFields::from_pairs(&[
+            (2, mask),
+            (facing_field - 3, 0),
+            (facing_field - 2, 0),
+            (facing_field - 1, 0),
+            (facing_field, facing.to_bits()),
+        ]))
+    }
+
+    fn unit() -> ObjectStore {
+        ObjectStore(ObjectFields::from_pairs(&[(2, 0x9)]))
+    }
+
+    fn relayed(orientation: f32) -> RemoteMotion {
+        RemoteMotion {
+            wow_pos: [0.0; 3],
+            orientation,
+            flags: 0,
+            pitch: 0.0,
+            speed: 0.0,
+            vertical_velocity: 0.0,
+            jump_xy_vel: [0.0; 2],
+            fall_start: None,
+            pending: std::collections::VecDeque::new(),
+            relay: Default::default(),
+            last_apply_ms: 0.0,
+            last_apply_pos: [0.0; 3],
+            fired_at_ms: None,
+        }
+    }
+
+    /// With no far sight the camera's object is the active player, or none before there is one.
+    #[test]
+    fn with_no_far_sight_the_arrows_read_the_active_player() {
+        let mut world = world();
+        assert_eq!(read(&mut world), None);
+        world.resource_mut::<Player>().active = true;
+        assert_eq!(read(&mut world), Some(OURS));
+        world.resource_mut::<Player>().turn_aim(TAU);
+        let wrapped = read(&mut world).expect("the player");
+        assert!((wrapped - OURS).abs() < 1e-5, "normalized: {wrapped}");
+    }
+
+    /// Slot 6 by the followed object's kind (`0x4eb0a4`, `0x4a7cb1`).
+    #[test]
+    fn the_arrows_read_the_object_the_camera_follows() {
+        // `DYNAMICOBJECT_FACING` is field 14, `GAMEOBJECT_FACING` field 18.
+        let mut eye = following((typed(0x41, 14, 4.0), turned(0.5)));
+        assert_eq!(read(&mut eye), Some(4.0), "a dynamic object's field");
+        let mut go = following((typed(0x21, 18, 3.0), turned(0.5)));
+        assert_eq!(read(&mut go), Some(3.0), "a game object's field");
+
+        let mut relay = following((unit(), relayed(2.5), turned(0.5)));
+        assert_eq!(read(&mut relay), Some(2.5), "a relayed mover");
+        let mut still = following((unit(), turned(-1.0)));
+        let yaw = read(&mut still).expect("a creature");
+        assert!((yaw - (TAU - 1.0)).abs() < 1e-5, "its rotation: {yaw}");
+        let mut ours = following((unit(), ActiveMover, relayed(2.5), turned(0.5)));
+        assert_eq!(read(&mut ours), Some(OURS), "the unit we move");
+    }
+
+    /// An object that does not resolve has no facing to read (`0x4eb0a2`, `0x4a7ca2`).
+    #[test]
+    fn an_object_not_held_has_no_facing() {
+        let mut world = following(unit());
+        world.resource_mut::<GuidIndex>().0.clear();
+        assert_eq!(read(&mut world), None);
     }
 }

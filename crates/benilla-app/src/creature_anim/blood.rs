@@ -42,6 +42,46 @@ pub(crate) fn unit_blood_id(
     blood.0.level_key(display, model).map(|k| k as i32)
 }
 
+/// The locale caps of `violenceLevel` by locale index (`[0xc0e080]`), the table at `0x86c3f8`: 2
+/// everywhere but koKR, which gets 1. The row's default is the cap (`0x6c5aa0`).
+const VIOLENCE_CAPS: [i32; 8] = [2, 1, 2, 2, 2, 2, 2, 2];
+
+/// The gore level the blood spurt indexes `UnitBloodLevels` by (`0x60a39d` → `0x6c5b50`, the word
+/// `[0xce8534]`): 0 none, 1 green, 2 true colors. Initially the English cap.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ViolenceLevel(pub(crate) usize);
+
+impl Default for ViolenceLevel {
+    fn default() -> Self {
+        Self(VIOLENCE_CAPS[0] as usize)
+    }
+}
+
+/// `violenceLevel`'s callback (`0x6c5af0`): the integer of the text (`SStrToInt`, `0x64ac60`),
+/// and a value below 0 or above the locale's cap (signed compares, `0x6c5b09`-`0x6c5b1b`) is
+/// stored as the cap. The CVar's own text stays as typed.
+pub(crate) fn on_cvar(
+    ev: &crate::cvars::CvarChanged,
+    mut level: bevy::prelude::Mut<'_, ViolenceLevel>,
+    locale: usize,
+) {
+    if ev.is("violenceLevel") {
+        *level = ViolenceLevel(clamp_violence(
+            benilla_ui::script::s_str_to_int(&ev.new),
+            locale,
+        ));
+    }
+}
+
+fn clamp_violence(value: i32, locale: usize) -> usize {
+    let cap = VIOLENCE_CAPS[locale.min(VIOLENCE_CAPS.len() - 1)];
+    if (0..=cap).contains(&value) {
+        value as usize
+    } else {
+        cap as usize
+    }
+}
+
 /// The victim attachments the spurt hangs on, `0xf` front and `0x10` back (`0x625010`).
 const ATTACH_FRONT: u16 = 15;
 const ATTACH_BACK: u16 = 16;
@@ -76,11 +116,10 @@ pub(super) fn blood_spurts(
     creatures: Option<Res<crate::entities::Creatures>>,
     blood: Option<Res<BloodTables>>,
     visuals: Option<Res<SpellVisuals>>,
-    cvars: Option<Res<crate::cvars::Cvars>>,
+    violence: Res<ViolenceLevel>,
     mut scales: Option<ResMut<super::FxEffectScale>>,
     mut fx: MessageWriter<SpellKitFx>,
 ) {
-    let violence = violence_level(cvars.as_deref());
     let (Some(creatures), Some(blood), Some(visuals)) = (creatures, blood, visuals) else {
         for _ in swings.read() {} // tables not loaded: drain, do not backlog
         return;
@@ -134,7 +173,7 @@ pub(super) fn blood_spurts(
         let large = swing.hit_info & 0x2000 != 0; // crushing picks the large row; a crit does not
         let Some((effect, path)) = blood
             .0
-            .effect_id(blood_id, violence, front, large)
+            .effect_id(blood_id, violence.0, front, large)
             .and_then(|id| visuals.0.effect_path(id).map(|path| (id, path)))
         else {
             info!("blood: dropped — no effect for blood {blood_id} (front {front}, large {large})");
@@ -158,6 +197,8 @@ pub(super) fn blood_spurts(
                 effect,
                 path: path.to_string(),
             }],
+            // A swing's impact, presented in the frame after every packet.
+            at: None,
         });
     }
 }
@@ -167,4 +208,28 @@ fn swing_attacker<'a>(
     swing: &SwingMessage,
 ) -> Option<&'a Transform> {
     transforms.get(swing.attacker).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A value below 0 or above the locale's cap becomes the cap, not 0 (`0x6c5b09`-`0x6c5b1b`);
+    /// koKR's cap is 1.
+    #[test]
+    fn violence_level_clamps_to_the_locale_cap() {
+        for (value, locale, want) in [
+            (2, 0, 2),
+            (1, 0, 1),
+            (0, 0, 0),
+            (3, 0, 2),
+            (-1, 0, 2),
+            (2, 1, 1),
+            (0, 1, 0),
+            (-5, 1, 1),
+            (9, 7, 2),
+        ] {
+            assert_eq!(clamp_violence(value, locale), want, "{value} on {locale}");
+        }
+    }
 }

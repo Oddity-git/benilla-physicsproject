@@ -1,42 +1,17 @@
-//! The per-frame feeds into the VM: the container snapshots built from the player's descriptor,
-//! and the item-tooltip views every window reads.
-
-use std::collections::{HashMap, HashSet};
+//! The per-frame feeds into the VM: the item-tooltip views every window reads; and the one bag
+//! slot's derivation the container getters read at the call ([`resolve_slot`], [`super::bags`]).
 
 use bevy::prelude::*;
 
 use benilla_protocol::ItemInfo;
-use benilla_ui::script::{ContainerSlot, ContainerState, ItemRead, UiScript};
+use benilla_ui::script::{ContainerSlot, ItemRead, UiScript};
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
-use crate::net::{NetCommands, ObjectStore, Objects, SelfPlayer};
+use crate::net::ObjectStore;
 use crate::query_cache::Ask;
-use crate::ui_script::gate;
 
-use super::{
-    find_equip_slot, has_key, keyring_size, BAGS, BAG_SLOT_FIRST, BANK_BAGS, BANK_BAG_ID_FIRST,
-    BANK_CONTAINER, BANK_SLOTS, KEYRING_CONTAINER, KEYRING_SLOTS, PACK_SLOTS,
-};
-
-/// The doll's equipment slots, 0-based descriptor slots 0..=18 (live-API ids 1..=19).
-const WORN_SLOTS: u8 = 19;
-
-/// What the container feed last pushed, so a push happens on change only.
-#[derive(Default)]
-pub(crate) struct FeedMemory {
-    pushed: HashMap<i64, ContainerState>,
-    /// The last `HasKey()` pushed, so its flip is logged once.
-    had_key: bool,
-    /// The worn items' cooldowns last pushed, by live-API slot id.
-    worn_cooldowns: HashMap<usize, (i64, u32, bool)>,
-    /// Counters for the stores whose lazy resolves make `is_changed` always true.
-    items_templates: gate::Watch,
-    cooldown_epoch: gate::Watch,
-    names_generation: gate::Watch,
-    petition_records: gate::Watch,
-    enchant_deadlines: gate::Watch,
-}
+use super::find_equip_slot;
 
 /// What the `$`-tokens read of the caster, the active player for an item's lines (the expander's
 /// pet argument is 0, `0x52da24`): its level for a spell, the per-level terms' level
@@ -55,15 +30,12 @@ impl TokenCaster<'static> {
         level: &|_| 0,
         power_cost: &|_| -1,
         power_per_second: &|d| {
-            crate::spell::usable::per_second_cost(
-                d,
-                crate::spell::SpellLevel::Known(0),
-                &mut crate::spell::Unrecorded,
-            )
+            crate::spell::usable::per_second_cost(d, crate::spell::SpellLevel::Known(0))
         },
     };
 }
 
+#[cfg(test)]
 /// A spell's `$`-substituted description, for item trigger and set-bonus lines. An empty one
 /// yields `None` and the caller drops the whole line, prefix included: the item builder
 /// (`0x52d8a0`) expands it (`0x5075f0`), tests the first byte (`0x52da29`) and on zero skips the
@@ -79,62 +51,56 @@ fn spell_desc_text(
     // The VM's strings for the keyed `$d`/`$s` tokens.
     global: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
+    let parts = spell_desc_parts(spells, id, caster, home_area, gender, mods)?;
+    Some(benilla_formats::resolve_parts(
+        &parts,
+        global,
+        &crate::ui_script::token_printf,
+    ))
+    .filter(|t| !t.is_empty())
+}
+
+/// [`spell_desc_text`]'s expansion with each template a token names left to be read where the
+/// line shows; `None` for no description.
+fn spell_desc_parts(
+    spells: Option<&crate::ui_action::Spells>,
+    id: u32,
+    caster: TokenCaster,
+    home_area: Option<&str>,
+    gender: &dyn Fn() -> u8,
+    mods: Option<&crate::spell::SpellModifiers>,
+) -> Option<Vec<benilla_formats::TokenPart>> {
     let sp = spells?;
     let d = sp.catalog.get(id)?;
-    match d.description.as_deref().filter(|t| !t.is_empty()) {
-        // The builder tests the expanded text, which can be empty from a non-empty template.
-        Some(desc) => {
-            let ctx = benilla_formats::TokenContext {
-                durations: &sp.durations,
-                radii: &sp.radii,
-                ranges: Some(&sp.ranges),
-                level: caster.level,
-                lookup: &|i| sp.catalog.get(i),
-                mods: mods.map(|m| m as &dyn benilla_formats::SpellMods),
-                power_cost: caster.power_cost,
-                power_per_second: caster.power_per_second,
-                unmodified_points: false,
-                gender,
-                home_area: &|| home_area,
-                global,
-                printf: &crate::ui_script::token_printf,
-            };
-            Some(benilla_formats::substitute(desc, d, &ctx)).filter(|t| !t.is_empty())
-        }
-        None => None,
-    }
+    let desc = d.description.as_deref().filter(|t| !t.is_empty())?;
+    let ctx = benilla_formats::TokenContext {
+        durations: &sp.durations,
+        radii: &sp.radii,
+        ranges: Some(&sp.ranges),
+        level: caster.level,
+        lookup: &|i| sp.catalog.get(i),
+        mods: mods.map(|m| m as &dyn benilla_formats::SpellMods),
+        power_cost: caster.power_cost,
+        power_per_second: caster.power_per_second,
+        unmodified_points: false,
+        gender,
+        home_area: &|| home_area,
+        // Never read: the parts leave each template to the read where the line shows.
+        global: &|_| None,
+        printf: &crate::ui_script::token_printf,
+    };
+    Some(benilla_formats::substitute_parts(
+        desc,
+        d,
+        &ctx,
+        benilla_formats::ExpandAt::default(),
+    ))
 }
 
-/// What the `$`-tokens read of the player beside the modifiers: the skills the per-level terms
-/// scale by, and the gender byte `$g`/`$G` branch on (`0x508214`).
-type TokenReads = (crate::spell::SkillSnapshot, u8);
-
-fn token_reads(me: Option<&ObjectStore>) -> TokenReads {
-    let gender = me.and_then(|s| s.0.unit_gender()).unwrap_or(0);
-    (crate::spell::skill_snapshot(me), gender)
-}
-
-/// Only descriptions with substitution tokens can change when the caster's spell mods change.
-fn spell_has_mod_tokens(spells: Option<&crate::ui_action::Spells>, id: u32) -> bool {
-    spells
-        .and_then(|s| s.catalog.get(id))
-        .and_then(|d| d.description.as_deref())
-        .is_some_and(|desc| desc.contains('$'))
-}
-
-fn item_has_mod_tokens(t: &ItemInfo, spells: Option<&crate::ui_action::Spells>) -> bool {
-    t.spells
-        .iter()
-        .any(|slot| slot.spell_id != 0 && spell_has_mod_tokens(spells, slot.spell_id))
-}
-
-fn bonuses_have_mod_tokens(
-    bonuses: &[(u32, u32)],
-    spells: Option<&crate::ui_action::Spells>,
-) -> bool {
-    bonuses
-        .iter()
-        .any(|&(_, spell)| spell_has_mod_tokens(spells, spell))
+/// The active player's `UNIT_FIELD_BYTES_0` byte 2, which `$g`/`$G` branch on (`0x508214`) and
+/// the standing label genders by (`0x612bf0`); 0 with no player.
+fn gender(me: Option<&ObjectStore>) -> u8 {
+    me.and_then(|s| s.0.unit_gender()).unwrap_or(0)
 }
 
 /// The static tables a template view names its ids through, all loaded at startup.
@@ -150,9 +116,64 @@ struct ViewTables<'a> {
     maps: Option<&'a benilla_formats::MapCatalog>,
 }
 
-/// An item template's tooltip view: the wire fields plus the strings only the app resolves, the
-/// trigger-spell text and the skill, spell and reputation requirements.
-fn template_view(
+/// An item record's view with what it reads of the player left open: the view, each spell line's
+/// text empty and the reputation line `None`; each line's description expanded against the caster
+/// as parts, its templates to be read where the line shows; and the reputation line's faction and
+/// gendered label. The host reads it at the call ([`Self::live`]), the VM's copy now
+/// ([`Self::resolved`]).
+pub(super) struct OpenView {
+    view: benilla_ui::script::ItemTemplateView,
+    texts: Vec<Vec<benilla_formats::TokenPart>>,
+    rep: Option<(String, bool)>,
+}
+
+impl OpenView {
+    /// The view with its texts read through `strings` now: a description that comes out empty
+    /// drops its line (`0x52da29`).
+    fn resolved(
+        self,
+        strings: benilla_ui::strings::Strings<'_>,
+    ) -> benilla_ui::script::ItemTemplateView {
+        let OpenView {
+            mut view,
+            texts,
+            rep,
+        } = self;
+        let get = |key: &str| strings.global(key);
+        view.spell_lines = std::mem::take(&mut view.spell_lines)
+            .into_iter()
+            .zip(texts)
+            .filter_map(|(line, parts)| {
+                let text =
+                    benilla_formats::resolve_parts(&parts, &get, &crate::ui_script::token_printf);
+                (!text.is_empty()).then_some(benilla_ui::script::ItemSpellLine { text, ..line })
+            })
+            .collect();
+        view.required_rep_line = rep.and_then(|(faction, female)| {
+            benilla_ui::script::reputation_line(strings, &faction, view.required_rep_rank, female)
+        });
+        view
+    }
+
+    /// The view as the host hands it to a getter at the call, its texts read where they show.
+    pub(super) fn live(self) -> benilla_ui::script::LiveItemView {
+        benilla_ui::script::LiveItemView {
+            view: self.view,
+            spell_texts: self
+                .texts
+                .into_iter()
+                .map(crate::ui_tooltip::tooltip_text)
+                .collect(),
+            rep: self.rep,
+        }
+    }
+}
+
+/// An item template's tooltip view ([`OpenView`]): the wire fields plus the strings only the app
+/// resolves, the trigger-spell texts and the skill, spell and reputation requirements, the texts
+/// read against `caster`, the bind point's `home_area` and the player's `gender`.
+#[allow(clippy::too_many_arguments)] // what the record's lines read, each a store of its own
+fn open_view(
     t: &ItemInfo,
     spells: Option<&crate::ui_action::Spells>,
     mods: Option<&crate::spell::SpellModifiers>,
@@ -161,11 +182,8 @@ fn template_view(
     home_area: Option<&str>,
     // The active player's gender byte, the trigger text's `$g`/`$G` branch (`0x508214`) and the
     // standing label's (`0x612bf0`).
-    gender: &dyn Fn() -> u8,
-    // The VM's own `GlobalStrings.lua`, for the reputation-requirement line and the `$`-engine's
-    // keyed tokens.
-    get: &dyn Fn(&str) -> Option<String>,
-) -> benilla_ui::script::ItemTemplateView {
+    gender: u8,
+) -> OpenView {
     let ViewTables {
         skill_lines,
         factions,
@@ -180,8 +198,33 @@ fn template_view(
             .and_then(|s| s.catalog.get(id))
             .map(|sd| sd.name.clone())
     };
-    let spell_text = |id: u32| spell_desc_text(spells, id, caster, home_area, gender, mods, get);
-    benilla_ui::script::ItemTemplateView {
+    // A block with no description has no lines (`0x52da29`..`0x52da31`).
+    let (spell_lines, texts): (Vec<_>, Vec<_>) = t
+        .spells
+        .iter()
+        .filter(|s| s.spell_id != 0)
+        .filter_map(|s| {
+            let parts = spell_desc_parts(spells, s.spell_id, caster, home_area, &|| gender, mods)?;
+            let line = benilla_ui::script::ItemSpellLine {
+                trigger: s.trigger,
+                spell_id: s.spell_id,
+                text: String::new(),
+                charges: s.charges,
+                block: s.index,
+                recipe: recipe_of(spells, s.spell_id),
+            };
+            Some((line, parts))
+        })
+        .unzip();
+    // `ITEM_REQ_REPUTATION`'s faction (`0x854b8c`): a faction with no row reads the literal
+    // `UNKNOWN` (`0x838044`, `0x52d800`), and the standing's label is gendered (`0x52d80f`).
+    let rep = (t.required_rep_faction != 0).then(|| {
+        let faction = factions
+            .and_then(|c| c.faction_name(t.required_rep_faction))
+            .unwrap_or("UNKNOWN");
+        (faction.to_string(), gender == 1)
+    });
+    let view = benilla_ui::script::ItemTemplateView {
         name: t.name.clone(),
         quality: t.quality,
         class: t.class,
@@ -256,45 +299,11 @@ fn template_view(
         },
         required_honor_rank: t.required_honor_rank,
         required_city_rank: t.required_city_rank,
-        // `ITEM_REQ_REPUTATION`, the reference's key for this line (`0x854b8c`): faction, then
-        // standing; an install missing the key shows no line.
-        required_rep_line: (t.required_rep_faction != 0)
-            .then(|| {
-                // A faction with no row reads the literal `UNKNOWN` (`0x838044`, `0x52d800`); the
-                // label is gendered (`0x52d80f`) and an absent one is empty.
-                let faction = factions
-                    .and_then(|c| c.faction_name(t.required_rep_faction))
-                    .unwrap_or("UNKNOWN");
-                let standing =
-                    benilla_ui::strings::standing_label(get, t.required_rep_rank, gender() == 1);
-                Some(benilla_ui::strings::fill(
-                    &get("ITEM_REQ_REPUTATION")?,
-                    &[
-                        benilla_ui::strings::Arg::S(faction),
-                        benilla_ui::strings::Arg::S(&standing),
-                    ],
-                ))
-            })
-            .flatten(),
+        required_rep_line: None,
         required_rep_faction: t.required_rep_faction,
         required_rep_rank: t.required_rep_rank,
         lock_id: t.lock_id,
-        // A block with no description has no lines (`0x52da29`..`0x52da31`).
-        spell_lines: t
-            .spells
-            .iter()
-            .filter(|s| s.spell_id != 0)
-            .filter_map(|s| {
-                Some(benilla_ui::script::ItemSpellLine {
-                    trigger: s.trigger,
-                    spell_id: s.spell_id,
-                    text: spell_text(s.spell_id)?,
-                    charges: s.charges,
-                    block: s.index,
-                    recipe: recipe_of(spells, s.spell_id),
-                })
-            })
-            .collect(),
+        spell_lines,
         description: t.description.clone(),
         page_text: t.page_text,
         sell_price: t.sell_price,
@@ -316,7 +325,24 @@ fn template_view(
         area: t.area,
         map: t.map,
         teaches: taught_spell(t, spells, skill_lines),
-    }
+    };
+    OpenView { view, texts, rep }
+}
+
+/// [`open_view`] read through `strings` now, as the VM's copy is.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn template_view(
+    t: &ItemInfo,
+    spells: Option<&crate::ui_action::Spells>,
+    mods: Option<&crate::spell::SpellModifiers>,
+    caster: TokenCaster,
+    tables: ViewTables,
+    home_area: Option<&str>,
+    gender: &dyn Fn() -> u8,
+    strings: benilla_ui::strings::Strings<'_>,
+) -> benilla_ui::script::ItemTemplateView {
+    open_view(t, spells, mods, caster, tables, home_area, gender()).resolved(strings)
 }
 
 /// A block's recipe (`0x52daf5`..`0x52db25`): its spell's Effect[0] is 36, and the spell that
@@ -363,147 +389,66 @@ fn taught_spell(
     })
 }
 
-/// Answers the engine's set-id asks from `ItemSet.dbc`: member names from the item-name store, each
-/// miss queried as the reference queries set members, and bonus text from the `$`-engine. A set
-/// stays pending, re-pushing, until every member resolves.
-pub(super) fn feed_item_sets(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    sets: Option<Res<super::ItemSets>>,
-    items: Res<Items>,
-    item_names: Res<crate::item_names::ItemNames>,
-    commands: Res<NetCommands>,
-    spells: Option<Res<crate::ui_action::Spells>>,
-    spell_mods: Res<crate::spell::SpellModifiers>,
-    skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
-    self_q: Query<&ObjectStore, With<SelfPlayer>>,
-    mut pending: Local<
-        crate::ui_script::VmMemo<std::collections::HashMap<u32, benilla_ui::script::ItemSetView>>,
-    >,
-    mut mod_sensitive: Local<crate::ui_script::VmMemo<HashSet<u32>>>,
-    mut last_reads: Local<crate::ui_script::VmMemo<Option<TokenReads>>>,
-) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        let pending = pending.get(script);
-        let mod_sensitive = mod_sensitive.get(script);
-        let me = self_q.single().ok();
-        // The build's asks are its lookups with a callback (`0x52bf60`): their members are asked,
-        // a refused one again; a set carried since only reads.
-        let asked: HashSet<u32> = script.take_item_set_asks().into_iter().collect();
-        for &id in &asked {
-            pending.entry(id).or_default();
-        }
-        // The `$`-tokens follow the player's skills and gender.
-        let reads = token_reads(me);
-        let gender = reads.1;
-        let reads_changed = last_reads.get(script).as_ref() != Some(&reads);
-        *last_reads.get(script) = Some(reads);
-        if spell_mods.is_changed() || reads_changed {
-            for &id in mod_sensitive.iter() {
-                pending.entry(id).or_default();
-            }
-        }
-        if pending.is_empty() {
-            return;
-        }
-        let Some(sets) = sets.as_deref() else {
-            return; // no catalog without client data: the asks stay parked
-        };
-        let spell_res = spells.as_deref();
-        let skill_catalog = skill_lines.as_deref().map(|s| &s.catalog);
-        let skills = crate::spell::PlayerSkills {
-            lines: skill_catalog,
-            spells: spell_res.map(|s| &s.catalog),
-            items: Some(&items),
-        };
-        let level = |d: &benilla_formats::SpellDisplay| {
-            crate::spell::player_spell_level(me, skills, d, &mut crate::spell::Unrecorded)
-        };
-        let power_cost = |d: &benilla_formats::SpellDisplay| {
-            me.map_or(-1, |s| {
-                crate::spell::usable::power_cost(
-                    d,
-                    s,
-                    skills,
-                    &spell_mods,
-                    &mut crate::spell::Unrecorded,
-                )
+/// Set `set_id`'s block as the set block reads it at the call (`0x52d8a0..0x52e0f5`): the
+/// `ItemSet.dbc` row, the members named off the item-name cache, only read (the build asks each
+/// one still unnamed in its call, `0x52df4b`), the skill line and the bonuses' descriptions
+/// expanded against the active player, `me`; `None` for no row.
+pub(super) fn item_set_live(
+    set_id: u32,
+    sets: &super::ItemSets,
+    item_names: &crate::item_names::ItemNames,
+    spells: Option<&crate::ui_action::Spells>,
+    spell_mods: Option<&crate::spell::SpellModifiers>,
+    skill_lines: Option<&crate::ui_spellbook::SkillLines>,
+    items: Option<&Items>,
+    me: Option<&ObjectStore>,
+) -> Option<benilla_ui::script::LiveItemSet> {
+    let row = sets.0.set(set_id)?;
+    let skill_catalog = skill_lines.map(|s| &s.catalog);
+    let skills = crate::spell::PlayerSkills {
+        lines: skill_catalog,
+        spells: spells.map(|s| &s.catalog),
+        items,
+    };
+    let level = |d: &benilla_formats::SpellDisplay| crate::spell::player_spell_level(me, skills, d);
+    let power_cost = |d: &benilla_formats::SpellDisplay| match (me, spell_mods) {
+        (Some(s), Some(mods)) => crate::spell::usable::power_cost(d, s, skills, mods),
+        _ => -1,
+    };
+    let power_per_second = |d: &benilla_formats::SpellDisplay| {
+        let level = crate::spell::SpellLevel::Player { me, skills };
+        crate::spell::usable::per_second_cost(d, level)
+    };
+    let caster = TokenCaster {
+        level: &level,
+        power_cost: &power_cost,
+        power_per_second: &power_per_second,
+    };
+    // The `$g`/`$G` branch reads our gender (`0x508214`).
+    let gender = gender(me);
+    Some(benilla_ui::script::LiveItemSet {
+        view: benilla_ui::script::ItemSetView {
+            name: row.name.clone(),
+            members: set_members(&row.items, item_names, Ask::Read),
+            bonuses: Vec::new(),
+            required_skill: row.required_skill,
+            required_skill_rank: row.required_skill_rank,
+            required_skill_name: (row.required_skill != 0)
+                .then(|| {
+                    skill_catalog
+                        .and_then(|sl| sl.line(row.required_skill))
+                        .map(|l| l.name.clone())
+                })
+                .flatten(),
+        },
+        bonuses: row
+            .bonuses
+            .iter()
+            .filter_map(|&(n, spell)| {
+                let parts = spell_desc_parts(spells, spell, caster, None, &|| gender, spell_mods)?;
+                Some((n, crate::ui_tooltip::tooltip_text(parts)))
             })
-        };
-        let power_per_second = |d: &benilla_formats::SpellDisplay| {
-            let level = crate::spell::SpellLevel::Player { me, skills };
-            crate::spell::usable::per_second_cost(d, level, &mut crate::spell::Unrecorded)
-        };
-        let caster = TokenCaster {
-            level: &level,
-            power_cost: &power_cost,
-            power_per_second: &power_per_second,
-        };
-        let mut done: Vec<u32> = Vec::new();
-        let mut push: Vec<(u32, benilla_ui::script::ItemSetView)> = Vec::new();
-        // Its borrow of the VM ends before the push, which needs the VM mutably.
-        let global = |key: &str| benilla_ui::strings::global(script.lua(), key);
-        for (&set_id, last) in pending.iter_mut() {
-            let Some(row) = sets.0.set(set_id) else {
-                done.push(set_id); // no such row: drop the ask
-                continue;
-            };
-            if bonuses_have_mod_tokens(&row.bonuses, spell_res) {
-                mod_sensitive.insert(set_id);
-            } else {
-                mod_sensitive.remove(&set_id);
-            }
-            let ask = if asked.contains(&set_id) {
-                Ask::Event(&commands)
-            } else {
-                Ask::Read
-            };
-            let members = set_members(&row.items, &item_names, ask);
-            let view = benilla_ui::script::ItemSetView {
-                name: row.name.clone(),
-                bonuses: row
-                    .bonuses
-                    .iter()
-                    .filter_map(|&(n, spell)| {
-                        spell_desc_text(
-                            spell_res,
-                            spell,
-                            caster,
-                            None,
-                            &|| gender,
-                            Some(&spell_mods),
-                            &global,
-                        )
-                        .map(|desc| (n, desc))
-                    })
-                    .collect(),
-                required_skill: row.required_skill,
-                required_skill_rank: row.required_skill_rank,
-                required_skill_name: (row.required_skill != 0)
-                    .then(|| {
-                        skill_catalog
-                            .and_then(|sl| sl.line(row.required_skill))
-                            .map(|l| l.name.clone())
-                    })
-                    .flatten(),
-                members,
-            };
-            if view.members.iter().all(|(_, n)| n.is_some()) {
-                done.push(set_id);
-            }
-            if *last != view {
-                *last = view.clone();
-                push.push((set_id, view));
-            }
-        }
-        for (id, view) in push {
-            script.set_item_set(id, view);
-        }
-        for id in done {
-            pending.remove(&id);
-        }
+            .collect(),
     })
 }
 
@@ -521,26 +466,17 @@ pub(super) fn set_members(
 
 /// Pushes the whole random-suffix table once per VM, when both catalogs are in, and the enchant
 /// names once the enchant catalog is: their consumers are click-driven, and a chat-link tooltip
-/// has no hover loop to repaint a late answer.
+/// has no hover loop to repaint a late answer. Both are load-once tables no packet writes.
 pub(super) fn feed_random_properties(
-    // The table is the host's too: a trade scan's placed row reads its rolls.
-    mut vm: crate::script_calls::VmWith<Option<ResMut<'static, crate::items::RandomProperties>>>,
+    mut vm: crate::script_calls::VmWith<Option<Res<'static, crate::items::RandomProperties>>>,
     enchants: Option<Res<crate::items::Enchants>>,
     mut pushed: Local<crate::ui_script::VmMemo<bool>>,
     mut names_pushed: Local<crate::ui_script::VmMemo<bool>>,
 ) {
-    vm.turn(|script, mut props| {
+    vm.turn(|script, props| {
         let Some(script) = script else {
             return;
         };
-        // The name formatter's `ITEM_SUFFIX_TEMPLATE` (`0x5d8b78`), as `FrameScript_GetText` reads
-        // it (`0x703bf0`); written only on a change, so the name feeds rebuild then alone.
-        if let Some(props) = props.as_mut() {
-            let template = script.global_text("ITEM_SUFFIX_TEMPLATE");
-            if props.suffix_template.as_deref() != Some(template.as_str()) {
-                props.suffix_template = Some(template);
-            }
-        }
         // The enchant names a link's bare id reads (`0x52c9f2`): every named row, as the builder's
         // loop tests no flag before it prints the name (`0x52ca23`..`0x52ca8b`).
         if let Some(enchants) = enchants.as_deref() {
@@ -572,78 +508,293 @@ pub(super) fn feed_random_properties(
     })
 }
 
-/// The item-tooltip feed: every template that lands is pushed unprompted, and a new VM is seated
-/// with every cached one, so the first hover never misses, as the reference reads one item cache
-/// synchronously that a `/reload` keeps. A miss the VM asked for is the
-/// getter's lookup with a callback, which queries it here and asks a refused one again; a miss
-/// `GetItemInfo` read is served from the cache and never queried (`0x48e172`).
-pub(super) fn feed_item_stats(
-    mut vm: crate::script_calls::VmWith<ResMut<'static, Items>>,
-    commands: Res<NetCommands>,
-    spells: Option<Res<crate::ui_action::Spells>>,
-    // The caster the `$`-tokens read: its spell modifiers and its skills.
-    (spell_mods, self_q): CasterReads,
-    skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
-    // The `$z` token: the bind point's area (`SMSG_BINDPOINTUPDATE`), named through `AreaTable`.
-    home_bind: Option<Res<crate::net::HomeBind>>,
-    (area_names, maps): (
-        Option<Res<crate::ui_quest_log::QuestHeaderNamesRes>>,
-        Option<Res<benilla_assets::MapCatalogRes>>,
-    ),
-    factions: Option<Res<crate::target::Factions>>,
-    sub_classes: Option<Res<super::ItemSubClasses>>,
-    // `GetItemInfo`'s `itemType` and `itemTexture`.
-    classes: Option<Res<super::ItemClasses>>,
-    icons: Option<Res<ItemDisplays>>,
-    mut pending: Local<crate::ui_script::VmMemo<std::collections::HashSet<u32>>>,
-    // The views built from the player beyond the template, rebuilt when what they read moves.
-    mut reads_player: Local<crate::ui_script::VmMemo<HashSet<u32>>>,
-    mut last_home: Local<crate::ui_script::VmMemo<Option<String>>>,
-    mut last_reads: Local<crate::ui_script::VmMemo<Option<TokenReads>>>,
+/// The name formatter's `ITEM_SUFFIX_TEMPLATE` (`0x5d8b7f` → `0x703bf0`), read off the VM as
+/// `FrameScript_GetText` reads it, into the copy every surface names through
+/// ([`crate::items::RandomProperties::suffix_template`]), once the frame's Lua has run: a handler
+/// holds no VM to read it at its call, so a script's write reaches the names the next frame's
+/// packets compose. Written only on a change, so the name feeds rebuild then alone.
+pub(super) fn copy_suffix_template(
+    script: Option<NonSend<UiScript>>,
+    props: Option<ResMut<crate::items::RandomProperties>>,
 ) {
-    vm.turn(|script, mut items| {
+    let (Some(script), Some(mut props)) = (script, props) else {
+        return;
+    };
+    let template = script.global_text("ITEM_SUFFIX_TEMPLATE");
+    if props.suffix_template.as_deref() != Some(template.as_str()) {
+        props.suffix_template = Some(template);
+    }
+}
+
+/// What an item record's view reads beside the record and the player ([`open_view`]): the spells
+/// its trigger lines name and the tables its ids are named through, all loaded at startup.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct RecordViews<'w> {
+    spells: Option<Res<'w, crate::ui_action::Spells>>,
+    skill_lines: Option<Res<'w, crate::ui_spellbook::SkillLines>>,
+    places: (
+        Option<Res<'w, crate::ui_quest_log::QuestHeaderNamesRes>>,
+        Option<Res<'w, benilla_assets::MapCatalogRes>>,
+    ),
+    factions: Option<Res<'w, crate::target::Factions>>,
+    sub_classes: Option<Res<'w, super::ItemSubClasses>>,
+    // `GetItemInfo`'s `itemType` and `itemTexture`.
+    classes: Option<Res<'w, super::ItemClasses>>,
+    icons: Option<Res<'w, ItemDisplays>>,
+}
+
+impl RecordViews<'_> {
+    /// Zone `id`'s `AreaTable` name, the bind point's for `$z` and `GetBindLocation`
+    /// (`0x48daf4`-`0x48db07`, `0x507f18`-`0x507f2b`).
+    fn area_name(&self, id: u32) -> Option<&str> {
+        self.places.0.as_deref()?.0.resolve(id as i32)
+    }
+
+    /// `t`'s view with its texts read against `me`, the active player, its spell modifiers `mods`
+    /// and the bind point's `home_area`: no player reads every level 0 and no cost (`0x6e3233`).
+    fn open(
+        &self,
+        t: &ItemInfo,
+        items: &Items,
+        me: Option<&ObjectStore>,
+        mods: Option<&crate::spell::SpellModifiers>,
+        home_area: Option<&str>,
+    ) -> OpenView {
+        let spell_res = self.spells.as_deref();
+        let skill_catalog = self.skill_lines.as_deref().map(|s| &s.catalog);
+        let skills = crate::spell::PlayerSkills {
+            lines: skill_catalog,
+            spells: spell_res.map(|s| &s.catalog),
+            items: Some(items),
+        };
+        let level =
+            |d: &benilla_formats::SpellDisplay| crate::spell::player_spell_level(me, skills, d);
+        let power_cost = |d: &benilla_formats::SpellDisplay| match (me, mods) {
+            (Some(s), Some(mods)) => crate::spell::usable::power_cost(d, s, skills, mods),
+            _ => -1,
+        };
+        let power_per_second = |d: &benilla_formats::SpellDisplay| {
+            let level = crate::spell::SpellLevel::Player { me, skills };
+            crate::spell::usable::per_second_cost(d, level)
+        };
+        let caster = TokenCaster {
+            level: &level,
+            power_cost: &power_cost,
+            power_per_second: &power_per_second,
+        };
+        let tables = ViewTables {
+            skill_lines: skill_catalog,
+            factions: self.factions.as_deref().map(|f| f.catalog()),
+            sub_classes: self.sub_classes.as_deref().map(|s| &s.0),
+            classes: self.classes.as_deref().map(|c| &c.0),
+            icons: self.icons.as_deref(),
+            areas: self.places.0.as_deref().map(|a| &a.0),
+            maps: self.places.1.as_deref().map(|m| &m.0),
+        };
+        open_view(t, spell_res, mods, caster, tables, home_area, gender(me))
+    }
+
+    /// The VM's copy of each of `ids` the cache holds, its texts read against no player and no
+    /// bind point: a getter with the host lent builds its record's view at the call
+    /// ([`ItemViewLive`]), so the copy's texts serve a VM with no host alone.
+    fn build(
+        &self,
+        items: &Items,
+        script: &UiScript,
+        ids: impl IntoIterator<Item = u32>,
+    ) -> Vec<(u32, benilla_ui::script::ItemTemplateView)> {
+        let strings = benilla_ui::strings::Strings::Vm(script.lua());
+        ids.into_iter()
+            .filter_map(|id| {
+                let t = items.template(id, 0, Ask::Read)?;
+                Some((id, self.open(t, items, None, None, None).resolved(strings)))
+            })
+            .collect()
+    }
+}
+
+/// Seat record `entry`'s copy in the VM from the cache, for a lookup that found the copy behind the
+/// cache with no host lent to read the cache through: the VM reads the record the cache holds, as
+/// the reference's lookup does (`0x55ba30`). Whether the cache held it.
+pub(crate) fn seat_record(
+    script: &mut UiScript,
+    views: &RecordViews,
+    items: &Items,
+    entry: u32,
+) -> bool {
+    let Some((id, view)) = views.build(items, script, [entry]).pop() else {
+        return false;
+    };
+    script.set_item_template(id, view);
+    true
+}
+
+/// The item records as a getter reads them at the call, the call host's half of
+/// [`benilla_ui::script::ItemViewQuery`]: each built off the item cache (`0x55ba30`) with its
+/// spell lines expanded against the active player as of the drain's place, its spell modifiers
+/// and the bind point as they stand, as the tooltip build expands each at the build (`0x5075f0`
+/// at `0x52da24`), so a listener's build reads what its own packet left; and the bind point's
+/// area `GetBindLocation` reads (`0x48dae3` → `0x5ed420`,
+/// [`benilla_ui::script::BindLocationQuery`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct ItemViewLive<'w, 's> {
+    items: Res<'w, Items>,
+    views: RecordViews<'w>,
+    spell_mods: Option<Res<'w, crate::spell::SpellModifiers>>,
+    home_bind: Option<Res<'w, crate::net::HomeBind>>,
+    objects: crate::net::Objects<'w, 's>,
+    stores: crate::ui_unit::views::ViewStores<'w, 's>,
+}
+
+impl ItemViewLive<'_, '_> {
+    /// The bind point's area name, `None` before `SMSG_BINDPOINTUPDATE` or for a zone with no
+    /// row.
+    fn home_area(&self) -> Option<&str> {
+        self.home_bind
+            .as_deref()
+            .and_then(|b| b.0)
+            .and_then(|id| self.views.area_name(id))
+    }
+
+    /// Record `entry`'s view now, `None` for a record the cache lacks.
+    fn view(&self, entry: u32) -> Option<benilla_ui::script::LiveItemView> {
+        let t = self.items.template(entry, 0, Ask::Read)?;
+        let me = self.objects.player().and_then(|e| self.stores.get(e).ok());
+        let open = self.views.open(
+            t,
+            &self.items,
+            me,
+            self.spell_mods.as_deref(),
+            self.home_area(),
+        );
+        Some(open.live())
+    }
+}
+
+impl crate::script_calls::live::LiveFamily for ItemViewLive<'_, '_> {
+    fn answer(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+        ask.answer(|q: &benilla_ui::script::ItemViewQuery| Some(self.view(q.0)))
+            || ask.answer(|_: &benilla_ui::script::BindLocationQuery| {
+                Some(self.home_area().map(str::to_string))
+            })
+    }
+}
+
+/// `ItemCacheReceive` (`0x55bdb0`) stores the answer in its node (`0x55bef6`, the valid byte at
+/// `0x55befb`) before it runs a callback (`0x55bf39`), so a callback that reads the cache reads
+/// the record: the VM's copy of the record lands here, at its packet, ahead of the callbacks
+/// ([`crate::net::objects`]), and a refusal of a held one drops it. The change is the VM's then,
+/// which the item-tooltip feed does not push again ([`Items::vm_took`]).
+pub(crate) fn push_answered_record(
+    In(entry): In<u32>,
+    mut vm: crate::script_calls::VmWith<(ResMut<'static, Items>, RecordViews<'static>)>,
+) {
+    vm.turn(|script, (mut items, views)| {
         let Some(script) = script else {
             return;
         };
-        let (pending, new_vm) = pending.get_reset(script);
-        if new_vm {
-            pending.extend(items.cached_template_ids());
+        match views.build(&items, script, [entry]).pop() {
+            Some((id, view)) => script.set_item_template(id, view),
+            None if !items.template_answered(entry) => return,
+            None => script.drop_item_template(entry),
         }
-        let reads_player = reads_player.get(script);
-        let last_home = last_home.get(script);
-        let me = self_q.single().ok();
-        // The `$`-tokens follow the player's skills and gender.
-        let reads = token_reads(me);
-        let gender = reads.1;
-        let reads_changed = last_reads.get(script).as_ref() != Some(&reads);
-        *last_reads.get(script) = Some(reads);
-        // `GetBindLocation()`'s push, here so it and the `$z` token share one name, and ahead of
-        // the pending gate below: the bind point can arrive while the feed idles.
-        let home_area: Option<&str> = home_bind
-            .as_deref()
-            .and_then(|b| b.0)
-            .and_then(|id| area_names.as_deref()?.0.resolve(id as i32));
-        // Pushed on change, per VM: a rebuilt VM is fed again the frame it appears.
-        if last_home.as_deref() != home_area {
-            script.set_bind_location(home_area.unwrap_or_default());
-            *last_home = home_area.map(str::to_string);
-            // Re-substitute every held view, or one pushed before the bind point carries a raw
-            // `$z`.
-            pending.extend(items.cached_template_ids());
-        }
+        items.vm_took(entry);
+    });
+}
 
-        // A refusal on a held record removed it from the cache (`0x556f35`): the VM's copy goes.
-        // Drained only when either holds an entry, so a quiet frame leaves the cache unchanged.
-        if items.any_fresh_or_dropped() {
-            for id in items.take_dropped() {
-                pending.remove(&id);
-                script.drop_item_template(id);
+/// The quest log's callback (`0x4e0830`) on a found record, at its place in the entry's list
+/// ([`crate::net::objects`]): a `QUEST_LOG_UPDATE` for each record the VM's lookups missed
+/// (`0x4e083a`, [`UiScript::flush_quest_log_refires`]), fired there, a step in its place
+/// ([`crate::lanes::step`]).
+pub(crate) fn quest_log_answered(world: &mut World) {
+    fn flush(mut vm: crate::script_calls::HostedVm) {
+        vm.run(|script| {
+            if let Some(script) = script {
+                script.flush_quest_log_refires();
             }
-            pending.extend(items.take_fresh());
+        });
+    }
+    crate::lanes::step(world, |world| {
+        if let Err(err) = crate::script_calls::run_cached(world, flush) {
+            debug!("ui_items: the quest log's record callback did not run: {err}");
         }
-        for id in script.take_item_stat_asks() {
-            items.template(id, 0, Ask::Event(&commands));
-            pending.insert(id);
+    });
+}
+
+/// The tooltips' callbacks (`0x52e530`, `0x52f820`) on a found record, at its place in the
+/// entry's list ([`crate::net::objects`]): the rebuilds run on the item lane there
+/// ([`UiScript::answer_item_tooltips`]).
+pub(crate) fn tooltips_answered(world: &mut World, entry: u32) {
+    if let Some(mut lane) = world.get_resource_mut::<crate::item_lane::ItemLane>() {
+        lane.push(crate::item_watch::Run {
+            notice: Some(crate::item_watch::ItemNotice::TooltipRecord { entry }),
+            ..Default::default()
+        });
+    }
+}
+
+/// The change count each VM's copy of the item records has taken in ([`Items::changed_since`]):
+/// set where a new interface's load seats the copy ([`seed_vm_item_records`]), then carried on by
+/// [`feed_item_stats`]. A VM no load seated has none.
+#[derive(Resource, Default)]
+pub(crate) struct VmItemRecords(crate::ui_script::VmMemo<Option<u64>>);
+
+/// A new interface's copy of the item records, seated at its load before any file or event runs:
+/// every record the cache holds, so its files and the listeners of the login's first packets read
+/// it whole, as the reference's interface reads the one item cache a `/reload` keeps from its
+/// first file (`0x55ba30`). The copy's texts read no player and the VM's strings as they stand,
+/// none yet: they serve a VM with no host alone, as every getter of a hosted VM reads its
+/// record's lines through the host at the call ([`ItemViewLive`]).
+pub(crate) fn seed_vm_item_records(world: &mut World, script: &mut UiScript) {
+    let mut state = bevy::ecs::system::SystemState::<(Option<Res<Items>>, RecordViews)>::new(world);
+    let (items, views) = state.get(world);
+    let Some(items) = items else {
+        return;
+    };
+    let count = items.change_count();
+    let built = views.build(&items, script, items.cached_template_ids());
+    for (id, view) in built {
+        script.set_item_template(id, view);
+    }
+    *world.get_resource_or_init::<VmItemRecords>().0.get(script) = Some(count);
+}
+
+/// The item-record feed: the records that land or go outside an answer, a cache file's load and
+/// another realm's forget, carried into the VM's copy, and the ones `GetItemInfo` or a link verb
+/// read that the copy lacked, served from the cache (`0x48e172`); a VM no load seated is seated
+/// whole first. None of it is a packet's: an answer's record reaches the copy at its packet, ahead
+/// of its callbacks ([`push_answered_record`]), a getter's miss asks inside its call through the
+/// host (`0x55ba30`), and the cache's file is loaded at the character's pick, ahead of the world
+/// entry's load. The copy's texts read no player ([`RecordViews::build`]).
+pub(super) fn feed_item_stats(
+    mut vm: crate::script_calls::VmWith<(
+        Res<'static, Items>,
+        RecordViews<'static>,
+        ResMut<'static, VmItemRecords>,
+    )>,
+    mut pending: Local<crate::ui_script::VmMemo<std::collections::HashSet<u32>>>,
+) {
+    vm.turn(|script, (items, views, mut seated)| {
+        let Some(script) = script else {
+            return;
+        };
+        let pending = pending.get(script);
+        let cursor = seated.0.get(script).get_or_insert_with(|| {
+            pending.extend(items.cached_template_ids());
+            items.change_count()
+        });
+        // A landed record is pushed unprompted; a refusal on a held record removed it from the
+        // cache (`0x556f35`), and the VM's copy goes.
+        if *cursor != items.change_count() {
+            for (id, held) in items.changed_since(*cursor) {
+                if held {
+                    pending.insert(id);
+                } else {
+                    pending.remove(&id);
+                    script.drop_item_template(id);
+                }
+            }
+            *cursor = items.change_count();
         }
         // A read the cache misses has nothing to push; a later landing pushes it unprompted.
         pending.extend(
@@ -652,42 +803,9 @@ pub(super) fn feed_item_stats(
                 .into_iter()
                 .filter(|&id| items.template(id, 0, Ask::Read).is_some()),
         );
-        if spell_mods.is_changed() || reads_changed {
-            pending.extend(reads_player.iter().copied());
-        }
         if pending.is_empty() {
             return;
         }
-        let spell_res = spells.as_deref();
-        let skill_catalog = skill_lines.as_deref().map(|s| &s.catalog);
-        let skills = crate::spell::PlayerSkills {
-            lines: skill_catalog,
-            spells: spell_res.map(|s| &s.catalog),
-            items: Some(&items),
-        };
-        let level = |d: &benilla_formats::SpellDisplay| {
-            crate::spell::player_spell_level(me, skills, d, &mut crate::spell::Unrecorded)
-        };
-        let power_cost = |d: &benilla_formats::SpellDisplay| {
-            me.map_or(-1, |s| {
-                crate::spell::usable::power_cost(
-                    d,
-                    s,
-                    skills,
-                    &spell_mods,
-                    &mut crate::spell::Unrecorded,
-                )
-            })
-        };
-        let power_per_second = |d: &benilla_formats::SpellDisplay| {
-            let level = crate::spell::SpellLevel::Player { me, skills };
-            crate::spell::usable::per_second_cost(d, level, &mut crate::spell::Unrecorded)
-        };
-        let caster = TokenCaster {
-            level: &level,
-            power_cost: &power_cost,
-            power_per_second: &power_per_second,
-        };
         let ready: Vec<u32> = pending
             .iter()
             .copied()
@@ -695,211 +813,32 @@ pub(super) fn feed_item_stats(
             .collect();
         // Built first, pushed after: the lookup borrows the VM that `set_item_template` needs
         // mutably.
-        let views: Vec<(u32, benilla_ui::script::ItemTemplateView)> = {
-            let get = |key: &str| {
-                script
-                    .lua()
-                    .globals()
-                    .get::<String>(key)
-                    .ok()
-                    .filter(|t| !t.is_empty())
-            };
-            ready
-                .into_iter()
-                .filter_map(|id| {
-                    pending.remove(&id);
-                    let t = items.template(id, 0, Ask::Read)?.clone();
-                    // The standing label reads the gender too.
-                    if item_has_mod_tokens(&t, spell_res) || t.required_rep_faction != 0 {
-                        reads_player.insert(id);
-                    } else {
-                        reads_player.remove(&id);
-                    }
-                    let tables = ViewTables {
-                        skill_lines: skill_catalog,
-                        factions: factions.as_deref().map(|f| f.catalog()),
-                        sub_classes: sub_classes.as_deref().map(|s| &s.0),
-                        classes: classes.as_deref().map(|c| &c.0),
-                        icons: icons.as_deref(),
-                        areas: area_names.as_deref().map(|a| &a.0),
-                        maps: maps.as_deref().map(|m| &m.0),
-                    };
-                    let view = template_view(
-                        &t,
-                        spell_res,
-                        Some(&spell_mods),
-                        caster,
-                        tables,
-                        home_area,
-                        &|| gender,
-                        &get,
-                    );
-                    Some((id, view))
-                })
-                .collect()
-        };
-        for (id, view) in views {
+        let built = views.build(&items, script, ready);
+        for (id, view) in built {
+            pending.remove(&id);
             script.set_item_template(id, view);
         }
+        // The quest log's item callbacks (`0x4e0830`) on the records the push carried, once each.
+        script.flush_quest_log_refires();
     })
 }
 
-/// What the `$`-tokens read of the caster.
-type CasterReads<'w, 's> = (
-    Res<'w, crate::spell::SpellModifiers>,
-    Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
-);
-
-/// The player state the tooltip's red requirement lines check: level, class, race, skills,
-/// proficiencies (`SMSG_SET_PROFICIENCY`), reputation ranks (the DBC base plus the
-/// `SMSG_INITIALIZE_FACTIONS` standing), honor rank and medals, the known spells, and the
-/// skinning value the unit tooltip colours by, pushed on change.
-pub(super) fn feed_player_req(
-    // The reputation slots, which a call can write: an engine turn.
-    mut vm: crate::script_calls::VmWith<Res<'static, crate::net::Reputations>>,
-    self_q: Query<&ObjectStore, With<SelfPlayer>>,
-    changed_self: Query<(), (With<SelfPlayer>, Changed<ObjectStore>)>,
-    proficiencies: Res<crate::net::Proficiencies>,
-    factions: Option<Res<crate::target::Factions>>,
-    actions: Res<crate::ui_action::PlayerActions>,
-    spells: Option<Res<crate::ui_action::Spells>>,
-    // The skinning latch `[0xb700e4]` and the line its value scales by.
-    skinning: (
-        Res<crate::ui_action::LearnedAbilities>,
-        Option<Res<crate::ui_spellbook::SkillLines>>,
-    ),
-    mut last: Local<crate::ui_script::VmMemo<Option<benilla_ui::script::PlayerReqState>>>,
-) {
-    vm.turn(|script, reputations| {
-        let (learned, skill_lines) = skinning;
-        let Some(script) = script else {
-            return;
-        };
-        let (last, vm_reset) = last.get_reset(script);
-        // The state is a function of these inputs alone.
-        let self_changed = !changed_self.is_empty();
-        let prof_changed = proficiencies.is_changed();
-        let reps_changed = reputations.is_changed();
-        let factions_changed = factions.as_ref().is_some_and(|r| r.is_changed());
-        let actions_changed = actions.is_changed();
-        let spells_changed = spells.as_ref().is_some_and(|r| r.is_changed());
-        let learned_changed = learned.is_changed();
-        let lines_changed = skill_lines.as_ref().is_some_and(|r| r.is_changed());
-        gate::trace(
-            "feed_player_req",
-            &[
-                ("vm_reset", vm_reset),
-                ("self", self_changed),
-                ("proficiencies", prof_changed),
-                ("reputations", reps_changed),
-                ("factions", factions_changed),
-                ("actions", actions_changed),
-                ("spells", spells_changed),
-                ("learned", learned_changed),
-                ("skill_lines", lines_changed),
-            ],
-        );
-        let gate = gate::Gate::new(
-            vm_reset
-                || self_changed
-                || prof_changed
-                || reps_changed
-                || factions_changed
-                || actions_changed
-                || spells_changed
-                || learned_changed
-                || lines_changed,
-        );
-        if gate.skip() {
-            return;
-        }
-        // The known-spell set the item tooltip's known-recipe line tests (`0x60c740`), the whole
-        // book: a recipe's taught craft is a spell the spellbook does not list.
-        if vm_reset || actions_changed {
-            script.set_known_spells(actions.spells.iter().copied().collect());
-        }
-        let Some(store) = self_q.iter().next() else {
-            return;
-        };
-        let mut skills = std::collections::HashMap::new();
-        for slot in 0..benilla_protocol::messages::PLAYER_SKILL_SLOTS {
-            let Some(s) = store.0.player_skill(slot) else {
-                continue;
-            };
-            if s.skill_id != 0 {
-                // The requirement checks (`0x5eaae0`, `0x5ea930`) read the value plus the permanent
-                // bonus, never the temporary one; the bonus is never negative in live data.
-                skills.insert(
-                    u32::from(s.skill_id),
-                    u32::from(s.value).saturating_add_signed(i32::from(s.perm_bonus)),
-                );
-            }
-        }
-        let race = store.0.unit_race().unwrap_or(0);
-        let class = store.0.unit_class().unwrap_or(0);
-        let mut rep_ranks = std::collections::HashMap::new();
-        if let Some(cat) = factions.as_deref().map(|f| f.catalog()) {
-            for (id, info) in cat.reputation_factions() {
-                let standing =
-                    usize::try_from(info.rep_index).map_or(0, |i| reputations.standing(i));
-                rep_ranks.insert(
-                    id,
-                    benilla_formats::reputation_rank(info.base_for(race, class) + standing),
-                );
-            }
-        }
-        let can_dual_wield = actions.knows_dual_wield(spells.as_deref());
-        // The skinnable line's value (`0x529f06`-`0x529f58`): the latched spell's first `SKINNING`
-        // effect, its points at the player's skill in the spell's line, kept only above 0.
-        let skinning = learned
-            .skinning
-            .and_then(|id| {
-                let d = spells.as_deref()?.catalog.get(id)?;
-                let e = d
-                    .effects
-                    .iter()
-                    .position(|&e| e == benilla_formats::SPELL_EFFECT_SKINNING)?;
-                let catalog = skill_lines.as_deref().map(|s| &s.catalog);
-                let skill = crate::spell::spell_skill_value(Some(store), catalog, id);
-                Some(d.effect_points_int(e, skill))
-            })
-            .filter(|&v| v > 0);
-        let state = benilla_ui::script::PlayerReqState {
-            level: store.0.unit_level().unwrap_or(0),
-            class_id: u32::from(class),
-            race_id: u32::from(race),
-            skills,
-            proficiency: proficiencies.0.clone(),
-            rep_ranks,
-            can_dual_wield,
-            honor_rank: store.0.player_honor_rank().unwrap_or(0),
-            pvp_medals: store.0.player_pvp_medals().unwrap_or(0),
-            skinning,
-        };
-        if last.as_ref() != Some(&state) {
-            gate.audit("feed_player_req", "the player-requirement state");
-            *last = Some(state.clone());
-            script.set_player_req_state(state);
-        }
-    })
-}
-
-/// One bag slot from its item guid: instance, template, icon and use-spell cooldown. `None` is an
-/// empty slot or one whose item object has not streamed; an occupied one whose template is not yet
-/// resolved is `Some` with empty fields.
-fn resolve_slot(
+/// One bag slot from its item guid: instance, template, icon and use-spell cooldown, the object
+/// read off `held` (the item objects as of the getter's place) and its countdowns off `objects`.
+/// `None` is an empty slot or one whose item object has not streamed; an occupied one whose
+/// template is not yet resolved is `Some` with empty fields. With no cooldown list or clock pair
+/// (`cooldown`) the slot carries no cooldown.
+#[allow(clippy::too_many_arguments)] // the slot's inputs, each a store it reads
+pub(super) fn resolve_slot(
     guid: u64,
-    objects: &Objects,
+    held: &(impl super::ItemObjects + ?Sized),
     items: &Items,
     icons: Option<&ItemDisplays>,
     rolls: crate::items::RollCatalogs,
-    cooldowns: &crate::spell::Cooldowns,
+    cooldown: Option<(&crate::spell::Cooldowns, std::time::Instant, f64)>,
     spells: Option<&benilla_formats::SpellCatalog>,
     names: &crate::names::NameCache,
-    // Mutable: reading a charter's record is what queries it.
-    petitions: &crate::ui_petition::PetitionRecords,
-    now: std::time::Instant,
-    ui_now: f64,
+    petitions: Option<&crate::ui_petition::PetitionRecords>,
     // The class's `ChrClasses.dbc` relic flag, which decides slot 17 for every fit-rule read.
     has_relic_slot: bool,
 ) -> Option<ContainerSlot> {
@@ -907,14 +846,14 @@ fn resolve_slot(
         return None;
     }
     // The enchant and lifetime (`SMSG_ITEM_TIME_UPDATE`) countdowns, in whole seconds.
-    let countdowns = objects.countdowns(guid);
+    let countdowns = held.countdowns(guid);
     let enchant_ms: [Option<u64>; crate::items::ENCHANT_SLOTS] =
         std::array::from_fn(|s| countdowns.and_then(|c| c.enchant_remaining_display_ms(s as u32)));
     let duration_ms = countdowns.and_then(|c| c.lifetime_remaining_display_ms());
     // A guid whose create has not landed: the reference finds no item object (`0x6228a0` returns
     // NULL), so `GetContainerItemInfo` pushes nothing (`0x4f96dc`, `0x4f96e0`, `0x4f9810`) and
     // the slot reads empty.
-    let fields = objects.object(guid)?;
+    let fields = held.object(guid)?;
     // What the getters read of it as they run, read here the same way.
     let live = super::live::LiveItem::object(fields, guid, items, icons, rolls);
     let (entry, count, durability, readable, creator, flags, already_bound, enchant_lines) = (
@@ -924,7 +863,8 @@ fn resolve_slot(
         // `GetContainerItemInfo`'s readable flag (`0x4f97ba`).
         live.readable(),
         // The creator's name for "<Made by %s>" and "Written by %s", `None` until the
-        // name query answers. The tooltip build asks it ([`ask_item_build_lookups`]).
+        // name query answers. The tooltip build asks it in its call
+        // ([`benilla_ui::script::RecordAsk::ItemBuildName`]).
         fields
             .item_creator()
             .filter(|&g| g != 0)
@@ -1005,7 +945,7 @@ fn resolve_slot(
         petition: (t.flags & benilla_protocol::messages::ITEM_FLAG_CHARTER != 0)
             .then(|| {
                 let id = fields.item_enchant(0).unwrap_or(0);
-                let view = petitions.tooltip_view(id as u32, guid, names, Ask::Read)?;
+                let view = petitions?.tooltip_view(id as u32, guid, names, Ask::Read)?;
                 Some(benilla_ui::script::PetitionSlotView {
                     signatures: fields.item_petition_signatures(),
                     ..view
@@ -1040,15 +980,17 @@ fn resolve_slot(
         // The tooltip's charges lines (`0x52d9e9`) and the sell price's charge scale
         // (`0x52e43d`) read them (`flds+0x28`).
         spell_charges: std::array::from_fn(|i| fields.item_spell_charges(i as u8).unwrap_or(0)),
-        cooldown: use_cooldown(
-            &t,
-            entry,
-            fields.item_spell_charges(0).unwrap_or(0),
-            cooldowns,
-            spells,
-            now,
-            ui_now,
-        ),
+        cooldown: cooldown.and_then(|(cooldowns, now, ui_now)| {
+            use_cooldown(
+                &t,
+                entry,
+                fields.item_spell_charges(0).unwrap_or(0),
+                cooldowns,
+                spells,
+                now,
+                ui_now,
+            )
+        }),
     })
 }
 
@@ -1061,7 +1003,7 @@ fn resolve_slot(
 /// template, which skips the query (`0x5347e3`, `0x53318a`, `0x4f9a48`, `0x4c8b55`), and a
 /// template with no on-use spell, which the query leaves untouched (`0x6e2f34`). A cold on-use
 /// spell answers enabled (`0x6e1406`).
-fn use_cooldown(
+pub(crate) fn use_cooldown(
     t: &ItemInfo,
     entry: u32,
     charges_left: i32,
@@ -1083,672 +1025,39 @@ fn use_cooldown(
     )
 }
 
-/// The item query's answer for each worn item by live-API slot id (the descriptor slot plus one),
-/// for the tooltip's ITEM_COOLDOWN_TIME line and `GetInventoryItemCooldown`; a slot the query
-/// answers zeros for has no entry ([`use_cooldown`]). The doll snapshot does not carry it: a cooldown moves no
-/// inventory slot, and that snapshot is pushed on change.
-fn worn_cooldowns(
-    store: &ObjectStore,
-    objects: &Objects,
+/// [`use_cooldown`] for the item object held under `guid` in `objects`, its record only read
+/// (`0x4c8b3a`, `0x4f9a3f`): `None` for no object or no entry, `Some(None)` for the all-zero
+/// answer, a record not cached included: the getters' query at the call
+/// ([`crate::spell::CooldownLive`]).
+pub(crate) fn object_cooldown(
+    objects: &(impl super::ItemObjects + ?Sized),
+    guid: u64,
     items: &Items,
     cooldowns: &crate::spell::Cooldowns,
     spells: Option<&benilla_formats::SpellCatalog>,
     now: std::time::Instant,
     ui_now: f64,
-) -> HashMap<usize, (i64, u32, bool)> {
-    (0..WORN_SLOTS)
-        .filter_map(|slot0| {
-            let guid = store.0.player_inv_slot(slot0).filter(|&g| g != 0)?;
-            let fields = objects.object(guid)?;
-            let entry = fields.object_entry()?;
-            // Only read (`0x4c8b3a`).
-            let t = items.template(entry, guid, Ask::Read)?;
-            let charges_left = fields.item_spell_charges(0).unwrap_or(0);
-            let triple = use_cooldown(t, entry, charges_left, cooldowns, spells, now, ui_now)?;
-            Some((usize::from(slot0) + 1, triple))
-        })
-        .collect()
-}
-
-/// The item build's own lookups, asked as it asks them. The creator's and the giver's names
-/// (`0x52e204`, `0x52e29d`) and a charter's record and owner (`0x52b93b`, `0x52b9d2`) pass a
-/// callback at every build, and a hovered bag or paper-doll slot builds again each frame
-/// (`ContainerFrameItemButton_OnUpdate`, `PaperDollItemSlotButton_OnUpdate` run their `OnEnter`
-/// while the tooltip is theirs), so a refused key is asked again about once per answer. The slot
-/// feeds only read what lands.
-pub(super) fn ask_item_build_lookups(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    names: Res<crate::names::NameCache>,
-    petitions: Res<crate::ui_petition::PetitionRecords>,
-    objects: Objects,
-    commands: Res<NetCommands>,
-) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        // The petition id rides enchantment slot 0 (`0x5ef337`).
-        let petition_id = |item| {
-            objects
-                .object(item)
-                .and_then(|f| f.item_enchant(0))
-                .unwrap_or(0) as u32
-        };
-        let asks = (script.take_item_name_asks(), script.take_petition_asks());
-        ask_build_lookups(asks, petition_id, &names, &petitions, &commands);
-    })
-}
-
-/// One run's asks: the build's missed names, then its charters' records and owners.
-fn ask_build_lookups(
-    (name_asks, petition_asks): (Vec<u64>, Vec<u64>),
-    petition_id: impl Fn(u64) -> u32,
-    names: &crate::names::NameCache,
-    petitions: &crate::ui_petition::PetitionRecords,
-    commands: &NetCommands,
-) {
-    for guid in name_asks {
-        names.resolve_player(guid, Ask::Event(commands));
-    }
-    for item in petition_asks {
-        petitions.tooltip_view(petition_id(item), item, names, Ask::Event(commands));
-    }
-}
-
-#[allow(clippy::type_complexity)] // the param list is the input set
-pub(crate) fn feed_containers(
-    mut vm: crate::script_calls::VmWith<Res<'static, crate::spell::Cooldowns>>,
-    // `ChrClasses.dbc` field 16, the fit rule's relic flag.
-    classes: Option<Res<crate::chr_classes::ChrClassTable>>,
-    items: Res<Items>,
-    icons: Option<Res<ItemDisplays>>,
-    // The tuples below pair parameters under Bevy's 16-parameter ceiling.
-    catalogs: (
-        Option<Res<crate::items::Enchants>>,
-        Option<Res<crate::items::RandomProperties>>,
-    ),
-    mut inv: crate::items::Inventory,
-    spells: Option<Res<crate::ui_action::Spells>>,
-    names: Res<crate::names::NameCache>,
-    clock_and_petitions: (
-        Res<crate::ui_script::UiClock>,
-        Res<crate::ui_petition::PetitionRecords>,
-    ),
-    mut memory: Local<crate::ui_script::VmMemo<FeedMemory>>,
-    mut view: ResMut<BagView>,
-) {
-    // The frame's first write of our player or an item, and a swap the last drain left half
-    // done (it ended with no VM): the view it put back gives way to the one it owed.
-    // Taken only when set, so a quiet frame leaves the view unchanged.
-    let written = if view.written.is_some() {
-        view.written.take()
-    } else {
-        None
+) -> Option<Option<(i64, u32, bool)>> {
+    let fields = objects.object(guid)?;
+    let entry = fields.object_entry()?;
+    let Some(t) = items.template(entry, guid, Ask::Read) else {
+        return Some(None);
     };
-    let owed = if view.swap.is_some() {
-        view.swap.take().filter(|s| !s.back).map(|s| s.new)
-    } else {
-        None
-    };
-    // The bags, read off the host's cooldowns among the rest. The push signals nothing: the bag
-    // events are the watchers' and the handlers', fired after it on the lanes
-    // ([`crate::item_lane`]).
-    let bags = vm.turn(|script, cooldowns| {
-        let script = script?;
-        let (clock, petitions) = clock_and_petitions;
-        let (memory, vm_reset) = memory.get_reset(script);
-        // The snapshot is a function of these inputs; the stores' counters stand in for their
-        // `is_changed`, which lazy resolves make always true. `UiClock` is not an input: a running
-        // cooldown's pushed start is absolute, and expiry moves `feed_epoch` through the prune.
-        let objects_moved = inv.changes.moved();
-        let templates_moved = memory.items_templates.moved(items.template_epoch());
-        let cooldowns_moved = memory.cooldown_epoch.moved(cooldowns.feed_epoch());
-        let names_moved = memory.names_generation.moved(names.generation());
-        let petitions_moved = memory.petition_records.moved(petitions.records_epoch());
-        // Countdowns are pushed in whole seconds, so only a displayed change reopens the gate.
-        let deadlines_moved = memory
-            .enchant_deadlines
-            .moved(inv.changes.countdown_steps());
-        let sweep = cooldowns.sweep_pending(clock.anchor);
-        let self_changed = !inv.self_changed.is_empty();
-        // `is_added`, not `is_changed`: only the load-once icon catalog is read here, and the
-        // resource's model cache changes every frame.
-        let icons_changed = icons.as_ref().is_some_and(|r| r.is_added());
-        // Both catalogs load once, at startup: one input covers the pair.
-        let enchants_changed = catalogs.0.as_ref().is_some_and(|r| r.is_changed())
-            || catalogs.1.as_ref().is_some_and(|r| r.is_changed());
-        let spells_changed = spells.as_ref().is_some_and(|r| r.is_changed());
-        gate::trace(
-            "feed_containers",
-            &[
-                ("vm_reset", vm_reset),
-                ("objects", objects_moved),
-                ("templates", templates_moved),
-                ("cooldowns", cooldowns_moved),
-                ("sweep", sweep),
-                ("names", names_moved),
-                ("petition-records", petitions_moved),
-                ("deadlines", deadlines_moved),
-                ("self", self_changed),
-                ("icons", icons_changed),
-                ("enchants", enchants_changed),
-                ("spells", spells_changed),
-            ],
-        );
-        let gate = gate::Gate::new(
-            vm_reset
-            || objects_moved
-            || templates_moved
-            || cooldowns_moved
-            // The frame a timer crosses zero, before the prune moves the epoch.
-            || sweep
-            || names_moved
-            || petitions_moved
-            || deadlines_moved
-            || self_changed
-            || icons_changed
-            || enchants_changed
-            || spells_changed,
-        );
-        if gate.skip() {
-            return None;
-        }
-        // `WOW_FEED_COST=1` prints the body's mean cost every 60 runs.
-        let cost_t0 = std::env::var_os("WOW_FEED_COST")
-            .is_some()
-            .then(std::time::Instant::now);
-        // One clock pair for every slot, so a running cooldown's pushed start is frame-stable.
-        let (now, ui_now) = (clock.anchor, clock.ui_now);
-        let spell_catalog = spells.as_deref().map(|s| &s.catalog);
-        let rolls = crate::items::RollCatalogs {
-            enchants: catalogs.0.as_deref(),
-            props: catalogs.1.as_deref(),
-        };
-        let player = inv.self_store.iter().next();
-        let mut key_pair = None;
-
-        let mut fresh: HashMap<i64, ContainerState> = HashMap::new();
-        // The class's relic flag; without client data it is false, an ordinary ranged slot.
-        let has_relic_slot = player.is_some_and(|p| {
-            p.0.unit_class().is_some_and(|c| {
-                classes
-                    .as_deref()
-                    .is_some_and(|t| t.0.has_relic_slot(u32::from(c)))
-            })
-        });
-        if let Some(store) = player {
-            let mut slots = HashMap::new();
-            for i in 0..PACK_SLOTS {
-                let guid = store.0.player_pack_slot(i).unwrap_or(0);
-                if let Some(slot) = resolve_slot(
-                    guid,
-                    &inv.objects,
-                    &items,
-                    icons.as_deref(),
-                    rolls,
-                    &cooldowns,
-                    spell_catalog,
-                    &names,
-                    &petitions,
-                    now,
-                    ui_now,
-                    has_relic_slot,
-                ) {
-                    slots.insert(u32::from(i) + 1, slot);
-                }
-            }
-            fresh.insert(
-                0,
-                ContainerState {
-                    name: None,
-                    num_slots: u32::from(PACK_SLOTS),
-                    slots,
-                },
-            );
-
-            // Bags 1..4: each INV bag slot holds a container object with its own slot array.
-            for bag in 1..=BAGS {
-                let bag_guid = store
-                    .0
-                    .player_inv_slot(BAG_SLOT_FIRST + bag - 1)
-                    .unwrap_or(0);
-                if bag_guid == 0 {
-                    continue; // no bag equipped → absent → GetContainerNumSlots = 0
-                }
-                let (entry, num_slots, slot_guids) = match inv.objects.object(bag_guid) {
-                    Some(f) => {
-                        let n = f.container_num_slots().unwrap_or(0);
-                        let guids: Vec<u64> = (0..n.min(36) as u8)
-                            .map(|j| f.container_slot(j).unwrap_or(0))
-                            .collect();
-                        (f.object_entry().unwrap_or(0), n, guids)
-                    }
-                    None => (0, 0, Vec::new()),
-                };
-                let name = (entry != 0)
-                    .then(|| {
-                        // `GetBagName` only reads (`0x4fa75e`).
-                        items
-                            .template(entry, bag_guid, Ask::Read)
-                            .map(|t| t.name.clone())
-                    })
-                    .flatten();
-                let mut slots = HashMap::new();
-                for (j, &guid) in slot_guids.iter().enumerate() {
-                    if let Some(slot) = resolve_slot(
-                        guid,
-                        &inv.objects,
-                        &items,
-                        icons.as_deref(),
-                        rolls,
-                        &cooldowns,
-                        spell_catalog,
-                        &names,
-                        &petitions,
-                        now,
-                        ui_now,
-                        has_relic_slot,
-                    ) {
-                        slots.insert(j as u32 + 1, slot);
-                    }
-                }
-                fresh.insert(
-                    i64::from(bag),
-                    ContainerState {
-                        name,
-                        num_slots,
-                        slots,
-                    },
-                );
-            }
-
-            // The bank, container -1 (the vault) and 5..=10 (its bags), fed whether or not the
-            // window is open: the descriptor streams at login.
-            let mut slots = HashMap::new();
-            for i in 0..BANK_SLOTS {
-                let guid = store.0.player_bank_slot(i).unwrap_or(0);
-                if let Some(slot) = resolve_slot(
-                    guid,
-                    &inv.objects,
-                    &items,
-                    icons.as_deref(),
-                    rolls,
-                    &cooldowns,
-                    spell_catalog,
-                    &names,
-                    &petitions,
-                    now,
-                    ui_now,
-                    has_relic_slot,
-                ) {
-                    slots.insert(u32::from(i) + 1, slot);
-                }
-            }
-            fresh.insert(
-                BANK_CONTAINER,
-                ContainerState {
-                    name: None,
-                    num_slots: u32::from(BANK_SLOTS),
-                    slots,
-                },
-            );
-            for bank_bag in 0..BANK_BAGS {
-                let bag_id = BANK_BAG_ID_FIRST + i64::from(bank_bag);
-                let bag_guid = store.0.player_bank_bag_slot(bank_bag).unwrap_or(0);
-                if bag_guid == 0 {
-                    continue; // no bag in the slot → absent → GetContainerNumSlots = 0
-                }
-                let (entry, num_slots, slot_guids) = match inv.objects.object(bag_guid) {
-                    Some(f) => {
-                        let n = f.container_num_slots().unwrap_or(0);
-                        let guids: Vec<u64> = (0..n.min(36) as u8)
-                            .map(|j| f.container_slot(j).unwrap_or(0))
-                            .collect();
-                        (f.object_entry().unwrap_or(0), n, guids)
-                    }
-                    None => (0, 0, Vec::new()),
-                };
-                let name = (entry != 0)
-                    .then(|| {
-                        // `GetBagName` only reads (`0x4fa75e`).
-                        items
-                            .template(entry, bag_guid, Ask::Read)
-                            .map(|t| t.name.clone())
-                    })
-                    .flatten();
-                let mut slots = HashMap::new();
-                for (j, &guid) in slot_guids.iter().enumerate() {
-                    if let Some(slot) = resolve_slot(
-                        guid,
-                        &inv.objects,
-                        &items,
-                        icons.as_deref(),
-                        rolls,
-                        &cooldowns,
-                        spell_catalog,
-                        &names,
-                        &petitions,
-                        now,
-                        ui_now,
-                        has_relic_slot,
-                    ) {
-                        slots.insert(j as u32 + 1, slot);
-                    }
-                }
-                fresh.insert(
-                    bag_id,
-                    ContainerState {
-                        name,
-                        num_slots,
-                        slots,
-                    },
-                );
-            }
-
-            // The keyring, container -2: player slots 81.., sized by the level ladder that stock
-            // `GetKeyRingSize` (`ContainerFrame.lua:773`) reads off `UnitLevel` and the server
-            // shares. Slots past the size, which the server refuses, are not fed.
-            let size = keyring_size(store.0.unit_level().unwrap_or(1));
-            let mut slots = HashMap::new();
-            for i in 0..size.min(u32::from(KEYRING_SLOTS)) as u8 {
-                let guid = store.0.player_keyring_slot(i).unwrap_or(0);
-                if let Some(slot) = resolve_slot(
-                    guid,
-                    &inv.objects,
-                    &items,
-                    icons.as_deref(),
-                    rolls,
-                    &cooldowns,
-                    spell_catalog,
-                    &names,
-                    &petitions,
-                    now,
-                    ui_now,
-                    has_relic_slot,
-                ) {
-                    slots.insert(u32::from(i) + 1, slot);
-                }
-            }
-            fresh.insert(
-                KEYRING_CONTAINER,
-                ContainerState {
-                    name: None,
-                    num_slots: size,
-                    slots,
-                },
-            );
-
-            // `HasKey()`, which decides whether the keyring shows at all, pushed with the
-            // containers so it is fresh on every `BAG_UPDATE` frame.
-            let key = has_key(&store.0, &inv.objects, &items);
-            key_pair = Some((memory.had_key, key));
-            if key != memory.had_key {
-                gate.audit("feed_containers", "the HasKey() flip");
-                debug!(
-                    "ui_items: HasKey() -> {key} (keyring {})",
-                    if key { "shown" } else { "hidden" }
-                );
-                memory.had_key = key;
-            }
-
-            // The worn items' use cooldowns, for the tooltip line; no event rides them.
-            let worn = worn_cooldowns(
-                store,
-                &inv.objects,
-                &items,
-                &cooldowns,
-                spell_catalog,
-                now,
-                ui_now,
-            );
-            if worn != memory.worn_cooldowns {
-                gate.audit("feed_containers", "the worn items' cooldowns");
-                script.set_worn_cooldowns(worn.clone());
-                memory.worn_cooldowns = worn;
-            }
-        }
-
-        if let Some(t0) = cost_t0 {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SUM_NS: AtomicU64 = AtomicU64::new(0);
-            static N: AtomicU64 = AtomicU64::new(0);
-            let sum = SUM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_multiple_of(60) {
-                let slots: usize = fresh.values().map(|c| c.slots.len()).sum();
-                eprintln!(
-                    "[feed-cost] ms={:.3} slots={slots} containers={}",
-                    sum as f64 / n as f64 / 1e6,
-                    fresh.len(),
-                );
-            }
-        }
-        Some((player.is_some().then_some(fresh), key_pair, vm_reset, gate))
-    });
-    vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        if let Some(owed) = owed {
-            owed.put(script);
-        }
-        let Some((source, key_pair, vm_reset, gate)) = bags else {
-            return;
-        };
-        let memory = memory.get(script);
-        let changed = push_changed(script, memory, source);
-        if !changed.is_empty() {
-            gate.audit("feed_containers", "a bag diff");
-        }
-        let Some((had_key, key)) = key_pair else {
-            return;
-        };
-        script.set_has_key(key);
-        // A fresh VM had no view before this one, so nothing stamped earlier reads an older one.
-        let Some(at) = written.filter(|_| !vm_reset) else {
-            return;
-        };
-        if changed.is_empty() && had_key == key {
-            return;
-        }
-        let (old, new) = changed
-            .into_iter()
-            .map(|(bag, old, new)| ((bag, old), (bag, new)))
-            .unzip();
-        view.swap = Some(Swap {
-            at,
-            back: true,
-            old: View {
-                bags: old,
-                key: had_key,
-            },
-            new: View { bags: new, key },
-        });
-    });
-}
-
-/// The bag view the lanes' events read, as the packets left it. The feed pushes the frame's whole
-/// view, which the feeds' own events after it read (the world-enter cascade's `BAG_UPDATE`s, the
-/// cooldown flush's `BAG_UPDATE_COOLDOWN`). An event a handler raised before the frame's first
-/// write of our player or an item reads the view that write changed, so when a lane holds one the
-/// drain starts on last frame's view and swaps to this frame's at that write's stamp.
-///
-/// The exact form is a view per packet (#2217): the bags here are last frame's or this frame's,
-/// never the one a packet between two writes left. And only the bag view swaps: while the old
-/// bags are up, an event's handler still reads this frame's state through everything else, among
-/// it `feed_char`'s inventory and bank-bag slots, `GetMoney`, and a verb a listener calls, which
-/// resolves against the live store (`ui_items::drain`).
-#[derive(Resource, Default)]
-pub(crate) struct BagView {
-    /// The stamp of the frame's first handler call that wrote our player or an item.
-    written: Option<crate::lanes::Stamp>,
-    swap: Option<Swap>,
-}
-
-/// One frame's change to the bag view: what the VM held before and after it.
-struct Swap {
-    /// The write's stamp, where the drain swaps to the new view.
-    at: crate::lanes::Stamp,
-    /// The drain's start still owes the old view.
-    back: bool,
-    old: View,
-    new: View,
-}
-
-/// The bags that changed and `HasKey()`.
-struct View {
-    bags: Vec<(i64, Option<ContainerState>)>,
-    key: bool,
-}
-
-impl View {
-    fn put(self, script: &mut UiScript) {
-        for (bag, state) in self.bags {
-            script.set_container(bag, state);
-        }
-        script.set_has_key(self.key);
-    }
-}
-
-impl BagView {
-    /// A handler wrote our player or an item: the first of the frame stamps the swap.
-    pub(crate) fn wrote(&mut self) {
-        if self.written.is_none() {
-            self.written = Some(crate::lanes::stamp());
-        }
-    }
-
-    /// The old view at the drain's start, then the new one at the write.
-    fn peek(&self) -> Option<crate::lanes::Stamp> {
-        self.swap.as_ref().map(|s| {
-            if s.back {
-                crate::lanes::Stamp::origin()
-            } else {
-                s.at
-            }
-        })
-    }
-}
-
-/// The lane and its drop, under the exact complement of the drain's gate.
-pub(super) fn add_bag_view_lane(app: &mut App) {
-    use crate::lanes::LaneApp;
-    app.init_resource::<BagView>()
-        .add_lane(
-            "bag view",
-            |world| world.get_resource::<BagView>()?.peek(),
-            fire_bag_view,
-            None,
-        )
-        .add_systems(
-            Update,
-            drop_bag_view
-                .in_set(crate::ui_script::UiFeed)
-                .run_if(not(crate::ui_script::ingame_ui_up)),
-        );
-}
-
-fn drop_bag_view(mut view: ResMut<BagView>) {
-    *view = BagView::default();
-}
-
-/// The lane's `fire_until` ([`crate::lanes`]): at the drain's start, last frame's view when an
-/// item stamped before the write is due ahead of it, else nothing to swap; at the write, the new.
-fn fire_bag_view(
-    In(until): In<crate::lanes::Until>,
-    mut vm: crate::script_calls::HostedVm,
-    mut view: ResMut<BagView>,
-) {
-    let Some(swap) = view.swap.as_mut() else {
-        return;
-    };
-    let put = if swap.back {
-        if until.admits(swap.at) {
-            view.swap = None;
-            return;
-        }
-        swap.back = false;
-        std::mem::replace(
-            &mut swap.old,
-            View {
-                bags: Vec::new(),
-                key: false,
-            },
-        )
-    } else {
-        let Some(swap) = view.swap.take() else {
-            return;
-        };
-        swap.new
-    };
-    vm.run(|script| {
-        if let Some(script) = script {
-            put.put(script);
-        }
-    });
-}
-
-/// [`push_changed`], with whether anything went into the VM.
-#[cfg(test)]
-pub(crate) fn push_containers(
-    script: &mut UiScript,
-    memory: &mut FeedMemory,
-    source: Option<HashMap<i64, ContainerState>>,
-) -> bool {
-    !push_changed(script, memory, source).is_empty()
-}
-
-/// Push every bag whose view changed since the last push, firing nothing: a bag's events are its
-/// watchers' runs (`0x4f8db0`, `0x4f90d0`, `0x4f8ec0`, `0x4f9480`, [`crate::item_watch`]), fired
-/// after this push on the item lane. Each changed bag with its view before and after, for the
-/// caller's gate audit and the lanes' swap ([`BagView`]).
-///
-/// `None` is an absent self store (before login, or the logout despawn frames before the VM shuts
-/// down), never "no items": the VM keeps its last push, as the reference's UI shutdown
-/// (`0x490bd0`) runs with the inventory intact.
-#[allow(clippy::type_complexity)] // (bag, before, after)
-fn push_changed(
-    script: &mut UiScript,
-    memory: &mut FeedMemory,
-    source: Option<HashMap<i64, ContainerState>>,
-) -> Vec<(i64, Option<ContainerState>, Option<ContainerState>)> {
-    let Some(fresh) = source else {
-        return Vec::new();
-    };
-    let changed: Vec<i64> = fresh
-        .keys()
-        .chain(memory.pushed.keys())
-        .copied()
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .filter(|b| fresh.get(b) != memory.pushed.get(b))
-        .collect();
-    if changed.is_empty() {
-        return Vec::new();
-    }
-    for &bag in &changed {
-        script.set_container(bag, fresh.get(&bag).cloned());
-    }
-    debug!(
-        "ui_items: fed {} changed bag(s) — {}",
-        changed.len(),
-        changed
-            .iter()
-            .map(|b| format!("{b}:{}", fresh.get(b).map_or(0, |c| c.slots.len())))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let out = changed
-        .iter()
-        .map(|&b| (b, memory.pushed.get(&b).cloned(), fresh.get(&b).cloned()))
-        .collect();
-    memory.pushed = fresh;
-    out
+    let charges_left = fields.item_spell_charges(0).unwrap_or(0);
+    Some(use_cooldown(
+        t,
+        entry,
+        charges_left,
+        cooldowns,
+        spells,
+        now,
+        ui_now,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ask_build_lookups, push_containers, resolve_slot, ContainerSlot, FeedMemory};
+    use super::resolve_slot;
 
     /// A set's member names come from the item-name store (`0x52df5a` looks up `0xc0e2dc` with a
     /// callback and a zero owner), asked with `CMSG_ITEM_NAME_QUERY`, never the template store.
@@ -1832,7 +1141,7 @@ mod tests {
             Default::default(),
             None,
             &|| 0,
-            &|_| None,
+            benilla_ui::strings::Strings::Host(&|_| None),
         );
         assert_eq!(view.item_level, 33);
         assert_eq!(
@@ -1862,7 +1171,7 @@ mod tests {
                 tables,
                 None,
                 &|| 0,
-                &|_| None,
+                benilla_ui::strings::Strings::Host(&|_| None),
             );
             (v.area_name, v.map_name)
         };
@@ -2035,36 +1344,12 @@ mod tests {
                 Default::default(),
                 None,
                 &move || gender,
-                &get,
+                benilla_ui::strings::Strings::Host(&get),
             )
             .required_rep_line
         };
         assert_eq!(line(0).as_deref(), Some("Requires UNKNOWN - Honored"));
         assert_eq!(line(1).as_deref(), Some("Requires UNKNOWN - Honored (f)"));
-    }
-
-    /// The build's lookups pass a callback (`0x52e204`, `0x52b93b`): a run asks a name still in
-    /// flight no second time, and asks a refused one again at once.
-    #[test]
-    fn each_build_asks_its_missed_name_and_charter_again_once_answered() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let commands = crate::net::NetCommands(tx);
-        let mut names = crate::names::NameCache::default();
-        let petitions = crate::ui_petition::PetitionRecords::default();
-        let run = |names: &crate::names::NameCache| {
-            ask_build_lookups((vec![0x5], vec![0x99]), |_| 7, names, &petitions, &commands);
-            crate::query_cache::queries(&rx).len()
-        };
-        assert_eq!(
-            run(&names),
-            2,
-            "the first build asks the name and the record"
-        );
-        for _ in 0..600 {
-            assert_eq!(run(&names), 0, "in flight: no build asks again");
-        }
-        names.insert_player(0x5, String::new(), None);
-        assert_eq!(run(&names), 1, "a refused name is asked at the next build");
     }
 
     /// A bag slot carries the template's quality and InventoryType, which `GetContainerItemInfo`
@@ -2104,18 +1389,17 @@ mod tests {
         let cooldowns = crate::spell::Cooldowns::default();
         let petitions = crate::ui_petition::PetitionRecords::default();
         let mut slot = |guid: u64| {
+            let o = objs.get();
             resolve_slot(
                 guid,
-                &objs.get(),
+                &o,
                 &items,
                 None,
                 RollCatalogs::NONE,
-                &cooldowns,
+                Some((&cooldowns, std::time::Instant::now(), 0.0)),
                 None,
                 &names,
-                &petitions,
-                std::time::Instant::now(),
-                0.0,
+                Some(&petitions),
                 false,
             )
         };
@@ -2164,20 +1448,25 @@ mod tests {
                 ..Default::default()
             },
         );
-        let slot = resolve_slot(
-            0xC1,
-            &objs.get(),
-            &items,
-            None,
-            RollCatalogs::NONE,
-            &crate::spell::Cooldowns::default(),
-            None,
-            &NameCache::default(),
-            &petitions,
-            std::time::Instant::now(),
-            0.0,
-            false,
-        )
+        let slot = {
+            let o = objs.get();
+            resolve_slot(
+                0xC1,
+                &o,
+                &items,
+                None,
+                RollCatalogs::NONE,
+                Some((
+                    &crate::spell::Cooldowns::default(),
+                    std::time::Instant::now(),
+                    0.0,
+                )),
+                None,
+                &NameCache::default(),
+                Some(&petitions),
+                false,
+            )
+        }
         .expect("an occupied slot");
         let petition = slot.petition.expect("the record is cached");
         assert_eq!((petition.title.as_str(), petition.signatures), ("Pact", 4));
@@ -2220,20 +1509,21 @@ mod tests {
         let cooldowns = crate::spell::Cooldowns::default();
         let petitions = crate::ui_petition::PetitionRecords::default();
         let mut seats = |guid: u64| {
-            resolve_slot(
-                guid,
-                &objs.get(),
-                &items,
-                None,
-                RollCatalogs::NONE,
-                &cooldowns,
-                None,
-                &names,
-                &petitions,
-                std::time::Instant::now(),
-                0.0,
-                false,
-            )
+            {
+                let o = objs.get();
+                resolve_slot(
+                    guid,
+                    &o,
+                    &items,
+                    None,
+                    RollCatalogs::NONE,
+                    Some((&cooldowns, std::time::Instant::now(), 0.0)),
+                    None,
+                    &names,
+                    Some(&petitions),
+                    false,
+                )
+            }
             .expect("an occupied slot")
             .occupied_seats
         };
@@ -2276,20 +1566,21 @@ mod tests {
         let cooldowns = crate::spell::Cooldowns::default();
         let petitions = crate::ui_petition::PetitionRecords::default();
         let mut readable = |guid: u64| {
-            resolve_slot(
-                guid,
-                &objs.get(),
-                &items,
-                None,
-                RollCatalogs::NONE,
-                &cooldowns,
-                None,
-                &names,
-                &petitions,
-                std::time::Instant::now(),
-                0.0,
-                false,
-            )
+            {
+                let o = objs.get();
+                resolve_slot(
+                    guid,
+                    &o,
+                    &items,
+                    None,
+                    RollCatalogs::NONE,
+                    Some((&cooldowns, std::time::Instant::now(), 0.0)),
+                    None,
+                    &names,
+                    Some(&petitions),
+                    false,
+                )
+            }
             .expect("an occupied slot")
             .readable
         };
@@ -2337,20 +1628,21 @@ mod tests {
         let cooldowns = crate::spell::Cooldowns::default();
         let petitions = crate::ui_petition::PetitionRecords::default();
         let mut bound = |guid: u64| {
-            resolve_slot(
-                guid,
-                &objs.get(),
-                &items,
-                None,
-                rolls,
-                &cooldowns,
-                None,
-                &names,
-                &petitions,
-                std::time::Instant::now(),
-                0.0,
-                false,
-            )
+            {
+                let o = objs.get();
+                resolve_slot(
+                    guid,
+                    &o,
+                    &items,
+                    None,
+                    rolls,
+                    Some((&cooldowns, std::time::Instant::now(), 0.0)),
+                    None,
+                    &names,
+                    Some(&petitions),
+                    false,
+                )
+            }
             .expect("an occupied slot")
             .already_bound
         };
@@ -2358,13 +1650,12 @@ mod tests {
         assert!(bound(0xE2), "any other item's binding enchant binds it");
     }
 
-    /// A worn item answers the item cooldown query by its entry (`0x6e2ed0`): its answer is pushed
-    /// under the live-API slot id, one past the descriptor slot. An on-use item with none running
+    /// A worn item answers the item cooldown query by its entry (`0x6e2ed0`), read by the live-API
+    /// slot id, one past the descriptor slot. An on-use item with none running
     /// answers cold and enabled (`0x6e1406`); one with no use spell is absent, the query leaving
     /// its zeros (`0x6e2f34`).
     #[test]
     fn a_worn_item_on_cooldown_is_keyed_by_its_live_slot_id() {
-        use super::worn_cooldowns;
         use crate::items::{test_template, Items};
         use crate::net::ObjectStore;
         use crate::ui_items::TestObjects;
@@ -2412,7 +1703,7 @@ mod tests {
             .collect();
         let store = ObjectStore(ObjectFields::from_pairs(&pairs));
 
-        let worn = worn_cooldowns(&store, &objs.get(), &items, &cooldowns, None, now, 50.0);
+        let worn = worn(&store, &mut objs, &items, &cooldowns, now, 50.0);
         assert_eq!(
             worn,
             HashMap::from([(13, (50_000, 120_000, true)), (14, (0, 0, true))]),
@@ -2425,7 +1716,6 @@ mod tests {
     /// the test is `template+0x144 != 0` (-1 included) against `ITEM_FIELD_SPELL_CHARGES[0] == 0`.
     #[test]
     fn a_charged_item_with_no_charge_left_has_no_cooldown() {
-        use super::worn_cooldowns;
         use crate::items::{test_template, Items, RollCatalogs};
         use crate::names::NameCache;
         use crate::net::ObjectStore;
@@ -2474,20 +1764,21 @@ mod tests {
         let names = NameCache::default();
         let petitions = crate::ui_petition::PetitionRecords::default();
         for (&(guid, ..), want) in cases.iter().zip(expected) {
-            let slot = resolve_slot(
-                guid,
-                &objs.get(),
-                &items,
-                None,
-                RollCatalogs::NONE,
-                &cooldowns,
-                None,
-                &names,
-                &petitions,
-                now,
-                50.0,
-                false,
-            )
+            let slot = {
+                let o = objs.get();
+                resolve_slot(
+                    guid,
+                    &o,
+                    &items,
+                    None,
+                    RollCatalogs::NONE,
+                    Some((&cooldowns, now, 50.0)),
+                    None,
+                    &names,
+                    Some(&petitions),
+                    false,
+                )
+            }
             .expect("an occupied slot");
             assert_eq!(slot.cooldown, want, "bag slot of {guid:#x}");
         }
@@ -2502,7 +1793,7 @@ mod tests {
             })
             .collect();
         let store = ObjectStore(ObjectFields::from_pairs(&pairs));
-        let worn = worn_cooldowns(&store, &objs.get(), &items, &cooldowns, None, now, 50.0);
+        let worn = worn(&store, &mut objs, &items, &cooldowns, now, 50.0);
         let want: HashMap<usize, (i64, u32, bool)> = expected
             .iter()
             .enumerate()
@@ -2513,56 +1804,27 @@ mod tests {
 
     use crate::ui_action::real_spells;
     use benilla_protocol::messages::ItemSpellEntry;
-    use benilla_ui::script::{ContainerState, UiScript};
     use std::collections::HashMap;
 
-    /// The push fires nothing: a bag's events are its watchers' ([`crate::item_watch`]). An absent
-    /// self store is no source, which keeps the VM's bags; a present one that lost a bag pushes.
-    #[test]
-    fn the_push_fires_nothing_and_an_absent_source_keeps_the_bags() {
-        let mut s = UiScript::new().unwrap();
-        s.run(
-            "SEEN = 0 \
-             local f = CreateFrame('Frame') \
-             for _, e in ipairs({'BAG_UPDATE', 'BAG_CLOSED', 'BAG_OPEN', \
-                     'PLAYERBANKSLOTS_CHANGED', 'ITEM_LOCK_CHANGED'}) do \
-                 f:RegisterEvent(e) \
-             end \
-             f:SetScript('OnEvent', function() SEEN = SEEN + 1 end)",
-        )
-        .unwrap();
-        let bag = |count: u32| {
-            HashMap::from([(
-                0,
-                ContainerState {
-                    name: None,
-                    num_slots: 16,
-                    slots: HashMap::from([(
-                        1,
-                        ContainerSlot {
-                            item_id: 2512,
-                            count,
-                            ..Default::default()
-                        },
-                    )]),
-                },
-            )])
-        };
-        let mut memory = FeedMemory::default();
-        assert!(push_containers(&mut s, &mut memory, Some(bag(200))));
-        assert!(push_containers(&mut s, &mut memory, Some(bag(199))));
-        assert!(!push_containers(&mut s, &mut memory, Some(bag(199))));
-        assert_eq!(s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(), 16);
-        // The logout despawn frame: the VM keeps its bags.
-        assert!(!push_containers(&mut s, &mut memory, None));
-        assert_eq!(
-            s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(),
-            16,
-            "an absent source must not empty the VM's containers"
-        );
-        assert!(push_containers(&mut s, &mut memory, Some(HashMap::new())));
-        assert_eq!(s.eval::<i64>("return GetContainerNumSlots(0)").unwrap(), 0);
-        assert_eq!(s.eval::<i64>("return SEEN").unwrap(), 0);
+    /// The worn items' cooldown answers by live-API slot id, as `CooldownQuery::Worn` reads each
+    /// at the call (`0x4c8b10` → `0x6228a0`, then `0x6e2ed0`).
+    fn worn(
+        store: &crate::net::ObjectStore,
+        objs: &mut crate::ui_items::TestObjects,
+        items: &crate::items::Items,
+        cooldowns: &crate::spell::Cooldowns,
+        now: std::time::Instant,
+        ui_now: f64,
+    ) -> HashMap<usize, (i64, u32, bool)> {
+        let o = objs.get();
+        (0..19u8)
+            .filter_map(|slot0| {
+                let guid = store.0.player_inv_slot(slot0).filter(|&g| g != 0)?;
+                let t = super::object_cooldown(&o, guid, items, cooldowns, None, now, ui_now)
+                    .flatten()?;
+                Some((usize::from(slot0) + 1, t))
+            })
+            .collect()
     }
 
     fn slot(spell_id: u32, charges: i32) -> ItemSpellEntry {
@@ -2575,44 +1837,6 @@ mod tests {
             category: 0,
             category_cooldown_ms: -1,
         }
-    }
-
-    #[test]
-    fn modifier_refresh_tracks_only_item_and_set_descriptions_with_tokens() {
-        let displays = std::collections::HashMap::from([
-            (
-                1,
-                benilla_formats::SpellDisplay {
-                    description: Some("Restores 5 health.".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                2,
-                benilla_formats::SpellDisplay {
-                    description: Some("Restores $s1 health.".into()),
-                    ..Default::default()
-                },
-            ),
-        ]);
-        let spells = crate::ui_action::Spells {
-            catalog: benilla_formats::SpellCatalog::from_displays(displays),
-            forms: Default::default(),
-            ranges: Default::default(),
-            cast_times: Default::default(),
-            durations: Default::default(),
-            radii: Default::default(),
-        };
-        let mut item = crate::items::test_template("Token item");
-        item.spells = vec![slot(1, 0)];
-        assert!(!super::item_has_mod_tokens(&item, Some(&spells)));
-        item.spells.push(slot(2, 0));
-        assert!(super::item_has_mod_tokens(&item, Some(&spells)));
-        assert!(!super::bonuses_have_mod_tokens(&[(2, 1)], Some(&spells)));
-        assert!(super::bonuses_have_mod_tokens(
-            &[(2, 1), (4, 2)],
-            Some(&spells)
-        ));
     }
 
     /// On the real Spell.dbc, an undescribed spell such as a key's `Opening` builds no trigger
@@ -2685,27 +1909,7 @@ mod tests {
         assert!(line(1).contains("the mage and her allies"), "{}", line(1));
         assert!(line(0).contains("the mage and his allies"), "{}", line(0));
     }
-
-    /// The item feeds re-substitute a held `$`-text when what the tokens read moves: the gender
-    /// byte `$g`/`$G` branch on (`0x508214`), and no other byte of `UNIT_FIELD_BYTES_0`.
-    #[test]
-    fn the_token_reads_move_with_the_gender_byte_alone() {
-        let store = |bytes: u32| {
-            crate::net::ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[(36, bytes)]))
-        };
-        let male = super::token_reads(Some(&store(4 | 1 << 8)));
-        assert_ne!(super::token_reads(Some(&store(4 | 1 << 8 | 1 << 16))), male);
-        assert_eq!(super::token_reads(Some(&store(1 | 2 << 8 | 1 << 24))), male);
-    }
 }
-
-#[cfg(test)]
-#[path = "feed_cooldown_tests.rs"]
-mod cooldown_tests;
-
-#[cfg(test)]
-#[path = "feed_link_tests.rs"]
-mod link_tests;
 
 #[cfg(test)]
 mod ask_tests {
@@ -2714,25 +1918,34 @@ mod ask_tests {
     use crate::items::Items;
     use crate::net::NetCommands;
 
-    /// A `/reload` keeps the reference's item cache, so a new VM is seated with every cached
-    /// record its first frame, ahead of its world entry, and its first read hits.
-    #[test]
-    fn a_new_vm_is_seated_with_every_cached_template() {
+    /// The feed alone over a fresh VM, with the sends kept.
+    fn feed_app() -> (App, crossbeam_channel::Receiver<crate::net::ClientCommand>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.insert_resource(NetCommands(tx))
             .init_resource::<Items>()
+            .init_resource::<super::VmItemRecords>()
             .init_resource::<crate::spell::SpellModifiers>()
             .add_systems(Update, super::feed_item_stats);
+        (app, rx)
+    }
+
+    /// `GetItemInfo(25)` off the VM's copy, with no host lent.
+    fn name(app: &mut App) -> Option<String> {
+        app.world_mut()
+            .non_send_resource_mut::<benilla_ui::script::UiScript>()
+            .eval::<Option<String>>("return (GetItemInfo(25))")
+            .unwrap()
+    }
+
+    /// A VM no interface's load seated (a harness's) is seated with every cached record by the
+    /// feed, and a new one again; nothing is asked.
+    #[test]
+    fn a_vm_no_load_seated_is_seated_with_every_cached_template() {
+        let (mut app, rx) = feed_app();
         app.world_mut()
             .resource_mut::<Items>()
             .insert_template(25, Some(crate::items::test_template("Linen Cloth")));
-        let name = |app: &mut App| {
-            app.world_mut()
-                .non_send_resource_mut::<benilla_ui::script::UiScript>()
-                .eval::<Option<String>>("return (GetItemInfo(25))")
-                .unwrap()
-        };
         app.insert_non_send_resource(benilla_ui::script::UiScript::new().unwrap());
         app.update();
         assert_eq!(name(&mut app).as_deref(), Some("Linen Cloth"));
@@ -2746,26 +1959,53 @@ mod ask_tests {
         assert!(crate::query_cache::queries(&rx).is_empty());
     }
 
+    /// A VM its load seated takes no second copy from the feed: only what changed since.
+    #[test]
+    fn a_vm_its_load_seated_takes_only_what_changed_since() {
+        let (mut app, _rx) = feed_app();
+        app.world_mut()
+            .resource_mut::<Items>()
+            .insert_template(25, Some(crate::items::test_template("Linen Cloth")));
+        let mut script = benilla_ui::script::UiScript::new().unwrap();
+        super::seed_vm_item_records(app.world_mut(), &mut script);
+        app.insert_non_send_resource(script);
+        assert_eq!(
+            name(&mut app).as_deref(),
+            Some("Linen Cloth"),
+            "seated at the load"
+        );
+        app.world_mut()
+            .non_send_resource_mut::<benilla_ui::script::UiScript>()
+            .drop_item_template(25);
+        app.world_mut()
+            .resource_mut::<Items>()
+            .insert_template(26, Some(crate::items::test_template("Wool Cloth")));
+        app.update();
+        assert_eq!(
+            name(&mut app),
+            None,
+            "the seated record is not pushed again"
+        );
+        assert_eq!(
+            app.world_mut()
+                .non_send_resource_mut::<benilla_ui::script::UiScript>()
+                .eval::<Option<String>>("return (GetItemInfo(26))")
+                .unwrap()
+                .as_deref(),
+            Some("Wool Cloth"),
+            "the record landed since is"
+        );
+    }
+
     /// A refusal on a record the cache held removes it (`0x556ec0`-`0x556f37`), so the VM's copy
     /// goes too: its readers, the equip questions among them, miss where they read it before.
     #[test]
     fn a_refusal_on_a_held_record_leaves_the_vm_too() {
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut app = App::new();
-        app.insert_resource(NetCommands(tx))
-            .init_resource::<Items>()
-            .init_resource::<crate::spell::SpellModifiers>()
-            .add_systems(Update, super::feed_item_stats);
+        let (mut app, _rx) = feed_app();
         app.world_mut()
             .resource_mut::<Items>()
             .insert_template(25, Some(crate::items::test_template("Linen Cloth")));
         app.insert_non_send_resource(benilla_ui::script::UiScript::new().unwrap());
-        let name = |app: &mut App| {
-            app.world_mut()
-                .non_send_resource_mut::<benilla_ui::script::UiScript>()
-                .eval::<Option<String>>("return (GetItemInfo(25))")
-                .unwrap()
-        };
         app.update();
         assert_eq!(name(&mut app).as_deref(), Some("Linen Cloth"));
         app.world_mut()
@@ -2775,17 +2015,11 @@ mod ask_tests {
         assert_eq!(name(&mut app), None, "the refusal removed it");
     }
 
-    /// A miss the VM asks for is the getter's lookup with a callback: it queries, a frame between
-    /// asks queries nothing, and the next ask queries a refused id again. A miss `GetItemInfo`
-    /// reads never queries (`0x48e172`).
+    /// A miss `GetItemInfo` reads never queries (`0x48e172`): not at the read, not at a frame,
+    /// not on a refused record.
     #[test]
-    fn a_refused_template_is_asked_by_the_next_getter_and_never_by_get_item_info() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let mut app = App::new();
-        app.insert_resource(NetCommands(tx))
-            .init_resource::<Items>()
-            .init_resource::<crate::spell::SpellModifiers>()
-            .add_systems(Update, super::feed_item_stats);
+    fn get_item_info_never_queries_a_miss() {
+        let (mut app, rx) = feed_app();
         app.insert_non_send_resource(benilla_ui::script::UiScript::new().unwrap());
         let run = |app: &mut App, lua: &str| {
             app.world_mut()
@@ -2799,14 +2033,6 @@ mod ask_tests {
             crate::query_cache::queries(&rx).is_empty(),
             "a read asks nothing"
         );
-        let ask = |app: &mut App| {
-            app.world_mut()
-                .non_send_resource_mut::<benilla_ui::script::UiScript>()
-                .ask_item_templates([25]);
-            app.update();
-        };
-        ask(&mut app);
-        assert_eq!(crate::query_cache::queries(&rx).len(), 1);
         app.world_mut()
             .resource_mut::<Items>()
             .insert_template(25, None);
@@ -2816,12 +2042,6 @@ mod ask_tests {
         assert!(
             crate::query_cache::queries(&rx).is_empty(),
             "no frame or read asks a refusal"
-        );
-        ask(&mut app);
-        assert_eq!(
-            crate::query_cache::queries(&rx).len(),
-            1,
-            "the next getter asks again"
         );
     }
 
@@ -2866,7 +2086,7 @@ mod ask_tests {
         assert_eq!(line, "Rockbiter 3");
     }
 
-    /// The name formatter's template is the VM's `ITEM_SUFFIX_TEMPLATE` (`0x5d8b78` →
+    /// The name formatter's template is the VM's `ITEM_SUFFIX_TEMPLATE` (`0x5d8b7f` →
     /// `0x703bf0`), read off the VM into the catalog every surface names through, and read again
     /// when it changes.
     #[test]
@@ -2881,7 +2101,7 @@ mod ask_tests {
                 },
             )])),
         ))
-        .add_systems(Update, super::feed_random_properties);
+        .add_systems(Update, super::copy_suffix_template);
         let script = benilla_ui::script::UiScript::new().unwrap();
         script.run(r#"ITEM_SUFFIX_TEMPLATE = "%s -- %s""#).unwrap();
         app.insert_non_send_resource(script);
@@ -2897,73 +2117,5 @@ mod ask_tests {
             .unwrap();
         app.update();
         assert_eq!(name(&app), "", "a missing key formats the empty string");
-    }
-
-    /// The requirement state carries `PLAYER_FIELD_PVP_MEDALS` and the whole known-spell book: a
-    /// held medal whites its line (`0x52d70a`), and a recipe whose craft the book holds, which the
-    /// spellbook never lists, reads already known (`0x52d54f`).
-    #[test]
-    fn the_requirement_feed_pushes_the_medals_and_the_known_spells() {
-        let mut app = App::new();
-        app.init_resource::<crate::net::Proficiencies>()
-            .init_resource::<crate::net::Reputations>()
-            .init_resource::<crate::ui_action::PlayerActions>()
-            .init_resource::<crate::ui_action::LearnedAbilities>()
-            .add_systems(Update, super::feed_player_req);
-        app.world_mut()
-            .resource_mut::<crate::ui_action::PlayerActions>()
-            .spells
-            .insert(2335);
-        // UNIT_FIELD_LEVEL 34 and PLAYER_FIELD_PVP_MEDALS 1225, medal 1 held.
-        app.world_mut().spawn((
-            crate::net::SelfPlayer,
-            crate::net::ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
-                (34, 60),
-                (1225, 0x1),
-            ])),
-        ));
-        let mut script = benilla_ui::script::UiScript::new().unwrap();
-        crate::ui_script::test_ui::load_tooltip_template(&script);
-        script.set_item_template(
-            9504,
-            benilla_ui::script::ItemTemplateView {
-                name: "Recipe: Medal".into(),
-                quality: 1,
-                required_city_rank: 1,
-                teaches: Some(benilla_ui::script::TaughtSpell {
-                    ranks: vec![2335],
-                    pet: false,
-                }),
-                ..Default::default()
-            },
-        );
-        app.insert_non_send_resource(script);
-        app.update();
-        let (known, medal, r, g, b): (String, String, f32, f32, f32) = app
-            .world_mut()
-            .non_send_resource_mut::<benilla_ui::script::UiScript>()
-            .eval(
-                r#"
-                ITEM_SPELL_KNOWN = "Already known"
-                ITEM_REQ_SKILL = "Requires %s"
-                PVP_MEDAL1 = "Medal"
-                local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
-                tt:SetOwner(CreateFrame("Frame"), "ANCHOR_NONE")
-                tt:SetHyperlink("item:9504:0:0:0")
-                local r, g, b = TTTextLeft3:GetTextColor()
-                return TTTextLeft2:GetText(), TTTextLeft3:GetText(), r, g, b
-                "#,
-            )
-            .unwrap();
-        assert_eq!(
-            (known.as_str(), medal.as_str()),
-            ("Already known", "Requires Medal")
-        );
-        // White, not the unmet red's `32/255` green and blue.
-        assert!(
-            [r, g, b].iter().all(|c| (c - 1.0).abs() < 1e-4),
-            "the medal is held: {:?}",
-            (r, g, b)
-        );
     }
 }

@@ -1,8 +1,7 @@
 //! The inspect bindings: `NotifyInspect` and `ClearInspectPlayer` act inside their calls through
-//! the host ([`InspectCall`]), the app pushes
-//! each held player's visible items by guid ([`UiScript::set_visible_equipment`]) for the
-//! `GetInventoryItem*` verbs, and `CanInspect` and `CheckInteractDistance` read a per-guid
-//! distance map ([`UiScript::set_unit_reach`]) through the token resolver ([`super::UnitGuids`]).
+//! the host ([`InspectCall`]), the `GetInventoryItem*` verbs read another player's visible items
+//! through the lent host ([`VisibleSlotQuery`]), and `CanInspect` and `CheckInteractDistance` read
+//! the reach of the unit the token resolver names through it too ([`UnitReachQuery`]).
 //!
 //! Worn gear is public descriptor state (`PLAYER_VISIBLE_ITEM_<n>_0`), so the window paints from
 //! what the client holds: `SMSG_INSPECT` echoes only the guid (`0x5e7d70`), `InspectFrame_Show`
@@ -43,51 +42,59 @@ pub struct UnitReach {
 }
 
 impl super::UiScript {
-    /// Push the squared distance of every live unit a token can name this frame, creature
-    /// included; both range verbs read the same d². A verb resolves its token to a guid through
+    /// Seat the squared distance of the units a token can name, which both range verbs read with
+    /// no host to ask ([`UnitReachQuery`]). A verb resolves its token to a guid through
     /// [`super::UnitGuids`], so `"party1target"` and `"PLAYER"` read the unit they name, and a
     /// guid absent from the map answers nil from both, the reference's null-object arms
-    /// (`0x48babe` for `CheckInteractDistance`, `0x48a1fa` for `CanInspect`). It changes every frame, so it stays off [`super::UnitState`], whose diffs
-    /// fire `UNIT_*` events.
+    /// (`0x48babe` for `CheckInteractDistance`, `0x48a1fa` for `CanInspect`).
     pub fn set_unit_reach(&mut self, reach: HashMap<u64, UnitReach>) {
         self.model_mut().unit_reach = reach;
     }
 
-    /// Push one unit's reach ahead of the next whole map: a unit seated between two pushes, as
-    /// the world mouseover is ([`Self::seat_world_mouseover_unit`]).
+    /// Seat one unit's reach, which the range verbs read with no host to ask ([`UnitReachQuery`]).
     pub fn set_unit_reach_of(&mut self, guid: u64, reach: UnitReach) {
         self.model_mut().unit_reach.insert(guid, reach);
     }
 
-    /// The guids of the held units the resolver's inputs reach ([`Self::set_unit_guids`]): every
-    /// unit a token can name, the `target` chains included, that the object manager holds. These
-    /// are the guids [`Self::set_unit_reach`] is measured for.
-    pub fn held_unit_guids(&self) -> Vec<u64> {
-        self.model_ref().unit_guids.held.keys().copied().collect()
-    }
-
-    /// The unit tokens that name a unit now ([`super::UnitGuids::bound_tokens`]): the set a
-    /// field's change is fanned out to (`0x515e50`).
+    /// The unit tokens that name a unit now ([`super::unit::bound_tokens_in`]): the set a field's
+    /// change is fanned out to (`0x515e50`). The objects, the target and the interaction globals
+    /// and the party and raid rows (`0x491920`, `0x491940`) are read through the lent host as of
+    /// the place this runs, the other globals as the VM holds them; with no host to ask, the
+    /// snapshot's ([`super::UnitGuids::bound_tokens`]).
     pub fn bound_unit_tokens(&self) -> Vec<String> {
-        self.model_ref().unit_guids.bound_tokens()
+        let model = self.model_ref();
+        let guids = &model.unit_guids;
+        let globals = super::unit::LiveGlobals::asked(self.lua(), guids);
+        super::unit::with_live_objects(self.lua(), |o| super::unit::bound_tokens_in(&globals, o))
+            .unwrap_or_else(|| guids.bound_tokens())
     }
 
-    /// The tokens naming one unit now ([`super::UnitGuids::tokens_of`]), the list `0x515e50`
-    /// signals a unit event for.
+    /// The tokens naming one unit as its event is signalled ([`super::unit::tokens_in`]), the list
+    /// `0x515e50` signals a unit event for, read as [`Self::bound_unit_tokens`] reads.
     pub fn unit_tokens_of(&self, guid: u64) -> Vec<String> {
-        self.model_ref().unit_guids.tokens_of(guid)
+        let model = self.model_ref();
+        let guids = &model.unit_guids;
+        let globals = super::unit::LiveGlobals::asked(self.lua(), guids);
+        super::unit::with_live_objects(self.lua(), |o| super::unit::tokens_in(&globals, o, guid))
+            .unwrap_or_else(|| guids.tokens_of(guid))
     }
 
-    /// Whether one unit carries the unit-field watchers now
-    /// ([`super::UnitGuids::has_field_watchers`]).
+    /// Whether one unit carries the unit-field watchers now ([`super::unit::field_watchers_in`]),
+    /// read as [`Self::bound_unit_tokens`] reads.
     pub fn unit_has_field_watchers(&self, guid: u64) -> bool {
-        self.model_ref().unit_guids.has_field_watchers(guid)
+        let model = self.model_ref();
+        let guids = &model.unit_guids;
+        let globals = super::unit::LiveGlobals::asked(self.lua(), guids);
+        super::unit::with_live_objects(self.lua(), |o| {
+            super::unit::field_watchers_in(&globals, o, guid)
+        })
+        .unwrap_or_else(|| guids.has_field_watchers(guid))
     }
 
     /// Push, or clear with `None`, the visible items of the player `guid` by slot id 1..=19:
     /// what the slot getters read through a token naming another player they may read
-    /// (`0x4944a0`). It fires nothing: a change of them is the visible-item bridge's
-    /// `UNIT_INVENTORY_CHANGED` (`0x51bd70`).
+    /// (`0x4944a0`) when no host is free to ask ([`VisibleSlotQuery`]). It fires nothing: a change
+    /// of them is the visible-item bridge's `UNIT_INVENTORY_CHANGED` (`0x51bd70`).
     pub fn set_visible_equipment(&mut self, guid: u64, slots: Option<InventorySlots>) {
         let mut model = self.model_mut();
         match slots {
@@ -110,6 +117,38 @@ impl super::UiScript {
     }
 }
 
+/// A slot getter's question of another player's visible items, through the lent host
+/// ([`super::live::ask`]): the slot, id 1..=19, as the object's `PLAYER_VISIBLE_ITEM_<slot>` block
+/// holds it at the call (`0x4c8328` → `0x5f0d60`). The answer is `None` for an empty slot or a
+/// player no longer held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisibleSlotQuery {
+    pub guid: u64,
+    pub slot: u8,
+}
+
+impl super::live::LiveQuery for VisibleSlotQuery {
+    type Answer = Option<super::InvSlotView>;
+}
+
+/// The visible item of the player `guid` at slot id `slot`, read through the lent host as of the
+/// call; with no host free to ask, the snapshot ([`super::UiScript::set_visible_equipment`]).
+pub(super) fn visible_slot(
+    lua: &Lua,
+    model: &Model,
+    guid: u64,
+    slot: usize,
+) -> Option<super::InvSlotView> {
+    let query = VisibleSlotQuery {
+        guid,
+        slot: u8::try_from(slot).ok()?,
+    };
+    match super::live::ask(lua, &query) {
+        Some(answer) => answer,
+        None => model.visible_equipment.get(&guid)?.get(slot)?.clone(),
+    }
+}
+
 /// An inspect verb the host applies inside its call ([`super::ScriptCall::Inspect`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InspectCall {
@@ -124,14 +163,31 @@ pub enum InspectCall {
     Honor,
 }
 
+/// The range verbs' question of the lent host ([`super::live::ask`]): the unit `guid` as the
+/// object manager holds it at the call (`0x468460`, typemask 8), its squared distance from the
+/// active player and `0x4944a0`'s other legs, read there (`0x48a26f`, `0x48ba00`); `None` for no
+/// unit held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitReachQuery(pub u64);
+
+impl super::live::LiveQuery for UnitReachQuery {
+    type Answer = Option<UnitReach>;
+}
+
+/// `guid`'s reach at the call: the lent host's, else the seat ([`super::UiScript::set_unit_reach`]).
+pub(super) fn reach_of(lua: &Lua, model: &Model, guid: u64) -> Option<UnitReach> {
+    super::live::ask(lua, &UnitReachQuery(guid))
+        .unwrap_or_else(|| model.unit_reach.get(&guid).copied())
+}
+
 /// The reach of the unit `token` names, through the resolver (`0x515970`, which both verbs call via
-/// `0x515940`): the guid it answers, then that guid's entry. A token the resolver does not
+/// `0x515940`): the guid it answers, then that guid's reach. A token the resolver does not
 /// recognise raises `Unknown unit name` (`0x515c14`).
 fn reach(lua: &Lua, token: &str) -> mlua::Result<Option<UnitReach>> {
     super::unit::check_unit_token(&Some(token.to_string()))?;
     let model = lua.app_data_ref::<Model>().expect("model app_data");
-    let guid = model.unit_guids.resolve(token).ok().flatten();
-    Ok(guid.and_then(|guid| model.unit_reach.get(&guid).copied()))
+    let guid = super::unit::guid_of(lua, &model, token)?;
+    Ok(guid.and_then(|guid| reach_of(lua, &model, guid)))
 }
 
 /// Whether `0x4944a0`'s distance leg passes: in range unless `100.0 < d²`, since `test ah,0x41`
@@ -200,10 +256,20 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // NotifyInspect(unit) (`Blizzard_InspectUI.lua:9`): fire-and-forget, as nothing waits on the
-    // reply.
+    // reply. `is-number-or-string` else `Usage: NotifyInspect(unit)` (`0x842724`, `0x48a38b`);
+    // with no player object it returns (`0x48a35a`), else the token goes through the resolver
+    // (`0x48a36a` → `0x515970`), which raises `Unknown unit name` for one it does not know.
     g.set(
         "NotifyInspect",
-        lua.create_function(|lua, unit: String| {
+        lua.create_function(|lua, unit: Value| {
+            let unit = binding_abi::string_arg(lua, unit, "Usage: NotifyInspect(unit)")?;
+            if !super::battlefield_queue::player_exists(
+                lua,
+                &lua.app_data_ref::<Model>().expect("model app_data"),
+            ) {
+                return Ok(());
+            }
+            super::unit::check_unit_token(&Some(unit.clone()))?;
             super::calls::submit(lua, super::ScriptCall::Inspect(InspectCall::Notify(unit)))
         })?,
     )?;
